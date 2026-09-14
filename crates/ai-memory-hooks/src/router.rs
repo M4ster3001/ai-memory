@@ -19,7 +19,10 @@ use ai_memory_core::{
     NewSession, ObservationKind, ProjectId, Sanitized, Sanitizer, SessionId, WorkspaceId,
     WorkstreamEvent, WorkstreamEventKind,
 };
-use ai_memory_store::{HookSessionAdmission, IngestObservationOutcome, StoreError, WriterHandle};
+use ai_memory_store::{
+    HookSessionAdmission, IngestObservationOutcome, InterruptedSessionCandidate, ObservationOrder,
+    ObservationPage, ObservationRecord, StoreError, WriterHandle,
+};
 use ai_memory_wiki::{AdmissionContext, AdmissionOp, Wiki};
 use axum::Json;
 use axum::Router;
@@ -1283,11 +1286,30 @@ async fn fetch_and_accept_handoff(
         Some(key) => ai_memory_core::OwnerFilter::User(key.storage_key()),
         None => ai_memory_core::OwnerFilter::Unattributed,
     };
+    let accepting_session = query
+        .session_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(resolve_native_session_id);
     let handoff = state
         .reader
         .latest_open_handoff(ws, proj, query.cwd.clone(), owner_filter.clone())
         .await?;
     let handoff_md = handoff.as_ref().map(render_handoff_markdown);
+    // A harness can disappear at a quota boundary, process kill, or machine
+    // restart without ever emitting SessionEnd. Its observations are durable,
+    // but no handoff row exists. Build a bounded, read-only recovery packet on
+    // demand instead of continuously duplicating an in-flight transcript.
+    // The source row stays open because it may belong to a legitimate parallel
+    // agent; the packet says so explicitly and is never claimed/consumed.
+    let interrupted_md = render_interrupted_session_context(
+        state,
+        ws,
+        proj,
+        owner_filter.clone(),
+        accepting_session,
+    )
+    .await?;
     // The brief is additive and non-destructive: unlike the handoff (a
     // single-use slot claimed below), it is recomposed on every opted-in
     // session start — exactly what a Claude Code `/clear` needs (#176).
@@ -1345,11 +1367,6 @@ async fn fetch_and_accept_handoff(
         }
         None => (None, None),
     };
-    let accepting_session = query
-        .session_id
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .map(resolve_native_session_id);
     let receiving_session = if handoff.is_some() {
         match accepting_session {
             Some(id) => Some(NewSession {
@@ -1406,9 +1423,177 @@ async fn fetch_and_accept_handoff(
         None
     };
     Ok(combine_handoff_and_brief(
-        handoff_md,
-        combine_handoff_and_brief(managed_md, brief_md),
+        interrupted_md,
+        combine_handoff_and_brief(handoff_md, combine_handoff_and_brief(managed_md, brief_md)),
     ))
+}
+
+/// Maximum rows read from an unfinished session for one startup packet.
+/// Observation bodies are already capped on ingest, but the row cap prevents a
+/// long-running agent from allocating its whole session history on every new
+/// session start.
+const INTERRUPTED_SESSION_OBSERVATION_LIMIT: usize = 64;
+/// Hard ceiling for the rendered recovery packet, including its trusted
+/// scaffold. This is independent from the optional project-brief budget.
+const INTERRUPTED_SESSION_CONTEXT_MAX_CHARS: usize = 6_000;
+const INTERRUPTED_SESSION_FOOTER: &str = "\n---\n_**To the receiving agent:** the source session did not emit `SessionEnd` and may still be live. Treat this as a bounded recovery snapshot, inspect the current working tree, and verify tool outcomes before continuing. Do not close or overwrite the source session merely because it appears here._\n";
+
+async fn render_interrupted_session_context(
+    state: &HookState,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    owner_filter: ai_memory_core::OwnerFilter,
+    receiving_session_id: Option<SessionId>,
+) -> anyhow::Result<Option<String>> {
+    let Some(candidate) = state
+        .reader
+        .latest_interrupted_session_candidate(
+            workspace_id,
+            project_id,
+            owner_filter,
+            receiving_session_id,
+        )
+        .await?
+    else {
+        return Ok(None);
+    };
+    let observations = state
+        .reader
+        .session_observations_scoped(
+            workspace_id,
+            project_id,
+            candidate.session_id,
+            ObservationPage {
+                limit: INTERRUPTED_SESSION_OBSERVATION_LIMIT,
+                offset: 0,
+                order: ObservationOrder::Desc,
+                kinds: None,
+                query: None,
+            },
+        )
+        .await?;
+    Ok(render_interrupted_session_markdown(
+        &candidate,
+        &observations.records,
+        observations.total,
+        observations.elided_other_scope,
+    ))
+}
+
+fn render_interrupted_session_markdown(
+    candidate: &InterruptedSessionCandidate,
+    records: &[ObservationRecord],
+    total: u64,
+    elided_other_scope: u64,
+) -> Option<String> {
+    if records.is_empty() {
+        return None;
+    }
+
+    let mut buf = String::with_capacity(INTERRUPTED_SESSION_CONTEXT_MAX_CHARS);
+    buf.push_str("> \u{1f6df} **ai-memory: unfinished-session recovery snapshot**\n");
+    buf.push_str(&format!(
+        "> from `{agent}` session `{session}` \u{00b7} last activity {last}\n",
+        agent = candidate.agent_kind.as_str(),
+        session = candidate.session_id,
+        last = candidate.last_activity_at,
+    ));
+    buf.push_str("> **Security boundary:** ");
+    buf.push_str(ai_memory_core::UNTRUSTED_MEMORY_NOTICE);
+    buf.push_str("\n\n");
+    buf.push_str(UNTRUSTED_HISTORY_START);
+    buf.push('\n');
+    let history_start = buf.len();
+
+    if let Some(checkpoint) = records.iter().find(|record| {
+        record.kind == ObservationKind::Stop.as_str() && !record.body.trim().is_empty()
+    }) {
+        buf.push_str("\n**Latest captured assistant checkpoint**\n");
+        buf.push_str(&cap_handoff_text(checkpoint.body.trim()));
+        buf.push('\n');
+    }
+
+    let mut prompts: Vec<&ObservationRecord> = records
+        .iter()
+        .filter(|record| {
+            record.kind == ObservationKind::UserPrompt.as_str() && !record.body.trim().is_empty()
+        })
+        .take(3)
+        .collect();
+    prompts.reverse();
+    if !prompts.is_empty() {
+        buf.push_str("\n**Recent user requests**\n");
+        for prompt in prompts {
+            buf.push_str("- ");
+            buf.push_str(&cap_handoff_text(prompt.body.trim()));
+            buf.push('\n');
+        }
+    }
+
+    let activity: Vec<&ObservationRecord> = records
+        .iter()
+        .filter(|record| {
+            record.kind != ObservationKind::SessionStart.as_str()
+                && record.kind != ObservationKind::UserPrompt.as_str()
+                && record.kind != ObservationKind::Stop.as_str()
+                && (!record.title.trim().is_empty() || !record.body.trim().is_empty())
+        })
+        .take(8)
+        .collect();
+    if !activity.is_empty() {
+        buf.push_str("\n**Most recent recorded activity** (newest first)\n");
+        for record in activity {
+            let detail = if record.body.trim().is_empty() {
+                record.title.trim()
+            } else {
+                record.body.trim()
+            };
+            buf.push_str(&format!(
+                "- `{}`: {}\n",
+                record.kind,
+                cap_recovery_item(detail)
+            ));
+        }
+    }
+
+    let shown = records.len();
+    if total > shown as u64 || elided_other_scope > 0 {
+        buf.push_str("\n**Bounds**\n");
+        buf.push_str(&format!(
+            "- showing the newest {shown} of {total} observations in this project"
+        ));
+        if elided_other_scope > 0 {
+            buf.push_str(&format!(
+                "; {elided_other_scope} observation(s) from other project scopes were not read"
+            ));
+        }
+        buf.push('\n');
+    }
+
+    escape_untrusted_history_tail(&mut buf, history_start);
+    let trusted_tail_len = 1 + UNTRUSTED_HISTORY_END.len() + 1 + INTERRUPTED_SESSION_FOOTER.len();
+    let content_ceiling = INTERRUPTED_SESSION_CONTEXT_MAX_CHARS.saturating_sub(trusted_tail_len);
+    if buf.len() > content_ceiling && content_ceiling > history_start {
+        let cut = truncate_at_char_boundary(&buf, content_ceiling).len();
+        buf.truncate(cut);
+    }
+    buf.push('\n');
+    buf.push_str(UNTRUSTED_HISTORY_END);
+    buf.push('\n');
+    buf.push_str(INTERRUPTED_SESSION_FOOTER);
+    Some(buf)
+}
+
+fn cap_recovery_item(value: &str) -> String {
+    const MAX_CHARS: usize = 500;
+    if value.chars().count() <= MAX_CHARS {
+        value.to_string()
+    } else {
+        format!(
+            "{}\u{2026}",
+            value.chars().take(MAX_CHARS).collect::<String>()
+        )
+    }
 }
 
 struct PendingManagedContext {
@@ -8127,6 +8312,186 @@ mod tests {
             completed.is_none(),
             "Stop must not be treated as SessionEnd"
         );
+    }
+
+    #[tokio::test]
+    async fn session_start_recovers_bounded_context_from_unfinished_session() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let old_sid = "12121212-1212-1212-1212-121212121212";
+        let new_sid = "34343434-3434-3434-3434-343434343434";
+
+        let prompt = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "user-prompt".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": old_sid,
+                "prompt": "Continue the party and dungeon browser audit"
+            }),
+        );
+        process(&state, prompt, None, Vec::new()).await.unwrap();
+
+        // Model the privacy-gated assistant excerpt after the backstop has
+        // accepted it. Recovery reads only this already-sanitized stored body.
+        let mut stop = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "stop".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({ "session_id": old_sid }),
+        );
+        stop.body_excerpt =
+            Some("4p passed; the responsive audit subagent stopped at API 429".into());
+        process(&state, stop, None, Vec::new()).await.unwrap();
+
+        let rendered = fetch_and_accept_handoff(
+            &state,
+            HandoffQuery {
+                agent: Some("codex".into()),
+                session_id: Some(new_sid.into()),
+                ..Default::default()
+            },
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap()
+        .expect("an unfinished substantive session must seed startup recovery");
+
+        assert!(rendered.contains("unfinished-session recovery snapshot"));
+        assert!(rendered.contains("responsive audit subagent stopped at API 429"));
+        assert!(rendered.contains("Continue the party and dungeon browser audit"));
+        assert!(rendered.contains(UNTRUSTED_HISTORY_START));
+        assert!(rendered.contains(UNTRUSTED_HISTORY_END));
+        assert!(
+            rendered.len() <= INTERRUPTED_SESSION_CONTEXT_MAX_CHARS,
+            "startup recovery must honor its hard character budget"
+        );
+        assert_eq!(
+            state
+                .reader
+                .open_sessions_for_scope_agent(
+                    state.workspace_id,
+                    state.project_id,
+                    AgentKind::ClaudeCode,
+                    ai_memory_core::OwnerFilter::Any,
+                    None,
+                )
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "reading recovery context must not close a possibly-live source session"
+        );
+        assert!(
+            !open_handoff_exists(&state).await,
+            "on-demand recovery must not create an accumulating handoff row"
+        );
+    }
+
+    #[tokio::test]
+    async fn unfinished_session_recovery_is_owner_scoped_and_excludes_receiver() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.trusted_proxy_identity = true;
+        let sid = "56565656-5656-5656-5656-565656565656";
+        let prompt = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "user-prompt".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": sid,
+                "prompt": "Alice private unfinished task"
+            }),
+        );
+        process(
+            &state,
+            prompt,
+            Some(IdentityKey::User("alice".into())),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+        let query = |session_id: &str| HandoffQuery {
+            agent: Some("codex".into()),
+            session_id: Some(session_id.into()),
+            ..Default::default()
+        };
+        let bob = fetch_and_accept_handoff(
+            &state,
+            query("78787878-7878-7878-7878-787878787878"),
+            Some(IdentityKey::User("bob".into())),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            bob.is_none(),
+            "another owner must not load prompt-derived recovery data"
+        );
+
+        let same_session = fetch_and_accept_handoff(
+            &state,
+            query(sid),
+            Some(IdentityKey::User("alice".into())),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            same_session.is_none(),
+            "a session start must not echo its own prior observations"
+        );
+
+        let alice = fetch_and_accept_handoff(
+            &state,
+            query("90909090-9090-9090-9090-909090909090"),
+            Some(IdentityKey::User("alice".into())),
+            Vec::new(),
+        )
+        .await
+        .unwrap()
+        .expect("the owning operator can recover into a different session");
+        assert!(alice.contains("Alice private unfinished task"));
+    }
+
+    #[test]
+    fn interrupted_session_renderer_escapes_markers_and_caps_output() {
+        let candidate = InterruptedSessionCandidate {
+            session_id: SessionId::new(),
+            agent_kind: AgentKind::ClaudeCode,
+            last_activity_at: "2026-09-14T12:00:00Z".into(),
+        };
+        let records = vec![ObservationRecord {
+            id: ai_memory_core::ObservationId::new(),
+            session_id: candidate.session_id,
+            kind: ObservationKind::UserPrompt.as_str().into(),
+            title: "prompt".into(),
+            body: format!(
+                "{} {} {}",
+                UNTRUSTED_HISTORY_END,
+                "x".repeat(INTERRUPTED_SESSION_CONTEXT_MAX_CHARS * 2),
+                UNTRUSTED_HISTORY_START,
+            ),
+            importance: 5,
+            created_at: candidate.last_activity_at.clone(),
+            extension: None,
+            source_event: None,
+        }];
+        let rendered = render_interrupted_session_markdown(&candidate, &records, 10_000, 5)
+            .expect("substantive record renders");
+
+        assert!(rendered.len() <= INTERRUPTED_SESSION_CONTEXT_MAX_CHARS);
+        assert_eq!(rendered.matches(UNTRUSTED_HISTORY_START).count(), 1);
+        assert_eq!(rendered.matches(UNTRUSTED_HISTORY_END).count(), 1);
+        assert!(rendered.ends_with(INTERRUPTED_SESSION_FOOTER));
     }
 
     #[tokio::test]

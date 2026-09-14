@@ -61,12 +61,12 @@ pub use reader::{
     BriefPageBody, BriefingPage, BriefingSnapshot, ClientActivity, ContaminationFinding,
     ContaminationReport, ContaminationSummary, ContradictionEdge, DecayCandidate, DecayTombstone,
     DerivedIndexStatus, EmbeddingTripleCount, FeedbackFinding, GraphVia, HealthDetail, HealthPage,
-    ObservationHit, ObservationOrder, ObservationPage, ObservationPageResult, ObservationRecord,
-    OpenSession, PageAuthor, PageHit, PageHitWithMeta, PageLinks, PageMeta, PageSummary,
-    ProjectSummary, ReaderPool, ReindexTargetStatus, RelatedPage, RrfContributions, ScopeRow,
-    SearchExplain, SessionDependentRows, SessionEndDisposition, SessionSummary, SettledPage,
-    StatusCounts, StorageStatus, StoredEmbedding, StoredPageBody, WorkspaceScopeRow,
-    WorkspaceSummary, f32_vec_to_bytes,
+    InterruptedSessionCandidate, ObservationHit, ObservationOrder, ObservationPage,
+    ObservationPageResult, ObservationRecord, OpenSession, PageAuthor, PageHit, PageHitWithMeta,
+    PageLinks, PageMeta, PageSummary, ProjectSummary, ReaderPool, ReindexTargetStatus, RelatedPage,
+    RrfContributions, ScopeRow, SearchExplain, SessionDependentRows, SessionEndDisposition,
+    SessionSummary, SettledPage, StatusCounts, StorageStatus, StoredEmbedding, StoredPageBody,
+    WorkspaceScopeRow, WorkspaceSummary, f32_vec_to_bytes,
 };
 pub use retrieval_tuning::{RetrievalTuning, is_session_recall_query};
 pub use scope::{
