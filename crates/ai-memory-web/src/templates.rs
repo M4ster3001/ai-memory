@@ -106,10 +106,38 @@ pub(crate) struct ProjectCard {
     pub project: String,
     /// Number of latest pages.
     pub page_count: u64,
+    /// Captured sessions, whether or not they have produced a page yet.
+    pub session_count: u64,
+    /// Sanitized hook observations recorded for the project.
+    pub observation_count: u64,
+    /// Sessions that have not emitted SessionEnd yet.
+    pub open_session_count: u64,
     /// Humanised timestamp (e.g. "3 hours ago"), or empty string.
     pub last_updated_relative: String,
     /// Link target (`w/{ws}/{proj}`, relative to `<base href>`).
     pub href: String,
+}
+
+/// Aggregate metadata for the human-only dashboard. Prompt bodies, command
+/// output, paths, and handoff prose intentionally do not appear here.
+pub(crate) struct DashboardStats {
+    pub project_count: usize,
+    pub page_count: u64,
+    pub session_count: u64,
+    pub observation_count: u64,
+    pub open_session_count: u64,
+    pub last_activity_relative: String,
+    /// Process-local hook capture health. Empty only for standalone embeds;
+    /// the production server always supplies it.
+    pub ingest: Option<IngestStats>,
+}
+
+/// Content-free snapshot of hook ingestion health since this server started.
+pub(crate) struct IngestStats {
+    pub accepted: u64,
+    pub dropped_by_policy: u64,
+    pub shed_saturated: u64,
+    pub shed_rate_limited: u64,
 }
 
 /// The one-time 2.0 migration explainer dialog (docs/okf.md): shown
@@ -133,6 +161,8 @@ pub(crate) struct OkfDialog {
 pub(crate) struct ProjectsView {
     /// All project cards, sorted by most recently active first.
     pub projects: Vec<ProjectCard>,
+    /// Privacy-preserving aggregate signals above the project cards.
+    pub dashboard: DashboardStats,
     /// Present whenever a migration receipt exists (dialog dismissal is
     /// client-side, per browser).
     pub okf_dialog: Option<OkfDialog>,

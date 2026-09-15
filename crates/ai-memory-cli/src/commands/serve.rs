@@ -26,7 +26,10 @@ use ai_memory_mcp::{
 use ai_memory_store::{
     ReaderPool, Store, TokenPepper, WriterHandle, hash_session_secret, hash_token,
 };
-use ai_memory_web::{WebMountSpec, normalize_prefix, split_web_routers, web_base_href};
+use ai_memory_web::{
+    WebMountSpec, normalize_prefix, split_web_routers, split_web_routers_with_metrics,
+    web_base_href,
+};
 use ai_memory_wiki::{WatcherHandle, Wiki, migrations, run_wiki_migrations};
 use anyhow::{Context, Result};
 use axum::body::Body;
@@ -1330,10 +1333,11 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 );
             }
             let base_href = web_base_href(&args.base_path, &args.web_slug);
-            let web = split_web_routers(
+            let web = split_web_routers_with_metrics(
                 args.enable_web,
                 store.reader.clone(),
                 wiki.clone(),
+                Some(ingest_metrics.clone()),
                 WebMountSpec {
                     web_ui_dir: args.web_ui_dir.as_deref(),
                     cors_origins: &cors_origins,

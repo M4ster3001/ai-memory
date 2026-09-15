@@ -8462,6 +8462,62 @@ mod tests {
         assert!(alice.contains("Alice private unfinished task"));
     }
 
+    #[tokio::test]
+    async fn session_start_recovers_activity_after_a_reused_ended_session_id() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let reused_sid = "abababab-abab-abab-abab-abababababab";
+
+        let prompt = |text: &str| {
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "user-prompt".into(),
+                    agent: Some("claude-code".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({ "session_id": reused_sid, "prompt": text }),
+            )
+        };
+        process(&state, prompt("initial completed work"), None, Vec::new())
+            .await
+            .unwrap();
+        let end = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "session-end".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({ "session_id": reused_sid }),
+        );
+        process(&state, end, None, Vec::new()).await.unwrap();
+
+        // Claude Code can continue publishing under its old session id after
+        // a lifecycle end (for example after a quota/retry boundary). That
+        // later substantive activity, not the old `ended_at`, is what a new
+        // harness must be able to recover.
+        process(
+            &state,
+            prompt("reused session continued: debug instrumentation is deployed"),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+        let candidate = state
+            .reader
+            .latest_interrupted_session_candidate(
+                state.workspace_id,
+                state.project_id,
+                ai_memory_core::OwnerFilter::Any,
+                None,
+            )
+            .await
+            .unwrap()
+            .expect("post-end substantive activity must seed recovery");
+        assert_eq!(candidate.session_id.to_string(), reused_sid);
+    }
+
     #[test]
     fn interrupted_session_renderer_escapes_markers_and_caps_output() {
         let candidate = InterruptedSessionCandidate {

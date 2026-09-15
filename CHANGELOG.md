@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- The read-only human web home now presents a privacy-preserving memory
+  dashboard: projects, sessions, sanitized capture events, compiled pages,
+  open-session continuity signals, and last activity. Project cards now
+  distinguish captured work from compiled pages, so active hooks no longer
+  look empty merely because their sessions have not ended (#721).
+- The production web dashboard now also exposes content-free, process-lifetime
+  hook-health counters (accepted, policy-dropped, capacity-shed, and
+  rate-limited) without persisting or rendering prompt, command, path, or
+  payload data (#721).
+
 ### Security
 - Updated locked `rustls` 0.23.40 â†’ 0.23.45 (and `rustls-webpki` 0.103.13 â†’
   0.103.15) for [RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285),

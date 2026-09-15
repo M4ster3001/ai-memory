@@ -314,13 +314,25 @@ pub fn split_web_routers(
     wiki: Wiki,
     spec: WebMountSpec<'_>,
 ) -> Result<SplitWebRouters> {
+    split_web_routers_with_metrics(enable_web, reader, wiki, None, spec)
+}
+
+/// Metric-aware variant of [`split_web_routers`]. The optional input keeps
+/// the web crate embeddable without coupling custom frontends to hook state.
+pub fn split_web_routers_with_metrics(
+    enable_web: bool,
+    reader: ReaderPool,
+    wiki: Wiki,
+    ingest_metrics: Option<Arc<ai_memory_core::IngestMetrics>>,
+    spec: WebMountSpec<'_>,
+) -> Result<SplitWebRouters> {
     if !enable_web {
         return Ok(SplitWebRouters {
             public: axum::Router::new(),
             protected: axum::Router::new(),
         });
     }
-    let api = build_api_router(&reader, &wiki, spec.cors_origins);
+    let api = build_api_router(&reader, &wiki, ingest_metrics.clone(), spec.cors_origins);
     let protected_api = axum::Router::new().nest("/api/v1", api);
     let slug = normalize_prefix(spec.web_slug);
     let mount = if slug.is_empty() { "/" } else { slug.as_str() };
@@ -340,7 +352,15 @@ pub fn split_web_routers(
     }
     Ok(SplitWebRouters {
         public: axum::Router::new(),
-        protected: mount_builtin_browser(protected_api, reader, wiki, &slug, spec.base_href, mount),
+        protected: mount_builtin_browser(
+            protected_api,
+            reader,
+            wiki,
+            ingest_metrics,
+            &slug,
+            spec.base_href,
+            mount,
+        ),
     })
 }
 
@@ -363,8 +383,19 @@ fn mount_web_router(
 /// the operator configured any. The layer is scoped to this router only
 /// (CORS_NOT_APPLIED_TO_OTHER_ROUTES invariant — `/mcp`, `/hook`,
 /// `/admin`, and `/web` must remain CORS-free).
-fn build_api_router(reader: &ReaderPool, wiki: &Wiki, cors_origins: &[String]) -> axum::Router {
-    let api = crate::api_router(reader.clone(), wiki.clone());
+fn build_api_router(
+    reader: &ReaderPool,
+    wiki: &Wiki,
+    ingest_metrics: Option<Arc<ai_memory_core::IngestMetrics>>,
+    cors_origins: &[String],
+) -> axum::Router {
+    let state = match ingest_metrics {
+        Some(metrics) => {
+            crate::WebState::new(reader.clone(), wiki.clone()).with_ingest_metrics(metrics)
+        }
+        None => crate::WebState::new(reader.clone(), wiki.clone()),
+    };
+    let api = crate::routes::build_api(Arc::new(state));
     if cors_origins.is_empty() {
         return api;
     }
@@ -438,6 +469,7 @@ fn mount_builtin_browser(
     router: axum::Router,
     reader: ReaderPool,
     wiki: Wiki,
+    ingest_metrics: Option<Arc<ai_memory_core::IngestMetrics>>,
     slug: &str,
     base_href: &str,
     mount: &str,
@@ -446,10 +478,13 @@ fn mount_builtin_browser(
     // `w/…`, `search`, `.`). Inject a `<base href>` into every HTML
     // response so they resolve under `{base_path}{web_slug}/` — the
     // same anchoring the custom SPA gets via its injected index.
-    let web_router = crate::router(reader, wiki).layer(axum::middleware::from_fn_with_state(
-        Arc::new(base_href.to_string()),
-        inject_web_base_href,
-    ));
+    let state = match ingest_metrics {
+        Some(metrics) => crate::WebState::new(reader, wiki).with_ingest_metrics(metrics),
+        None => crate::WebState::new(reader, wiki),
+    };
+    let web_router = crate::routes::build(Arc::new(state)).layer(
+        axum::middleware::from_fn_with_state(Arc::new(base_href.to_string()), inject_web_base_href),
+    );
     info!(mount, base_href, "read-only wiki browser mounted");
     if slug.is_empty() {
         return router.merge(web_router);
