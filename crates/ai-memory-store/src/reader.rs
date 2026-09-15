@@ -1259,9 +1259,18 @@ pub struct ProjectSummary {
     pub project_name: String,
     /// Number of `is_latest = 1` pages.
     pub page_count: u64,
+    /// Number of recorded sessions, including sessions that remain open.
+    pub session_count: u64,
+    /// Number of sanitized observations recorded for this project.
+    pub observation_count: u64,
+    /// Sessions without a `SessionEnd` record. This can mean active work or
+    /// an interruption, so the dashboard presents it as a signal, not an error.
+    pub open_session_count: u64,
     /// ISO-8601 timestamp of the newest `updated_at`, or `None` when
     /// the project has no pages yet.
     pub last_updated: Option<String>,
+    /// Most recent capture, session start, or page update in this project.
+    pub last_activity: Option<String>,
 }
 
 /// One workspace scope with the id + name needed to write its
@@ -6600,36 +6609,56 @@ impl ReaderPool {
         workspace: Option<String>,
     ) -> StoreResult<Vec<ProjectSummary>> {
         self.with_conn(move |conn| {
+            // Correlated aggregates avoid multiplying counts by joining pages,
+            // sessions, and observations on this dashboard hot path.
             let mut stmt = conn.prepare(
-                "SELECT w.name AS workspace_name, \
-                        p.name AS project_name, \
-                        COUNT(pg.id) AS page_count, \
-                        MAX(pg.updated_at) AS last_updated_us \
+                "SELECT w.name, p.name, \
+                        (SELECT COUNT(*) FROM pages pg WHERE pg.project_id = p.id AND pg.is_latest = 1), \
+                        (SELECT COUNT(*) FROM sessions s WHERE s.project_id = p.id), \
+                        (SELECT COUNT(*) FROM observations o WHERE o.project_id = p.id), \
+                        (SELECT COUNT(*) FROM sessions s WHERE s.project_id = p.id AND s.ended_at IS NULL), \
+                        (SELECT MAX(pg.updated_at) FROM pages pg WHERE pg.project_id = p.id AND pg.is_latest = 1), \
+                        COALESCE( \
+                            (SELECT MAX(o.created_at) FROM observations o WHERE o.project_id = p.id), \
+                            (SELECT MAX(s.started_at) FROM sessions s WHERE s.project_id = p.id), \
+                            (SELECT MAX(pg.updated_at) FROM pages pg WHERE pg.project_id = p.id AND pg.is_latest = 1) \
+                        ) AS last_activity \
                  FROM workspaces w \
                  JOIN projects p ON p.workspace_id = w.id \
-                 LEFT JOIN pages pg ON pg.project_id = p.id AND pg.is_latest = 1 \
                  WHERE (?1 IS NULL OR w.name = ?1) \
-                 GROUP BY w.id, p.id \
-                 ORDER BY last_updated_us DESC NULLS LAST",
+                 ORDER BY last_activity DESC NULLS LAST",
             )?;
             let rows = stmt.query_map(params![workspace], |row| {
                 let workspace_name: String = row.get(0)?;
                 let project_name: String = row.get(1)?;
                 let page_count: i64 = row.get(2)?;
-                let last_updated_us: Option<i64> = row.get(3)?;
-                Ok((workspace_name, project_name, page_count, last_updated_us))
+                let session_count: i64 = row.get(3)?;
+                let observation_count: i64 = row.get(4)?;
+                let open_session_count: i64 = row.get(5)?;
+                let last_updated_us: Option<i64> = row.get(6)?;
+                let last_activity_us: Option<i64> = row.get(7)?;
+                Ok((workspace_name, project_name, page_count, session_count, observation_count,
+                    open_session_count, last_updated_us, last_activity_us))
             })?;
             let mut out = Vec::new();
             for r in rows {
-                let (workspace_name, project_name, page_count, last_updated_us) = r?;
+                let (workspace_name, project_name, page_count, session_count, observation_count,
+                    open_session_count, last_updated_us, last_activity_us) = r?;
                 let last_updated = last_updated_us
+                    .and_then(|us| jiff::Timestamp::from_microsecond(us).ok())
+                    .map(|ts| ts.to_string());
+                let last_activity = last_activity_us
                     .and_then(|us| jiff::Timestamp::from_microsecond(us).ok())
                     .map(|ts| ts.to_string());
                 out.push(ProjectSummary {
                     workspace_name,
                     project_name,
                     page_count: u64::try_from(page_count).unwrap_or(0),
+                    session_count: u64::try_from(session_count).unwrap_or(0),
+                    observation_count: u64::try_from(observation_count).unwrap_or(0),
+                    open_session_count: u64::try_from(open_session_count).unwrap_or(0),
                     last_updated,
+                    last_activity,
                 });
             }
             Ok(out)

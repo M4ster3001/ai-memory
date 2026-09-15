@@ -431,6 +431,10 @@ async fn api_projects_returns_project_stats() {
     assert_eq!(json[0]["workspace_name"], "default");
     assert_eq!(json[0]["project_name"], "scratch");
     assert_eq!(json[0]["page_count"], 1);
+    assert_eq!(json[0]["session_count"], 0);
+    assert_eq!(json[0]["observation_count"], 0);
+    assert_eq!(json[0]["open_session_count"], 0);
+    assert!(json[0]["last_activity"].is_string());
 }
 
 #[tokio::test]
@@ -3080,6 +3084,9 @@ async fn homepage_llm_notice_is_dismissible_and_backup_banner_is_gone() {
     assert!(text.contains(r#"id="llm-notice""#));
     assert!(text.contains(r#"id="llm-notice-close""#));
     assert!(text.contains("ai-memory-llm-notice-dismissed"));
+    assert!(text.contains("Memory dashboard"));
+    assert!(text.contains("Captured events"));
+    assert!(text.contains("Open sessions"));
 
     // The old always-on backup banner is gone (the migration dialog
     // carries that information; `status` keeps the durable reminder).
