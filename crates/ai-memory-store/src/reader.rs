@@ -659,6 +659,19 @@ pub struct OpenSession {
     pub cwd: Option<String>,
 }
 
+/// Latest substantive open session that can seed a bounded startup recovery
+/// packet. Unlike a handoff, this is a read-only view: the source session stays
+/// open because it may still belong to a live parallel agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterruptedSessionCandidate {
+    /// Session whose persisted observations are the recovery source.
+    pub session_id: SessionId,
+    /// Harness that produced the source session.
+    pub agent_kind: AgentKind,
+    /// ISO-8601 timestamp of the most recent in-scope observation.
+    pub last_activity_at: String,
+}
+
 /// One session as listed from a scope by [`ReaderPool::sessions_for_scope`]
 /// and [`ReaderPool::session_summary_scoped`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -2801,6 +2814,92 @@ impl ReaderPool {
             )
             .await?;
         Ok(sessions.pop())
+    }
+
+    /// Return the most recently active substantive open session in a scope.
+    ///
+    /// This powers startup recovery when a harness disappears without a
+    /// `SessionEnd` (quota exhaustion, process kill, machine restart). The
+    /// query is owner-filtered before prompt-derived rows are selected and
+    /// excludes the receiving session id, so it cannot echo a new session back
+    /// to itself. It is deliberately non-destructive: parallel sessions are a
+    /// supported workflow and an open row is not proof that its process died.
+    ///
+    /// A candidate must contain at least one prompt or tool observation in the
+    /// exact scope. Lifecycle-only sessions never produce recovery noise.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn latest_interrupted_session_candidate(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        owner_filter: OwnerFilter,
+        receiving_session_id: Option<SessionId>,
+    ) -> StoreResult<Option<InterruptedSessionCandidate>> {
+        self.with_conn(move |conn| {
+            let owner_clause = match &owner_filter {
+                OwnerFilter::Any => "",
+                OwnerFilter::User(_) => " AND (s.actor_user IS NULL OR s.actor_user = :actor)",
+                OwnerFilter::Unattributed => " AND s.actor_user IS NULL",
+            };
+            let receiver_clause = if receiving_session_id.is_some() {
+                " AND s.id != :receiver"
+            } else {
+                ""
+            };
+            let sql = format!(
+                "SELECT s.id, s.agent_kind, MAX(o.created_at) AS last_activity \
+                 FROM sessions s \
+                 JOIN observations o ON o.session_id = s.id \
+                 WHERE s.workspace_id = :ws AND s.project_id = :proj \
+                   AND s.ended_at IS NULL \
+                   AND o.workspace_id = :ws AND o.project_id = :proj \
+                   AND EXISTS (SELECT 1 FROM observations substantive \
+                               WHERE substantive.session_id = s.id \
+                                 AND substantive.workspace_id = :ws \
+                                 AND substantive.project_id = :proj \
+                                 AND substantive.kind IN ('user-prompt','pre-tool-use','post-tool-use'))\
+                   {owner_clause}{receiver_clause} \
+                 GROUP BY s.id, s.agent_kind, s.started_at \
+                 ORDER BY last_activity DESC, s.started_at DESC, s.id DESC \
+                 LIMIT 1"
+            );
+            let ws_bytes = workspace_id.as_bytes();
+            let proj_bytes = project_id.as_bytes();
+            let receiver_bytes = receiving_session_id.map(|id| *id.as_bytes());
+            let mut named: Vec<(&str, &dyn rusqlite::ToSql)> = vec![
+                (":ws", &ws_bytes as &dyn rusqlite::ToSql),
+                (":proj", &proj_bytes as &dyn rusqlite::ToSql),
+            ];
+            if let OwnerFilter::User(owner) = &owner_filter {
+                named.push((":actor", owner));
+            }
+            if let Some(receiver) = &receiver_bytes {
+                named.push((":receiver", receiver));
+            }
+            let row = conn
+                .query_row(&sql, named.as_slice(), |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })
+                .optional()?;
+            let Some((id, agent, last_activity_us)) = row else {
+                return Ok(None);
+            };
+            let last_activity_at = jiff::Timestamp::from_microsecond(last_activity_us)
+                .map(|ts| ts.to_string())
+                .unwrap_or_default();
+            Ok(Some(InterruptedSessionCandidate {
+                session_id: SessionId::from_slice(&id)?,
+                agent_kind: AgentKind::from_wire(&agent),
+                last_activity_at,
+            }))
+        })
+        .await
     }
 
     async fn open_sessions_for_scope_agent_filtered(

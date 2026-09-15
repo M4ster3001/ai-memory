@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- Updated locked `rustls` 0.23.40 â†’ 0.23.45 (and `rustls-webpki` 0.103.13 â†’
+  0.103.15) for [RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285),
+  which made TLS 1.3 accept handshake messages at an invalid encryption level.
+  Lockfile-only change.
+
+### Fixed
+- A new agent session now receives a bounded, read-only recovery snapshot when
+  the previous substantive session in the same project disappeared without a
+  `SessionEnd` (for example API quota exhaustion, a killed process, or a machine
+  restart). The snapshot is assembled on demand from at most 64 already
+  sanitized observations and capped at 6,000 characters, so it does not create
+  a rolling copy of the transcript or an unbounded in-memory read. Selection is
+  project- and owner-scoped, excludes the receiving session, preserves the
+  untrusted-memory boundary, and never closes or claims the source because it
+  may still be a legitimate parallel agent. Normal single-use handoffs and
+  managed workstream packets remain unchanged (#720).
+
 ## [2.2.1] - 2026-09-12
 
 ### Fixed

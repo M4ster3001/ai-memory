@@ -90,6 +90,15 @@ from hook paths.
    frontmatter records `session_id` plus the immutable `sessions.agent_kind`
    as `agent`; it describes the page's harness origin, not the later writer.
    Manual page writes do not receive inferred agent metadata.
+   If a harness is cut off before `SessionEnd`, the next `SessionStart` also
+   looks for the most recently active substantive open session in the same
+   project and ownership boundary. It renders a read-only recovery snapshot
+   from the newest 64 stored observations with a 6,000-character ceiling. The
+   source remains open (parallel agents are valid), no extra handoff row is
+   created, and observations from other project scopes are not loaded. A
+   privacy-gated assistant `Stop` excerpt, when enabled, is preferred as the
+   latest checkpoint; otherwise recent prompts and lifecycle/tool metadata
+   still provide a continuation trail (#720).
 4. When `AI_MEMORY_LLM_PROVIDER` is set, `memory_consolidate` rewrites
    that summary into a richer durable page or fans out into a
    multi-page batch under `concepts/`, `decisions/`, `gotchas/`. Consolidation
