@@ -22,6 +22,21 @@
   </p>
 </section>
 
+{% if let Some(ingest) = dashboard.ingest %}
+<section aria-label="Hook capture health" class="mb-8 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900/50 p-5">
+  <div class="flex flex-wrap items-baseline justify-between gap-2">
+    <h2 class="text-base font-semibold text-slate-900 dark:text-slate-100">Hook capture health</h2>
+    <p class="text-xs text-slate-500">Since this server started; counters contain no prompt or command content.</p>
+  </div>
+  <div class="mt-4 grid grid-cols-2 lg:grid-cols-4 gap-3 text-sm">
+    <div><div class="text-slate-500">Accepted</div><div class="mt-1 text-xl font-semibold text-emerald-700 dark:text-emerald-300">{{ ingest.accepted }}</div></div>
+    <div><div class="text-slate-500">Policy-dropped</div><div class="mt-1 text-xl font-semibold">{{ ingest.dropped_by_policy }}</div></div>
+    <div><div class="text-slate-500">Capacity-shed</div><div class="mt-1 text-xl font-semibold {% if ingest.shed_saturated > 0 %}text-amber-700 dark:text-amber-300{% endif %}">{{ ingest.shed_saturated }}</div></div>
+    <div><div class="text-slate-500">Rate-limited</div><div class="mt-1 text-xl font-semibold {% if ingest.shed_rate_limited > 0 %}text-amber-700 dark:text-amber-300{% endif %}">{{ ingest.shed_rate_limited }}</div></div>
+  </div>
+</section>
+{% endif %}
+
 <div id="llm-notice" class="mb-6 hidden relative rounded-md border border-amber-200 dark:border-amber-900/50 bg-amber-50 dark:bg-amber-950/30 p-4 pr-10 text-sm text-amber-900 dark:text-amber-200">
   <button id="llm-notice-close" type="button" aria-label="Dismiss permanently" title="Don't show this again"
           class="absolute top-2 right-2 rounded p-1 text-amber-700 dark:text-amber-300 hover:bg-amber-100 dark:hover:bg-amber-900/40">

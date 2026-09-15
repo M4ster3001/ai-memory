@@ -127,6 +127,17 @@ pub(crate) struct DashboardStats {
     pub observation_count: u64,
     pub open_session_count: u64,
     pub last_activity_relative: String,
+    /// Process-local hook capture health. Empty only for standalone embeds;
+    /// the production server always supplies it.
+    pub ingest: Option<IngestStats>,
+}
+
+/// Content-free snapshot of hook ingestion health since this server started.
+pub(crate) struct IngestStats {
+    pub accepted: u64,
+    pub dropped_by_policy: u64,
+    pub shed_saturated: u64,
+    pub shed_rate_limited: u64,
 }
 
 /// The one-time 2.0 migration explainer dialog (docs/okf.md): shown

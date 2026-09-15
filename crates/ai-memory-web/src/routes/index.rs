@@ -9,7 +9,7 @@ use axum::response::Html;
 
 use crate::state::WebState;
 use crate::templates::{
-    DashboardStats, OkfDialog, ProjectCard, ProjectsView, humanize, project_href,
+    DashboardStats, IngestStats, OkfDialog, ProjectCard, ProjectsView, humanize, project_href,
 };
 
 /// Handler for `GET /`.
@@ -33,6 +33,15 @@ pub(crate) async fn handler(
             .find_map(|s| s.last_activity.as_deref())
             .map(humanize)
             .unwrap_or_default(),
+        ingest: state.ingest_metrics.as_ref().map(|metrics| {
+            let snapshot = metrics.snapshot();
+            IngestStats {
+                accepted: snapshot.accepted,
+                dropped_by_policy: snapshot.dropped_by_policy,
+                shed_saturated: snapshot.shed_saturated,
+                shed_rate_limited: snapshot.shed_rate_limited,
+            }
+        }),
     };
     let projects = summaries
         .into_iter()
