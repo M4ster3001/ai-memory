@@ -3,13 +3,20 @@
 {% block title %}Projects — ai-memory{% endblock %}
 
 {% block content %}
+<style>
+  /* The shipped Tailwind stylesheet is vendored. Keep these dashboard-only
+     grids explicit so a stale utility build cannot collapse their cards. */
+  .memory-summary-grid, .memory-hook-health-grid { display: grid; grid-template-columns: repeat(1, minmax(0, 1fr)); gap: .75rem; }
+  @media (min-width: 640px) { .memory-summary-grid, .memory-hook-health-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  @media (min-width: 1024px) { .memory-summary-grid { grid-template-columns: repeat(5, minmax(0, 1fr)); } .memory-hook-health-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
+</style>
 <div class="mb-6">
   <h1 class="text-2xl font-bold text-slate-900 dark:text-slate-100">Memory dashboard</h1>
   <p class="mt-1 text-sm text-slate-500 dark:text-slate-400">Human-facing overview of capture, continuity, and compiled memory.</p>
 </div>
 
 <section aria-label="Memory health overview" class="mb-8">
-  <div class="grid grid-cols-2 lg:grid-cols-5 gap-3">
+  <div class="memory-summary-grid">
     <div class="rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-4"><div class="text-xs text-slate-500">Projects</div><div class="mt-1 text-2xl font-semibold">{{ dashboard.project_count }}</div></div>
     <div class="rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-4"><div class="text-xs text-slate-500">Sessions</div><div class="mt-1 text-2xl font-semibold">{{ dashboard.session_count }}</div></div>
     <div class="rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-4"><div class="text-xs text-slate-500">Captured events</div><div class="mt-1 text-2xl font-semibold">{{ dashboard.observation_count }}</div></div>
@@ -28,7 +35,7 @@
     <h2 class="text-base font-semibold text-slate-900 dark:text-slate-100">Hook capture health</h2>
     <p class="text-xs text-slate-500">Since this server started; counters contain no prompt or command content.</p>
   </div>
-  <div class="mt-4 grid grid-cols-2 lg:grid-cols-4 gap-3 text-sm">
+  <div class="memory-hook-health-grid mt-4 text-sm">
     <div><div class="text-slate-500">Accepted</div><div class="mt-1 text-xl font-semibold text-emerald-700 dark:text-emerald-300">{{ ingest.accepted }}</div></div>
     <div><div class="text-slate-500">Policy-dropped</div><div class="mt-1 text-xl font-semibold">{{ ingest.dropped_by_policy }}</div></div>
     <div><div class="text-slate-500">Capacity-shed</div><div class="mt-1 text-xl font-semibold {% if ingest.shed_saturated > 0 %}text-amber-700 dark:text-amber-300{% endif %}">{{ ingest.shed_saturated }}</div></div>
