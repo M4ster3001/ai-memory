@@ -9,7 +9,9 @@ use axum::http::StatusCode;
 use axum::response::Html;
 
 use crate::state::WebState;
-use crate::templates::{Folder, PageRow, ProjectView, humanize, page_href};
+use crate::templates::{
+    Folder, PageRow, ProjectMemoryStats, ProjectView, humanize, page_href,
+};
 
 /// Handler for `GET /w/:workspace/:project`.
 pub(crate) async fn handler(
@@ -21,6 +23,40 @@ pub(crate) async fn handler(
         .list_pages(&workspace, &project)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // The page tree alone is a poor explanation for projects where hooks are
+    // working but compilation has not produced a page yet. Reuse the same
+    // metadata-only aggregate behind the dashboard; raw observations remain
+    // accessible only through scoped API detail routes.
+    let summary = state
+        .reader
+        .list_projects_with_stats()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .into_iter()
+        .find(|item| item.workspace_name == workspace && item.project_name == project);
+    let stats = match summary {
+        Some(item) => ProjectMemoryStats {
+            page_count: item.page_count,
+            session_count: item.session_count,
+            observation_count: item.observation_count,
+            open_session_count: item.open_session_count,
+            last_activity_relative: item
+                .last_activity
+                .as_deref()
+                .map(humanize)
+                .unwrap_or_default(),
+        },
+        // A page listing may still be visible while aggregate metadata is
+        // being refreshed. Preserve a truthful compiled-page count.
+        None => ProjectMemoryStats {
+            page_count: pages.len() as u64,
+            session_count: 0,
+            observation_count: 0,
+            open_session_count: 0,
+            last_activity_relative: String::new(),
+        },
+    };
 
     // Build sidebar folder trees (group by first path segment), split
     // into knowledge and machinery. A store accumulates far more
@@ -91,6 +127,7 @@ pub(crate) async fn handler(
     let html = ProjectView {
         workspace,
         project,
+        stats,
         folders,
         system,
         recent,

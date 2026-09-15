@@ -6,9 +6,14 @@
 <style>
   /* The shipped Tailwind stylesheet is vendored. Keep these dashboard-only
      grids explicit so a stale utility build cannot collapse their cards. */
-  .memory-summary-grid, .memory-hook-health-grid { display: grid; grid-template-columns: repeat(1, minmax(0, 1fr)); gap: .75rem; }
-  @media (min-width: 640px) { .memory-summary-grid, .memory-hook-health-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  .memory-summary-grid, .memory-hook-health-grid, .project-cards-grid { display: grid; grid-template-columns: repeat(1, minmax(0, 1fr)); gap: .75rem; }
+  .project-card-metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .5rem; }
+  .project-card-metric { border: 1px solid rgb(226 232 240); border-radius: .375rem; padding: .5rem; }
+  .project-card-footer { display: flex; align-items: center; justify-content: space-between; gap: .75rem; margin-top: .75rem; }
+  @media (min-width: 640px) { .memory-summary-grid, .memory-hook-health-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .project-cards-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  @media (min-width: 1024px) { .project-cards-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
   @media (min-width: 1024px) { .memory-summary-grid { grid-template-columns: repeat(5, minmax(0, 1fr)); } .memory-hook-health-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
+  .dark .project-card-metric { border-color: rgb(30 41 59); }
 </style>
 <div class="mb-6">
   <h1 class="text-2xl font-bold text-slate-900 dark:text-slate-100">Memory dashboard</h1>
@@ -153,21 +158,24 @@
   </p>
 </div>
 {% else %}
-<div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+<div class="project-cards-grid">
   {% for card in projects %}
-  <a href="{{ card.href }}" class="block rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-5 hover:border-blue-400 dark:hover:border-blue-600 hover:shadow-sm transition-all">
+  <a href="{{ card.href }}" class="block rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-5 hover:border-blue-400 dark:hover:border-blue-600 hover:shadow-sm transition-all" aria-label="Open {{ card.workspace }}/{{ card.project }}">
     <div class="text-xs font-medium text-slate-400 dark:text-slate-500 mb-1">{{ card.workspace }}</div>
     <div class="text-base font-semibold text-slate-800 dark:text-slate-100 truncate">{{ card.project }}</div>
-    <div class="mt-3 flex flex-wrap gap-x-3 gap-y-1 text-xs text-slate-500 dark:text-slate-400">
-      <span>{{ card.session_count }} session{% if card.session_count != 1 %}s{% endif %}</span>
-      <span>{{ card.observation_count }} event{% if card.observation_count != 1 %}s{% endif %}</span>
-      <span>{{ card.page_count }} page{% if card.page_count != 1 %}s{% endif %}</span>
-      {% if card.open_session_count > 0 %}<span class="text-amber-700 dark:text-amber-300">{{ card.open_session_count }} open</span>{% endif %}
+    <div class="project-card-metrics mt-3 text-xs">
+      <div class="project-card-metric"><div class="text-slate-500 dark:text-slate-400">Sessions</div><div class="mt-1 font-semibold text-slate-800 dark:text-slate-100">{{ card.session_count }}</div></div>
+      <div class="project-card-metric"><div class="text-slate-500 dark:text-slate-400">Captured events</div><div class="mt-1 font-semibold text-slate-800 dark:text-slate-100">{{ card.observation_count }}</div></div>
+      <div class="project-card-metric"><div class="text-slate-500 dark:text-slate-400">Compiled pages</div><div class="mt-1 font-semibold text-slate-800 dark:text-slate-100">{{ card.page_count }}</div></div>
+      <div class="project-card-metric {% if card.open_session_count > 0 %}bg-amber-50 dark:bg-amber-950/20{% endif %}"><div class="text-slate-500 dark:text-slate-400">Open sessions</div><div class="mt-1 font-semibold {% if card.open_session_count > 0 %}text-amber-700 dark:text-amber-300{% else %}text-emerald-700 dark:text-emerald-300{% endif %}">{{ card.open_session_count }}</div></div>
     </div>
-    <div class="mt-2 flex items-center justify-end text-xs text-slate-500 dark:text-slate-400">
+    <div class="project-card-footer text-xs text-slate-500 dark:text-slate-400">
       {% if card.last_updated_relative != "" %}
-      <span>{{ card.last_updated_relative }}</span>
+      <span>Last capture {{ card.last_updated_relative }}</span>
+      {% else %}
+      <span>No capture yet</span>
       {% endif %}
+      <span class="font-medium text-blue-700 dark:text-blue-300">Open project â†’</span>
     </div>
   </a>
   {% endfor %}

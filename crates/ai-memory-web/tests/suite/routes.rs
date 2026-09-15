@@ -141,6 +141,9 @@ async fn smoke_project_page_returns_200() {
         text.contains("Bar Note"),
         "expected page title in project response"
     );
+    assert!(text.contains("Project capture summary"));
+    assert!(text.contains("Captured events"));
+    assert!(text.contains("Compiled pages"));
 }
 
 #[tokio::test]
