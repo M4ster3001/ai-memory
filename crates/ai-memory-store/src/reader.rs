@@ -2825,7 +2825,7 @@ impl ReaderPool {
         Ok(sessions.pop())
     }
 
-    /// Return the most recently active substantive open session in a scope.
+    /// Return the most recently active substantive interrupted session in a scope.
     ///
     /// This powers startup recovery when a harness disappears without a
     /// `SessionEnd` (quota exhaustion, process kill, machine restart). The
@@ -2835,7 +2835,11 @@ impl ReaderPool {
     /// supported workflow and an open row is not proof that its process died.
     ///
     /// A candidate must contain at least one prompt or tool observation in the
-    /// exact scope. Lifecycle-only sessions never produce recovery noise.
+    /// exact scope. Lifecycle-only sessions never produce recovery noise. Some
+    /// harnesses reuse a session id after they previously emitted `SessionEnd`;
+    /// those rows are eligible again only when a substantive observation is
+    /// newer than the recorded end. This preserves normal completed-session
+    /// behavior while avoiding a silent continuity gap after quota recovery.
     ///
     /// # Errors
     /// Propagates any SQL or pool error.
@@ -2862,7 +2866,14 @@ impl ReaderPool {
                  FROM sessions s \
                  JOIN observations o ON o.session_id = s.id \
                  WHERE s.workspace_id = :ws AND s.project_id = :proj \
-                   AND s.ended_at IS NULL \
+                   AND (s.ended_at IS NULL OR EXISTS ( \
+                       SELECT 1 FROM observations resumed \
+                       WHERE resumed.session_id = s.id \
+                         AND resumed.workspace_id = :ws \
+                         AND resumed.project_id = :proj \
+                         AND resumed.kind IN ('user-prompt','pre-tool-use','post-tool-use') \
+                         AND resumed.created_at > s.ended_at \
+                   )) \
                    AND o.workspace_id = :ws AND o.project_id = :proj \
                    AND EXISTS (SELECT 1 FROM observations substantive \
                                WHERE substantive.session_id = s.id \
