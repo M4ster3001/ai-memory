@@ -202,6 +202,9 @@ pub(crate) struct ProjectView {
     pub workspace: String,
     /// Project name.
     pub project: String,
+    /// Capture metadata for the project. Deliberately excludes raw prompt,
+    /// command and observation bodies from the human dashboard.
+    pub stats: ProjectMemoryStats,
     /// Sidebar folder tree — knowledge pages only.
     pub folders: Vec<Folder>,
     /// Machinery pages (lint reports, sessions, logs, indexes),
@@ -209,6 +212,20 @@ pub(crate) struct ProjectView {
     pub system: Vec<Folder>,
     /// N most-recent knowledge pages for the right column.
     pub recent: Vec<PageRow>,
+}
+
+/// Privacy-preserving project-level capture summary.
+pub(crate) struct ProjectMemoryStats {
+    /// Number of compiled memory pages.
+    pub page_count: u64,
+    /// Sessions recorded for this project.
+    pub session_count: u64,
+    /// Sanitized events recorded for the project.
+    pub observation_count: u64,
+    /// Sessions without a SessionEnd event.
+    pub open_session_count: u64,
+    /// Humanised latest capture timestamp, if one exists.
+    pub last_activity_relative: String,
 }
 
 /// View-model for a namespace (directory) listing — `GET
