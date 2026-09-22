@@ -8,6 +8,7 @@
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::Arc;
 
 use ai_memory_core::{
@@ -4100,6 +4101,112 @@ impl ReaderPool {
             Ok(out)
         })
         .await
+    }
+
+    /// Best-effort harness attribution for the web UI: for every
+    /// `is_latest = 1` page in scope, the [`AgentKind`] of the most
+    /// recently cited session in its `page_evidence` (P2, kind
+    /// `'session'`). Pages with no session evidence — hand-written pages,
+    /// or writes from before the P2 evidence substrate shipped — are
+    /// simply absent from the map, the same "unknown, not unsupported"
+    /// convention as [`Self::page_evidence_counts`].
+    ///
+    /// Two queries total regardless of page count: evidence rows for the
+    /// scope, then one batched `sessions` lookup for the distinct session
+    /// ids involved. A malformed session id (evidence is only ever written
+    /// by us) or a session row that no longer exists is skipped rather than
+    /// failing the whole call — this is decorative UI metadata, not a
+    /// correctness-critical read.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn latest_page_agent_kinds(
+        &self,
+        workspace: &str,
+        project: &str,
+    ) -> StoreResult<std::collections::HashMap<String, AgentKind>> {
+        let workspace = workspace.to_owned();
+        let project = project.to_owned();
+        let evidence_rows: Vec<(String, String, i64)> = self
+            .with_conn(move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT pg.path, pe.source_id, pe.created_at \
+                     FROM pages pg \
+                     JOIN page_evidence pe ON pe.page_id = pg.id AND pe.source_kind = 'session' \
+                     JOIN projects p ON p.id = pg.project_id \
+                     JOIN workspaces w ON w.id = pg.workspace_id \
+                     WHERE w.name = ?1 AND p.name = ?2 AND pg.is_latest = 1",
+                )?;
+                let rows = stmt.query_map(params![workspace, project], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(StoreError::from)
+            })
+            .await?;
+
+        let mut latest_session_by_path: std::collections::HashMap<String, (SessionId, i64)> =
+            std::collections::HashMap::new();
+        for (path, session_id_str, created_at) in evidence_rows {
+            let Ok(session_id) = SessionId::from_str(&session_id_str) else {
+                continue;
+            };
+            latest_session_by_path
+                .entry(path)
+                .and_modify(|(existing_id, existing_at)| {
+                    if created_at > *existing_at {
+                        *existing_id = session_id;
+                        *existing_at = created_at;
+                    }
+                })
+                .or_insert((session_id, created_at));
+        }
+        if latest_session_by_path.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        let session_ids: Vec<SessionId> = latest_session_by_path
+            .values()
+            .map(|(id, _)| *id)
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        let session_id_blobs: Vec<Value> = session_ids
+            .iter()
+            .map(|id| Value::Blob(id.as_bytes().to_vec()))
+            .collect();
+        let agent_by_session: std::collections::HashMap<SessionId, AgentKind> = self
+            .with_conn(move |conn| {
+                let placeholders = std::iter::repeat_n("?", session_id_blobs.len())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let sql =
+                    format!("SELECT id, agent_kind FROM sessions WHERE id IN ({placeholders})");
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt.query_map(params_from_iter(session_id_blobs.iter()), |row| {
+                    Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
+                })?;
+                let mut out = std::collections::HashMap::new();
+                for r in rows {
+                    let (id_bytes, agent) = r?;
+                    if let Ok(id) = SessionId::from_slice(&id_bytes) {
+                        out.insert(id, AgentKind::from_wire(&agent));
+                    }
+                }
+                Ok(out)
+            })
+            .await?;
+
+        Ok(latest_session_by_path
+            .into_iter()
+            .filter_map(|(path, (session_id, _))| {
+                agent_by_session.get(&session_id).map(|kind| (path, *kind))
+            })
+            .collect())
     }
 
     /// Rank pages by how many of the query's tokens match their indexed
@@ -9465,8 +9572,8 @@ mod tests {
 
     use ai_memory_core::{
         AgentKind, Handoff, HandoffContent, HandoffId, HandoffLifecycle, HandoffOrigin,
-        HandoffScope, HandoffState, NewHandoff, NewSession, OwnerFilter, ProjectId, SessionId,
-        WorkspaceId,
+        HandoffScope, HandoffState, NewHandoff, NewPage, NewSession, OwnerFilter, PageEvidence,
+        PageEvidenceKind, PagePath, ProjectId, SessionId, Tier, WorkspaceId,
     };
 
     #[test]
@@ -10260,5 +10367,100 @@ mod tests {
         assert!(sql.contains("json_extract(pages.frontmatter_json, '$.summary')"));
         assert!(sql.contains("NULLIF(TRIM("));
         assert!(sql.contains("substr(pages.body, 1, 600)"));
+    }
+
+    fn evidence_test_page(ws: WorkspaceId, proj: ProjectId, path: &str) -> NewPage {
+        NewPage {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new(path).unwrap(),
+            title: "test".into(),
+            body: "body".into(),
+            tier: Tier::Semantic,
+            frontmatter_json: serde_json::json!({}),
+            pinned: false,
+            links: Vec::new(),
+            author_id: None,
+            expires_at: None,
+            entities: Vec::new(),
+            evidence: Vec::new(),
+        }
+    }
+
+    /// The web dashboard's per-page agent badge (#722): the harness whose
+    /// session most recently cited a page as evidence. Only the *latest*
+    /// citation should win when a page has been touched by more than one
+    /// agent, and a page with no session evidence at all must be absent
+    /// from the map rather than reported as some default.
+    #[tokio::test]
+    async fn latest_page_agent_kinds_prefers_the_most_recent_session_citation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store.writer.get_or_create_workspace("acme").await.unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "webapp", None)
+            .await
+            .unwrap();
+
+        let codex_session = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: codex_session,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Codex,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        let claude_session = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: claude_session,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::ClaudeCode,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+
+        // Cited first by Codex, then by Claude Code — the join must report
+        // the later one, not the first or an arbitrary one.
+        let mut page = evidence_test_page(ws, proj, "concepts/attribution.md");
+        page.evidence = vec![PageEvidence {
+            kind: PageEvidenceKind::Session,
+            source_id: codex_session.to_string(),
+        }];
+        store.writer.upsert_page(page.clone()).await.unwrap();
+        page.evidence = vec![PageEvidence {
+            kind: PageEvidenceKind::Session,
+            source_id: claude_session.to_string(),
+        }];
+        store.writer.upsert_page(page).await.unwrap();
+
+        // A hand-written page with no session evidence at all.
+        let unattributed = evidence_test_page(ws, proj, "concepts/no-evidence.md");
+        store.writer.upsert_page(unattributed).await.unwrap();
+
+        let by_path = store
+            .reader
+            .latest_page_agent_kinds("acme", "webapp")
+            .await
+            .unwrap();
+        assert_eq!(
+            by_path.get("concepts/attribution.md"),
+            Some(&AgentKind::ClaudeCode),
+            "the later citation must win"
+        );
+        assert!(
+            !by_path.contains_key("concepts/no-evidence.md"),
+            "a page with no session evidence must be absent, not defaulted"
+        );
     }
 }

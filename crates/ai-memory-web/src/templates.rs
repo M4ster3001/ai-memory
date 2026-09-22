@@ -39,6 +39,38 @@ fn encode_path(path: &str) -> String {
         .join("/")
 }
 
+/// Human-readable label for an agent-kind badge (`claude-code` → `Claude
+/// Code`). Purely a display concern — the wire form
+/// ([`ai_memory_core::AgentKind::as_str`]) stays the identity used
+/// everywhere else.
+#[must_use]
+pub(crate) fn agent_label(kind: ai_memory_core::AgentKind) -> &'static str {
+    use ai_memory_core::AgentKind;
+    match kind {
+        AgentKind::ClaudeCode => "Claude Code",
+        AgentKind::Codex => "Codex",
+        AgentKind::OpenCode => "OpenCode",
+        AgentKind::Cursor => "Cursor",
+        AgentKind::GeminiCli => "Gemini CLI",
+        AgentKind::ClaudeDesktop => "Claude Desktop",
+        AgentKind::OpenClaw => "OpenClaw",
+        AgentKind::AntigravityCli => "Antigravity CLI",
+        AgentKind::Omp => "Oh My Pi",
+        AgentKind::Pi => "Pi",
+        AgentKind::Crush => "Crush",
+        AgentKind::Grok => "Grok Build CLI",
+        AgentKind::Zero => "Zero",
+        AgentKind::Devin => "Devin",
+        AgentKind::KimiCode => "Kimi Code",
+        AgentKind::KiroCli => "Kiro CLI",
+        AgentKind::CommandCode => "Command Code",
+        AgentKind::Hermes => "Hermes",
+        AgentKind::Pool => "Pool",
+        AgentKind::Zcode => "ZCode",
+        AgentKind::Other => "Other",
+    }
+}
+
 fn encode_segment(segment: &str) -> String {
     let mut out = String::with_capacity(segment.len());
     for byte in segment.bytes() {
@@ -184,6 +216,19 @@ pub(crate) struct PageRow {
     pub kind: String,
     /// Humanised updated timestamp.
     pub updated_relative: String,
+    /// Harness that most recently contributed evidence to this page
+    /// version, if any is recorded (P2 evidence substrate). `None` for
+    /// hand-written pages or writes that predate it — omitted from the
+    /// badge row rather than shown as "unknown".
+    pub agent_label: Option<&'static str>,
+}
+
+/// One agent-kind badge with a session count, for the project stats card.
+pub(crate) struct AgentBadge {
+    /// Human-readable label (`Claude Code`, `Codex`, ...).
+    pub label: &'static str,
+    /// Sessions recorded for this agent in the project.
+    pub count: u64,
 }
 
 /// A folder in the sidebar tree (groups pages by first path segment).
@@ -212,6 +257,9 @@ pub(crate) struct ProjectView {
     pub system: Vec<Folder>,
     /// N most-recent knowledge pages for the right column.
     pub recent: Vec<PageRow>,
+    /// Sessions grouped by the agent CLI that ran them, most-used first.
+    /// Empty when the project has no sessions yet.
+    pub by_agent: Vec<AgentBadge>,
 }
 
 /// Privacy-preserving project-level capture summary.

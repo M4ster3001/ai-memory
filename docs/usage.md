@@ -122,6 +122,22 @@ a page: a query aimed at a session-specific term can still return that session.
 `pinned` remains primarily a retention and automation-mutation control, not an
 unconditional search override.
 
+### Keep a lookup cheap
+
+`memory_read_session_observations` defaults to 20 rows of up to 1000
+characters each, and `memory_read_page` defaults to a 12,000-character cap —
+both are read-only and both accept a bigger `limit`/`body_max_chars`/
+`max_chars` when you actually need the full transcript or page. For a "what
+did this session do" or "where did it stop" question, a narrow
+`order: "desc"` read with a `kinds` filter such as
+`["user-prompt", "stop", "session-end"]` is normally enough.
+
+The other lever is the asking session itself, not ai-memory: a question sent
+into a long-idle agent session re-caches that session's entire context before
+the first tool call runs, and every subsequent tool call re-reads it. A quick
+lookup like this is far cheaper started in a fresh session (or a subagent)
+than appended to one that has been idle for hours.
+
 ## Historical memory and live code intelligence
 
 ai-memory can run beside CodeGraph, an LSP-backed service, a SCIP/LSIF index,

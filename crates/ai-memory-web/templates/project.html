@@ -32,6 +32,16 @@
     {% if stats.last_activity_relative != "" %}Last capture {{ stats.last_activity_relative }}. {% endif %}
     {% if stats.open_session_count > 0 %}Open means no SessionEnd was received; it may be an active agent or an interruption.{% else %}No currently open session is recorded.{% endif %}
   </p>
+  {% if !by_agent.is_empty() %}
+  <div class="mt-4 flex flex-wrap items-center gap-2 border-t border-slate-200 dark:border-slate-800 pt-4">
+    <span class="text-xs text-slate-500 dark:text-slate-400">Agents:</span>
+    {% for badge in by_agent %}
+    <span class="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium bg-blue-50 dark:bg-blue-950/40 text-blue-700 dark:text-blue-300 border border-blue-100 dark:border-blue-900">
+      {{ badge.label }} <span class="text-blue-500 dark:text-blue-400">· {{ badge.count }}</span>
+    </span>
+    {% endfor %}
+  </div>
+  {% endif %}
 </section>
 
 <div class="flex flex-col md:flex-row gap-8">
@@ -108,6 +118,11 @@
             <span class="inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400">
               {{ page.kind }}
             </span>
+            {% if let Some(agent) = page.agent_label %}
+            <span class="inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium bg-blue-50 dark:bg-blue-950/40 text-blue-700 dark:text-blue-300">
+              {{ agent }}
+            </span>
+            {% endif %}
             <span class="text-xs text-slate-400 dark:text-slate-500 truncate">{{ page.path }}</span>
           </div>
         </div>

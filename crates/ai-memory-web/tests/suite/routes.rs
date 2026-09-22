@@ -3,7 +3,10 @@
 //! Spins up a `Store` + `Wiki` in a tempdir, seeds two pages, builds
 //! the router, and exercises each route via `tower::ServiceExt::oneshot`.
 
-use ai_memory_core::{AgentKind, NewHandoff, NewPage, PagePath, Tier};
+use ai_memory_core::{
+    AgentKind, NewHandoff, NewPage, NewSession, PageEvidence, PageEvidenceKind, PagePath,
+    SessionId, Tier,
+};
 use ai_memory_store::Store;
 use ai_memory_web::{api_router, router};
 use ai_memory_wiki::{Wiki, WritePageRequest};
@@ -3052,6 +3055,78 @@ async fn project_view_separates_machinery_from_knowledge() {
     assert!(knowledge.contains("Retrieval Concept"));
     assert!(knowledge.contains("Deploy Policy Rule"));
     assert!(!knowledge.contains("Session abc123"));
+}
+
+/// The project overview shows which agent CLIs produced its memory: a
+/// session-count breakdown in the stats card, and, on each Recent Activity
+/// row, the harness whose session most recently cited that page as
+/// evidence (#722).
+#[tokio::test]
+async fn project_view_shows_agent_attribution() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+
+    let session_id = SessionId::new();
+    store
+        .writer
+        .begin_session(NewSession {
+            id: session_id,
+            workspace_id: ws,
+            project_id: proj,
+            agent_kind: AgentKind::ClaudeCode,
+            cwd: None,
+            actor_user: None,
+        })
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_page(NewPage {
+            evidence: vec![PageEvidence {
+                kind: PageEvidenceKind::Session,
+                source_id: session_id.to_string(),
+            }],
+            ..new_page(
+                ws,
+                proj,
+                "concepts/retrieval.md",
+                "Retrieval Concept",
+                "body text",
+            )
+        })
+        .await
+        .unwrap();
+
+    let app = router(store.reader.clone(), wiki.clone());
+    let req = Request::builder()
+        .uri("/w/default/scratch")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = std::str::from_utf8(&body).unwrap();
+
+    assert!(
+        text.contains("Agents:"),
+        "the stats card must show the per-agent session breakdown"
+    );
+    let recent = &text[text.find("Recent Activity").expect("recent heading")..];
+    assert!(
+        recent.contains("Claude Code"),
+        "the page cited by the Claude Code session must carry that badge"
+    );
 }
 
 #[tokio::test]

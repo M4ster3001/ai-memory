@@ -26,7 +26,9 @@ use ai_memory_mcp::{
 use ai_memory_store::{
     ReaderPool, Store, TokenPepper, WriterHandle, hash_session_secret, hash_token,
 };
-use ai_memory_web::{WebMountSpec, normalize_prefix, split_web_routers_with_metrics, web_base_href};
+use ai_memory_web::{
+    WebMountSpec, normalize_prefix, split_web_routers_with_metrics, web_base_href,
+};
 use ai_memory_wiki::{WatcherHandle, Wiki, migrations, run_wiki_migrations};
 use anyhow::{Context, Result};
 use axum::body::Body;

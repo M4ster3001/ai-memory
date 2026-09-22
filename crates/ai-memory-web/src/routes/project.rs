@@ -8,9 +8,12 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::Html;
 
+use ai_memory_core::OwnerFilter;
+use ai_memory_store::lookup_existing_scope;
+
 use crate::state::WebState;
 use crate::templates::{
-    Folder, PageRow, ProjectMemoryStats, ProjectView, humanize, page_href,
+    AgentBadge, Folder, PageRow, ProjectMemoryStats, ProjectView, agent_label, humanize, page_href,
 };
 
 /// Handler for `GET /w/:workspace/:project`.
@@ -58,6 +61,39 @@ pub(crate) async fn handler(
         },
     };
 
+    // Which agent CLIs produced this project's memory. This is a
+    // read-only, unauthenticated dashboard shared by every operator on the
+    // project (see the multi-session/multi-user invariant), so the count
+    // deliberately covers every owner rather than the (nonexistent) caller
+    // identity — same aggregate posture as `stats` above. Best-effort: a
+    // project with no resolvable scope yet (no sessions recorded) just
+    // shows no breakdown rather than failing the whole page.
+    let by_agent: Vec<AgentBadge> = match lookup_existing_scope(&state.reader, &workspace, &project)
+        .await
+    {
+        Ok(scope) => state
+            .reader
+            .session_counts_by_agent(scope.workspace_id, scope.project_id, OwnerFilter::Any, None)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|row| AgentBadge {
+                label: agent_label(ai_memory_core::AgentKind::from_wire(&row.agent)),
+                count: row.sessions,
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+
+    // Best-effort per-page attribution: the harness whose session most
+    // recently contributed evidence to each page. Decorative UI metadata,
+    // so a lookup failure just means no badges rather than a broken page.
+    let agent_by_path = state
+        .reader
+        .latest_page_agent_kinds(&workspace, &project)
+        .await
+        .unwrap_or_default();
+
     // Build sidebar folder trees (group by first path segment), split
     // into knowledge and machinery. A store accumulates far more
     // machinery pages (lint reports, session captures, monthly logs,
@@ -91,6 +127,7 @@ pub(crate) async fn handler(
             title: p.title.clone(),
             kind: p.kind.clone(),
             updated_relative: humanize(&p.updated_at),
+            agent_label: None,
         });
     }
     let folders: Vec<Folder> = knowledge_map
@@ -116,6 +153,7 @@ pub(crate) async fn handler(
     let recent: Vec<PageRow> = sorted
         .into_iter()
         .map(|p| PageRow {
+            agent_label: agent_by_path.get(&p.path).copied().map(agent_label),
             path: p.path.clone(),
             href: page_href(&workspace, &project, &p.path),
             title: p.title.clone(),
@@ -131,6 +169,7 @@ pub(crate) async fn handler(
         folders,
         system,
         recent,
+        by_agent,
     }
     .render()
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
