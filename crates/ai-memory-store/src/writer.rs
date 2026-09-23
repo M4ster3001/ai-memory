@@ -153,6 +153,10 @@ pub(crate) enum WriteCmd {
         min_age_days: u32,
         reply: oneshot::Sender<StoreResult<Vec<String>>>,
     },
+    CloseAbandonedSessions {
+        cutoff_us: i64,
+        reply: oneshot::Sender<StoreResult<u64>>,
+    },
     InsertObservation {
         obs: NewObservation,
         reply: oneshot::Sender<StoreResult<ObservationId>>,
@@ -961,6 +965,23 @@ impl WriterHandle {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::SweepHollowProjects {
             min_age_days,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Close every session, in every scope, open with no activity since
+    /// before `cutoff_us` (#722 follow-up safety net). No usage, no
+    /// consolidation — see [`ops::close_abandoned_sessions`] for why.
+    /// Returns the number of sessions closed.
+    ///
+    /// # Errors
+    /// Propagates store failures.
+    pub async fn close_abandoned_sessions(&self, cutoff_us: i64) -> StoreResult<u64> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::CloseAbandonedSessions {
+            cutoff_us,
             reply: tx,
         })
         .await?;
@@ -2751,6 +2772,10 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             } => {
                 let result = ops::sweep_hollow_projects(&mut conn, min_age_days);
                 send_or_warn(reply, result, "sweep_hollow_projects");
+            }
+            WriteCmd::CloseAbandonedSessions { cutoff_us, reply } => {
+                let result = ops::close_abandoned_sessions(&conn, cutoff_us);
+                send_or_warn(reply, result, "close_abandoned_sessions");
             }
             WriteCmd::InsertObservation { obs, reply } => {
                 let result = ops::insert_observation(&mut conn, &obs);

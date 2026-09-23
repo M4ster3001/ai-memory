@@ -671,6 +671,11 @@ pub struct InterruptedSessionCandidate {
     pub agent_kind: AgentKind,
     /// ISO-8601 timestamp of the most recent in-scope observation.
     pub last_activity_at: String,
+    /// Captured session cwd, if available. Lets a client-side backfill
+    /// locate the source session's own transcript file (its native
+    /// harness's on-disk layout is typically keyed by cwd), separate from
+    /// scope resolution — untrusted display/lookup data, never identity.
+    pub cwd: Option<String>,
 }
 
 /// One session as listed from a scope by [`ReaderPool::sessions_for_scope`]
@@ -2952,7 +2957,7 @@ impl ReaderPool {
                 ""
             };
             let sql = format!(
-                "SELECT s.id, s.agent_kind, MAX(o.created_at) AS last_activity \
+                "SELECT s.id, s.agent_kind, MAX(o.created_at) AS last_activity, s.cwd \
                  FROM sessions s \
                  JOIN observations o ON o.session_id = s.id \
                  WHERE s.workspace_id = :ws AND s.project_id = :proj \
@@ -2971,7 +2976,7 @@ impl ReaderPool {
                                  AND substantive.project_id = :proj \
                                  AND substantive.kind IN ('user-prompt','pre-tool-use','post-tool-use'))\
                    {owner_clause}{receiver_clause} \
-                 GROUP BY s.id, s.agent_kind, s.started_at \
+                 GROUP BY s.id, s.agent_kind, s.started_at, s.cwd \
                  ORDER BY last_activity DESC, s.started_at DESC, s.id DESC \
                  LIMIT 1"
             );
@@ -2994,10 +2999,11 @@ impl ReaderPool {
                         row.get::<_, Vec<u8>>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, i64>(2)?,
+                        row.get::<_, Option<String>>(3)?,
                     ))
                 })
                 .optional()?;
-            let Some((id, agent, last_activity_us)) = row else {
+            let Some((id, agent, last_activity_us, cwd)) = row else {
                 return Ok(None);
             };
             let last_activity_at = jiff::Timestamp::from_microsecond(last_activity_us)
@@ -3007,6 +3013,7 @@ impl ReaderPool {
                 session_id: SessionId::from_slice(&id)?,
                 agent_kind: AgentKind::from_wire(&agent),
                 last_activity_at,
+                cwd,
             }))
         })
         .await

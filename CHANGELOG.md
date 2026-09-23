@@ -39,6 +39,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tokens) with the 20 most recent sessions. Best-effort throughout: a session
   whose harness never reported usage, an unsupported harness, or an older
   client all just show no number, never a zeroed one.
+- A session that never gets a graceful `session-end` — most commonly a paid
+  quota running out mid-task, so the harness gets killed and the operator
+  switches to a different agent/account to keep going — no longer stays
+  "open" and token-less forever. When a new session starts in the same
+  scope and finds one quiet for at least 15 minutes, the client best-effort
+  locates that old session's own transcript (Claude Code and Codex), reports
+  its usage, and closes it with a normal synthetic `session-end` — safe even
+  if the old session turns out to still be live, since a later real
+  `session-end` with more work already re-runs the full end path. A separate,
+  much more conservative scheduled sweep (48h of no activity, every scope)
+  closes sessions that are never continued anywhere, so `open_session_count`
+  stops leaking forever; that path never attaches usage or triggers
+  consolidation, since the server has no access to a client's transcript
+  outside a live hook request.
 
 ### Changed
 - `memory_read_session_observations`'s defaults are smaller: `limit` 50 → 20,

@@ -1409,6 +1409,45 @@ fn end_session_row(
     Ok(())
 }
 
+/// Close every session across every scope that has been open with no
+/// activity since before `cutoff_us` (#722 follow-up safety net).
+///
+/// This is the general case a `SessionStart`-triggered backfill never
+/// reaches — a session that is never continued anywhere, in any scope, so
+/// nothing ever asks the store about it again. It exists only to stop
+/// `open_session_count` leaking forever; deliberately narrower than a
+/// normal session end:
+/// - No usage is attached (the server has no access to a client's
+///   transcript file outside a live hook request).
+/// - No consolidation is enqueued and `summary_page_id` stays `NULL` —
+///   running LLM consolidation inside a blind time-based sweep against a
+///   session that might still be slow-but-alive is a bigger risk than this
+///   sweep should take (invariant #16). The observations remain durable and
+///   reachable through the bounded raw-observation retrieval fallback.
+///
+/// One batched `UPDATE`, no per-scope iteration (invariant #2). Returns the
+/// number of sessions closed.
+///
+/// # Errors
+/// Propagates any SQL error.
+pub fn close_abandoned_sessions(conn: &Connection, cutoff_us: i64) -> StoreResult<u64> {
+    let changed = conn.execute(
+        "UPDATE sessions \
+         SET ended_at = COALESCE( \
+                 (SELECT MAX(o.created_at) FROM observations o WHERE o.session_id = sessions.id), \
+                 started_at), \
+             ended_observation_count = ( \
+                 SELECT COUNT(*) FROM observations WHERE session_id = sessions.id \
+             ) \
+         WHERE ended_at IS NULL \
+           AND COALESCE( \
+                 (SELECT MAX(o.created_at) FROM observations o WHERE o.session_id = sessions.id), \
+                 started_at) < ?1",
+        params![cutoff_us],
+    )?;
+    Ok(u64::try_from(changed).unwrap_or(0))
+}
+
 /// Record a session's reported cumulative token usage (token-cost
 /// visibility). The reported values are the harness's own running totals
 /// for the whole session, not deltas, so the upsert keeps `MAX(existing,
@@ -11043,5 +11082,88 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert_eq!(rows, 0);
+    }
+
+    /// Safety-net sweep (#722 follow-up): only a session quiet since before
+    /// the cutoff gets closed, an already-ended session is left untouched,
+    /// and no consolidation is ever implied (`summary_page_id` stays NULL).
+    #[test]
+    fn close_abandoned_sessions_only_closes_stale_open_sessions() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let now = Timestamp::now().as_microsecond();
+        let one_day_us = 24 * 60 * 60 * 1_000_000;
+
+        let stale = hook_session(SessionId::new(), ws, proj, None);
+        begin_session(&mut conn, &stale).unwrap();
+        conn.execute(
+            "UPDATE sessions SET started_at = ?1 WHERE id = ?2",
+            params![now - 3 * one_day_us, stale.id.as_bytes()],
+        )
+        .unwrap();
+
+        let fresh = hook_session(SessionId::new(), ws, proj, None);
+        begin_session(&mut conn, &fresh).unwrap();
+        conn.execute(
+            "UPDATE sessions SET started_at = ?1 WHERE id = ?2",
+            params![now - one_day_us / 2, fresh.id.as_bytes()],
+        )
+        .unwrap();
+
+        let already_ended = hook_session(SessionId::new(), ws, proj, None);
+        begin_session(&mut conn, &already_ended).unwrap();
+        conn.execute(
+            "UPDATE sessions SET started_at = ?1 WHERE id = ?2",
+            params![now - 3 * one_day_us, already_ended.id.as_bytes()],
+        )
+        .unwrap();
+        end_session(&mut conn, &already_ended.id, None).unwrap();
+        let already_ended_at_before: i64 = conn
+            .query_row(
+                "SELECT ended_at FROM sessions WHERE id = ?1",
+                params![already_ended.id.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        let cutoff_us = now - one_day_us;
+        let closed = close_abandoned_sessions(&conn, cutoff_us).unwrap();
+        assert_eq!(closed, 1, "only the stale open session must close");
+
+        let (ended_at, summary_page_id): (Option<i64>, Option<Vec<u8>>) = conn
+            .query_row(
+                "SELECT ended_at, summary_page_id FROM sessions WHERE id = ?1",
+                params![stale.id.as_bytes()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(ended_at.is_some(), "stale session must be closed");
+        assert!(
+            summary_page_id.is_none(),
+            "the safety net must never imply consolidation happened"
+        );
+
+        let fresh_ended_at: Option<i64> = conn
+            .query_row(
+                "SELECT ended_at FROM sessions WHERE id = ?1",
+                params![fresh.id.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            fresh_ended_at.is_none(),
+            "a recently-started session must stay open"
+        );
+
+        let already_ended_at_after: i64 = conn
+            .query_row(
+                "SELECT ended_at FROM sessions WHERE id = ?1",
+                params![already_ended.id.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            already_ended_at_after, already_ended_at_before,
+            "an already-ended session's ended_at must be left exactly as it was"
+        );
     }
 }

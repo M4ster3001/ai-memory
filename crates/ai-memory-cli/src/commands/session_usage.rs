@@ -211,6 +211,45 @@ pub fn locate_codex_rollout(codex_home: &Path, session_id: &str) -> Option<PathB
     None
 }
 
+/// Locate a Claude Code transcript file by session id and cwd, for a
+/// session other than the current one (client-side backfill-close of an
+/// abandoned session, #722 follow-up — the current session's own
+/// `session-end` payload already carries `transcript_path` directly, so
+/// this is only needed for a *different*, earlier session). Claude Code
+/// stores each session at `<claude_config_dir>/projects/<flattened
+/// cwd>/<session_id>.jsonl`, flattening `cwd` by turning every `/`, `\`,
+/// and `:` into `-` — verified against real transcript directories on a
+/// live install (`C:\Users\...\ai-memory` → `C--Users-...-ai-memory`).
+#[must_use]
+pub fn locate_claude_code_transcript(
+    claude_config_dir: &Path,
+    cwd: &str,
+    session_id: &str,
+) -> Option<PathBuf> {
+    if cwd.is_empty()
+        || !session_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+    {
+        return None;
+    }
+    let flattened: String = cwd
+        .chars()
+        .map(|c| {
+            if matches!(c, '/' | '\\' | ':') {
+                '-'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let path = claude_config_dir
+        .join("projects")
+        .join(flattened)
+        .join(format!("{session_id}.jsonl"));
+    path.is_file().then_some(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -375,5 +414,45 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join("sessions/2026/01/01")).unwrap();
         assert!(locate_codex_rollout(tmp.path(), "no-such-session").is_none());
+    }
+
+    #[test]
+    fn locate_claude_code_transcript_flattens_windows_and_posix_cwd() {
+        let tmp = tempfile::tempdir().unwrap();
+        let windows_dir = tmp
+            .path()
+            .join("projects")
+            .join("C--Users-aldoC-OneDrive-Documentos-Projetos-ai-memory");
+        std::fs::create_dir_all(&windows_dir).unwrap();
+        let windows_target = windows_dir.join("9fc72c68-53ac-4d50-82aa-135f7ab03b7d.jsonl");
+        std::fs::write(&windows_target, "").unwrap();
+        let found = locate_claude_code_transcript(
+            tmp.path(),
+            r"C:\Users\aldoC\OneDrive\Documentos\Projetos\ai-memory",
+            "9fc72c68-53ac-4d50-82aa-135f7ab03b7d",
+        )
+        .unwrap();
+        assert_eq!(found, windows_target);
+
+        let posix_dir = tmp.path().join("projects").join("-home-alice-proj");
+        std::fs::create_dir_all(&posix_dir).unwrap();
+        let posix_target = posix_dir.join("deadbeef-0000-0000-0000-000000000000.jsonl");
+        std::fs::write(&posix_target, "").unwrap();
+        let found = locate_claude_code_transcript(
+            tmp.path(),
+            "/home/alice/proj",
+            "deadbeef-0000-0000-0000-000000000000",
+        )
+        .unwrap();
+        assert_eq!(found, posix_target);
+    }
+
+    #[test]
+    fn locate_claude_code_transcript_rejects_unsafe_input_and_missing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(locate_claude_code_transcript(tmp.path(), "", "sid").is_none());
+        assert!(locate_claude_code_transcript(tmp.path(), "/proj", "").is_none());
+        assert!(locate_claude_code_transcript(tmp.path(), "/proj", "../../etc/passwd").is_none());
+        assert!(locate_claude_code_transcript(tmp.path(), "/no/such/proj", "sid").is_none());
     }
 }

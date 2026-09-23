@@ -177,6 +177,22 @@ from hook paths.
    no pages, sessions, observations, handoffs, managed workstreams, or
    auto-improvement data; managed continuity history therefore keeps its
    project scope alive even when no lifecycle-hook session has been captured.
+   The same scheduled sweep tick also runs one store-wide
+   `close_abandoned_sessions` batched `UPDATE`: a session with no activity
+   for 48h and no `SessionEnd` gets its `ended_at` stamped from its own last
+   activity, with no summary page and no usage attached — a safety net for
+   `open_session_count` leaking forever on a session nobody ever continues,
+   deliberately narrower than a real end (see the session-usage row below).
+   A session that *is* continued (a new session starts in the same scope
+   while the old one is quiet for 15+ minutes) is closed sooner and more
+   completely, client-side: `render_interrupted_session_context`'s existing
+   read-only recovery packet (`ai-memory-hooks/src/router.rs`) also embeds a
+   machine-parsed marker past that stricter threshold, and the client
+   locates the old session's own transcript, reports its usage, and sends a
+   normal synthetic `SessionEnd` for it — safe even if that session turns
+   out to still be live, since a later real `SessionEnd` with more
+   observations than the early close saw already re-runs the full end path
+   (`SessionEndDisposition::ReEndWithNewWork`, issue #152).
 8. Backups: `ai-memory backup --to <tarball>` uses SQLite's online
    backup API so the source stays writable; `ai-memory restore`
    reverses. Or: `git push` the wiki dir + `rsync` the data dir.
