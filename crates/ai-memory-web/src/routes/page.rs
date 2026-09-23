@@ -120,6 +120,7 @@ async fn namespace_or_not_found(
             title: p.title,
             kind: p.kind,
             updated_relative: humanize(&p.updated_at),
+            agent_label: None,
         })
         .collect();
     if pages.is_empty() {

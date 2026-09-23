@@ -17,6 +17,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hook-health counters (accepted, policy-dropped, capacity-shed, and
   rate-limited) without persisting or rendering prompt, command, path, or
   payload data (#721).
+- The project overview page now shows which agent CLIs produced a project's
+  memory: an "Agents" badge row in the stats card (session counts per
+  harness) and, on each Recent Activity entry, the harness whose session
+  most recently contributed evidence to that page version. Both are
+  best-effort and additive — pages or projects with no session evidence
+  simply show no badge.
+- `memory_read_page` now accepts an optional `max_chars` (default 12000, min
+  500, max 64000) that caps the returned body with the same visible
+  truncation marker `memory_read_session_observations` already uses. The
+  response always carries `truncated` and `total_chars` so a caller knows
+  the real size even when the body wasn't cut.
+
+### Changed
+- `memory_read_session_observations`'s defaults are smaller: `limit` 50 → 20,
+  `body_max_chars` 4000 → 1000. A caller that needs more can still raise
+  either explicitly (up to the unchanged ceilings of 200 and 16384). This
+  makes a routine "what did this session do" lookup materially cheaper by
+  default; the retrieval skill now also documents a narrow
+  `order="desc"` + small `kinds`/`limit`/`body_max_chars` recipe for that
+  question instead of reading the whole session.
 
 ### Security
 - Updated locked `rustls` 0.23.40 â†’ 0.23.45 (and `rustls-webpki` 0.103.13 â†’
