@@ -132,6 +132,188 @@ fn should_spawn_background_drainer(event: &str) -> bool {
     matches!(event, "session-end" | "stop" | "pre-compact")
 }
 
+/// Best-effort: compute this session's cumulative token usage from the
+/// harness's own transcript, for the agents that have a known transcript
+/// format (see `session_usage`). Every failure path — an unsupported agent,
+/// a payload missing the field this agent needs, an unreadable or
+/// unparseable transcript — returns `None` rather than a zeroed report;
+/// callers must never treat `None` as "zero usage".
+fn compute_session_usage(
+    agent_kind: AgentKind,
+    json: &serde_json::Value,
+    session_id: Option<&str>,
+) -> Option<super::session_usage::SessionUsage> {
+    match agent_kind {
+        AgentKind::ClaudeCode => {
+            let path = json
+                .get("transcript_path")
+                .and_then(serde_json::Value::as_str)?;
+            super::session_usage::extract_claude_code_usage(Path::new(path))
+        }
+        AgentKind::Codex => {
+            let session_id = session_id?;
+            let codex_home = std::env::var_os("CODEX_HOME")
+                .map(PathBuf::from)
+                .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))?;
+            let rollout = super::session_usage::locate_codex_rollout(&codex_home, session_id)?;
+            super::session_usage::extract_codex_usage(&rollout)
+        }
+        _ => None,
+    }
+}
+
+/// A stale interrupted-session candidate found in the session-start handoff
+/// text, eligible for a best-effort backfill-close (#722 follow-up).
+struct BackfillCandidate {
+    session_id: String,
+    agent_kind: AgentKind,
+    cwd: Option<String>,
+}
+
+/// Parse and strip the backfill marker embedded by the server (see
+/// `ai_memory_hooks::BACKFILL_MARKER_PREFIX` / `render_backfill_marker`)
+/// from fetched handoff text. Returns the candidate (if any) plus the text
+/// with the marker line removed — the receiving agent must never see raw
+/// protocol metadata in its injected context. The server already escapes
+/// any occurrence of the marker prefix inside untrusted observation
+/// content, so the first matching line is always the trusted one.
+fn extract_backfill_marker(handoff: &str) -> (Option<BackfillCandidate>, String) {
+    let Some(marker_line) = handoff
+        .lines()
+        .find(|line| line.starts_with(ai_memory_hooks::BACKFILL_MARKER_PREFIX))
+    else {
+        return (None, handoff.to_owned());
+    };
+    let stripped = handoff
+        .lines()
+        .filter(|line| *line != marker_line)
+        .collect::<Vec<_>>()
+        .join("\n");
+    (parse_backfill_marker(marker_line), stripped)
+}
+
+fn parse_backfill_marker(line: &str) -> Option<BackfillCandidate> {
+    use base64::Engine as _;
+    let inner = line
+        .trim()
+        .strip_prefix(ai_memory_hooks::BACKFILL_MARKER_PREFIX)?
+        .trim_end()
+        .strip_suffix("-->")?
+        .trim();
+    let mut session_id = None;
+    let mut agent_kind = None;
+    let mut cwd = None;
+    for field in inner.split_whitespace() {
+        let Some((key, value)) = field.split_once('=') else {
+            continue;
+        };
+        match key {
+            "session_id" if !value.is_empty() => session_id = Some(value.to_owned()),
+            "agent_kind" if !value.is_empty() => agent_kind = Some(AgentKind::from_wire(value)),
+            "cwd" if !value.is_empty() => {
+                cwd = base64::engine::general_purpose::STANDARD
+                    .decode(value)
+                    .ok()
+                    .and_then(|bytes| String::from_utf8(bytes).ok());
+            }
+            _ => {}
+        }
+    }
+    Some(BackfillCandidate {
+        session_id: session_id?,
+        agent_kind: agent_kind?,
+        cwd,
+    })
+}
+
+/// Best-effort: locate and extract token usage for a session other than the
+/// current one (the old, abandoned session named by a backfill marker).
+/// Mirrors [`compute_session_usage`], but locates the transcript file
+/// independently instead of reading a `transcript_path` the current
+/// event's own payload provided — that field only ever describes the
+/// current session.
+fn compute_backfill_usage(
+    agent_kind: AgentKind,
+    old_session_id: &str,
+    old_cwd: Option<&str>,
+) -> Option<super::session_usage::SessionUsage> {
+    match agent_kind {
+        AgentKind::ClaudeCode => {
+            let cwd = old_cwd?;
+            let claude_config_dir =
+                super::path_util::claude_config_dir(std::env::var_os("CLAUDE_CONFIG_DIR"))
+                    .or_else(|| dirs::home_dir().map(|home| home.join(".claude")))?;
+            let path = super::session_usage::locate_claude_code_transcript(
+                &claude_config_dir,
+                cwd,
+                old_session_id,
+            )?;
+            super::session_usage::extract_claude_code_usage(&path)
+        }
+        AgentKind::Codex => {
+            let codex_home = std::env::var_os("CODEX_HOME")
+                .map(PathBuf::from)
+                .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))?;
+            let rollout = super::session_usage::locate_codex_rollout(&codex_home, old_session_id)?;
+            super::session_usage::extract_codex_usage(&rollout)
+        }
+        _ => None,
+    }
+}
+
+/// Best-effort client-side half of close-on-continuation (#722 follow-up):
+/// given a backfill candidate named by the server, try to compute the old
+/// session's usage locally, then enqueue a normal synthetic `session-end`
+/// for it through the existing spool — reusing the server's ordinary
+/// session-end admission and consolidation path (safe even if the old
+/// session turns out to still be live: `SessionEndDisposition::
+/// ReEndWithNewWork` already re-runs the full end path when more
+/// observations arrive after an early close). Every failure is logged and
+/// swallowed; this must never delay or fail the real session-start hook.
+fn dispatch_backfill_close(
+    candidate: &BackfillCandidate,
+    dd: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    oidc_present: bool,
+) {
+    let usage = compute_backfill_usage(
+        candidate.agent_kind,
+        &candidate.session_id,
+        candidate.cwd.as_deref(),
+    );
+    let mut body = serde_json::json!({});
+    if let Some(usage) = &usage {
+        body["_ai_memory_usage"] = serde_json::json!({
+            "input_tokens": usage.input_tokens,
+            "output_tokens": usage.output_tokens,
+            "cache_write_tokens": usage.cache_write_tokens,
+            "cache_read_tokens": usage.cache_read_tokens,
+            "model": usage.model,
+        });
+    }
+    let Ok(payload) = serde_json::to_string(&body) else {
+        eprintln!("ai-memory hook warning: could not serialize backfill-close body; skipped");
+        return;
+    };
+    let cwd_qs = candidate
+        .cwd
+        .as_deref()
+        .filter(|cwd| !cwd.is_empty())
+        .map_or_else(String::new, |cwd| format!("&cwd={}", url_encode(cwd)));
+    let base = server_url.trim_end_matches('/');
+    let event_url = format!(
+        "{base}/hook?event=session-end&agent={agent}&session_id={session_id}{cwd_qs}",
+        agent = candidate.agent_kind.as_str(),
+        session_id = url_encode(&candidate.session_id),
+    );
+    let spool = hook_spool::spool_dir(dd);
+    let entry = hook_spool::entry_for(event_url, payload, auth_token, oidc_present);
+    if let Err(e) = hook_spool::enqueue(&spool, &entry) {
+        eprintln!("ai-memory hook warning: failed to spool backfill-close event: {e}");
+    }
+}
+
 fn session_id_state_path(data_dir: &Path, agent: AgentKind) -> PathBuf {
     data_dir
         .join("hook-state")
@@ -599,6 +781,31 @@ where
         }
     }
 
+    // Token-usage visibility (docs: token-cost tracking): only at
+    // session-end, which fires once per session — never on the frequent
+    // `stop`/`post-tool-use` path — so the bounded transcript read this
+    // performs (a full linear scan for Claude Code, a bounded tail read for
+    // Codex) never touches the hot path. Spliced the same way
+    // `_ai_memory_capture` is above, so it rides the existing session-end
+    // POST/spool/retry path with no new wire format.
+    if args.event == "session-end"
+        && let Some(usage) =
+            compute_session_usage(agent_kind, &json, canonical_session_id.as_deref())
+        && let Some(object) = json.as_object_mut()
+    {
+        object.insert(
+            "_ai_memory_usage".into(),
+            serde_json::json!({
+                "input_tokens": usage.input_tokens,
+                "output_tokens": usage.output_tokens,
+                "cache_write_tokens": usage.cache_write_tokens,
+                "cache_read_tokens": usage.cache_read_tokens,
+                "model": usage.model,
+            }),
+        );
+        payload = serde_json::to_string(&json)?;
+    }
+
     let qs = cwd_query_suffix(
         &args.agent,
         &json,
@@ -704,6 +911,16 @@ where
             if let Some(handoff) =
                 get_handoff(&client, &handoff_url, bearer.as_deref(), handoff_timeout()).await
             {
+                let (backfill_candidate, handoff) = extract_backfill_marker(&handoff);
+                if let Some(candidate) = &backfill_candidate {
+                    dispatch_backfill_close(
+                        candidate,
+                        &dd,
+                        &args.server_url,
+                        effective_token,
+                        oidc_present,
+                    );
+                }
                 if agent_kind == AgentKind::KiroCli {
                     // Kiro v2/v3 consume SessionStart stdout verbatim and define
                     // no wrapper envelope.
@@ -935,6 +1152,66 @@ mod tests {
         }
         // With no marker present, allowlist mode admits none of them.
         assert!(!repository_admits_capture(CaptureMode::Allowlist, false));
+    }
+
+    /// Close-on-continuation client half (#722 follow-up): the marker line
+    /// is parsed correctly and, critically, removed from what the receiving
+    /// agent actually sees — raw protocol metadata must never leak into
+    /// injected context.
+    #[test]
+    fn extract_backfill_marker_parses_and_strips_the_line() {
+        use base64::Engine as _;
+        let sid = SessionId::new();
+        let cwd_b64 = base64::engine::general_purpose::STANDARD.encode("/home/alice/proj");
+        let handoff = format!(
+            "> some recovery preamble\n\
+             {prefix}session_id={sid} agent_kind=codex cwd={cwd_b64} -->\n\
+             \u{2015}\u{2015}\u{2015}\n\
+             untrusted history here\n",
+            prefix = ai_memory_hooks::BACKFILL_MARKER_PREFIX,
+        );
+        let (candidate, stripped) = extract_backfill_marker(&handoff);
+        let candidate = candidate.expect("marker must parse");
+        assert_eq!(candidate.session_id, sid.to_string());
+        assert_eq!(candidate.agent_kind, AgentKind::Codex);
+        assert_eq!(candidate.cwd.as_deref(), Some("/home/alice/proj"));
+        assert!(
+            !stripped.contains(ai_memory_hooks::BACKFILL_MARKER_PREFIX),
+            "the marker line must never reach the receiving agent: {stripped}"
+        );
+        assert!(stripped.contains("some recovery preamble"));
+        assert!(stripped.contains("untrusted history here"));
+    }
+
+    #[test]
+    fn extract_backfill_marker_absent_returns_text_unchanged() {
+        let handoff = "> plain handoff text\nwith no marker at all\n";
+        let (candidate, stripped) = extract_backfill_marker(handoff);
+        assert!(candidate.is_none());
+        assert_eq!(stripped, handoff);
+    }
+
+    #[test]
+    fn extract_backfill_marker_missing_session_id_or_agent_is_none() {
+        let handoff = format!(
+            "{prefix}agent_kind=codex cwd= -->\n",
+            prefix = ai_memory_hooks::BACKFILL_MARKER_PREFIX
+        );
+        let (candidate, _) = extract_backfill_marker(&handoff);
+        assert!(
+            candidate.is_none(),
+            "a marker missing the required session_id must not parse"
+        );
+    }
+
+    #[test]
+    fn compute_backfill_usage_unsupported_agent_is_none() {
+        assert!(compute_backfill_usage(AgentKind::Cursor, "some-session", Some("/proj")).is_none());
+    }
+
+    #[test]
+    fn compute_backfill_usage_claude_code_without_cwd_is_none() {
+        assert!(compute_backfill_usage(AgentKind::ClaudeCode, "some-session", None).is_none());
     }
 
     #[test]

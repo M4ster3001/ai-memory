@@ -156,6 +156,29 @@ pub struct NewSession {
     pub actor_user: Option<String>,
 }
 
+/// Reported cumulative token usage for one session (token-cost visibility).
+/// Sourced client-side from the harness's own transcript at `session-end`;
+/// see `ai-memory-cli`'s `session_usage` module. Values are cumulative
+/// totals for the whole session, not deltas — the store's upsert keeps
+/// `MAX(existing, reported)` per column so a replayed or out-of-order hook
+/// can never lower a total (docs: session usage tracking).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct NewSessionUsage {
+    /// Session this usage belongs to.
+    pub session_id: SessionId,
+    /// Fresh (non-cached) input tokens.
+    pub input_tokens: u64,
+    /// Output tokens (including any reasoning/thinking breakdown the
+    /// harness reports as part of the same total).
+    pub output_tokens: u64,
+    /// Tokens written to a prompt cache.
+    pub cache_write_tokens: u64,
+    /// Tokens served from a prompt cache.
+    pub cache_read_tokens: u64,
+    /// Last-seen model name, when the transcript records one.
+    pub model: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

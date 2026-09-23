@@ -1564,6 +1564,7 @@ async fn start_maintenance_scheduler(
                             expired = outcome.expired,
                             hard_deleted = outcome.hard_deleted,
                             observations_pruned = outcome.observations_pruned,
+                            abandoned_sessions_closed = outcome.abandoned_sessions_closed,
                             errors = outcome.errors,
                             elapsed_ms = started.elapsed().as_millis(),
                             "scheduled forget sweep completed"
@@ -1810,6 +1811,15 @@ async fn start_maintenance_scheduler(
     tasks
 }
 
+/// How long a session may sit open with no activity before the scheduled
+/// sweep closes it (#722 follow-up safety net) — deliberately much more
+/// conservative than the `SessionStart`-triggered backfill-close's 15
+/// minutes (`ai_memory_hooks::router::BACKFILL_CLOSE_MIN_IDLE`), since this
+/// path has no positive "someone is continuing the work" signal at all; it
+/// is a blind time-based guess and must essentially never fire on a
+/// genuinely slow-but-alive session.
+const ABANDONED_SESSION_CUTOFF: std::time::Duration = std::time::Duration::from_secs(48 * 60 * 60);
+
 #[derive(Debug, Default)]
 struct ScheduledSweepTickOutcome {
     scopes: usize,
@@ -1819,6 +1829,9 @@ struct ScheduledSweepTickOutcome {
     hard_deleted: usize,
     observations_pruned: usize,
     errors: usize,
+    /// Sessions closed by the abandoned-session safety net (no usage, no
+    /// consolidation — see `ai_memory_store::ops::close_abandoned_sessions`).
+    abandoned_sessions_closed: u64,
 }
 
 async fn run_scheduled_sweep_tick(
@@ -1865,6 +1878,16 @@ async fn run_scheduled_sweep_tick(
                     "scheduled forget sweep failed for scope"
                 );
             }
+        }
+    }
+
+    let cutoff_us = jiff::Timestamp::now().as_microsecond()
+        - i64::try_from(ABANDONED_SESSION_CUTOFF.as_micros()).unwrap_or(i64::MAX);
+    match writer.close_abandoned_sessions(cutoff_us).await {
+        Ok(closed) => outcome.abandoned_sessions_closed = closed,
+        Err(e) => {
+            outcome.errors += 1;
+            tracing::warn!(error = %e, "scheduled abandoned-session close failed");
         }
     }
 
@@ -2396,6 +2419,7 @@ mod tests {
         Sanitized, Sanitizer, SessionId, Tier,
     };
     use ai_memory_llm::{ChatRequest, ChatResponse, LlmResult, SyntheticEmbedder};
+    use ai_memory_web::split_web_routers;
     use ai_memory_wiki::WritePageRequest;
     use axum::http::Request;
     use secrecy::SecretString;

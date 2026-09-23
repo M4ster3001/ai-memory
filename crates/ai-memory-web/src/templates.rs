@@ -39,6 +39,19 @@ fn encode_path(path: &str) -> String {
         .join("/")
 }
 
+/// Compact human-readable token count (`12345` → `"12.3k"`, `2_100_000` →
+/// `"2.1M"`). Values under 1000 render as a plain integer.
+#[must_use]
+pub(crate) fn fmt_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
 /// Human-readable label for an agent-kind badge (`claude-code` → `Claude
 /// Code`). Purely a display concern — the wire form
 /// ([`ai_memory_core::AgentKind::as_str`]) stays the identity used
@@ -124,6 +137,43 @@ pub(crate) fn humanize(iso: &str) -> String {
     }
     let years = months / 12;
     format!("{years} year{} ago", if years == 1 { "" } else { "s" })
+}
+
+/// Humanised session duration between two ISO-8601 timestamps, or `"open"`
+/// when `ended` is absent. Falls back to `"—"` on any parse error rather
+/// than a raw/misleading duration.
+#[must_use]
+pub(crate) fn duration_between(started: &str, ended: Option<&str>) -> String {
+    let Some(ended) = ended else {
+        return "open".to_owned();
+    };
+    let (Ok(start), Ok(end)) = (
+        started.parse::<jiff::Timestamp>(),
+        ended.parse::<jiff::Timestamp>(),
+    ) else {
+        return "—".to_owned();
+    };
+    let secs = (end.as_microsecond() - start.as_microsecond())
+        .abs()
+        .saturating_div(1_000_000);
+    if secs < 60 {
+        return format!("{secs}s");
+    }
+    let mins = secs / 60;
+    if mins < 60 {
+        return format!("{mins}m");
+    }
+    let hours = mins / 60;
+    let rem_mins = mins % 60;
+    if hours < 24 {
+        return if rem_mins == 0 {
+            format!("{hours}h")
+        } else {
+            format!("{hours}h {rem_mins}m")
+        };
+    }
+    let days = hours / 24;
+    format!("{days}d")
 }
 
 // ---------------------------------------------------------------------------
@@ -260,6 +310,23 @@ pub(crate) struct ProjectView {
     /// Sessions grouped by the agent CLI that ran them, most-used first.
     /// Empty when the project has no sessions yet.
     pub by_agent: Vec<AgentBadge>,
+    /// Most-recent sessions for the Sessions table, newest first.
+    pub sessions: Vec<SessionRow>,
+}
+
+/// One row in the project page's Sessions table (token-cost visibility).
+pub(crate) struct SessionRow {
+    /// Human-readable harness label (`Claude Code`, `Codex`, ...).
+    pub agent_label: &'static str,
+    /// Humanised relative start time.
+    pub started_relative: String,
+    /// Humanised duration, or "open" while the session has no `ended_at`.
+    pub duration: String,
+    /// Observations captured in this scope.
+    pub observation_count: u64,
+    /// Compact token summary (e.g. "12.3k in / 4.5k out"), or "—" when the
+    /// harness's hook never reported usage for this session.
+    pub tokens: String,
 }
 
 /// Privacy-preserving project-level capture summary.
@@ -274,6 +341,9 @@ pub(crate) struct ProjectMemoryStats {
     pub open_session_count: u64,
     /// Humanised latest capture timestamp, if one exists.
     pub last_activity_relative: String,
+    /// Compact total input+output tokens across every session with a
+    /// reported usage, or "—" when none has reported any yet.
+    pub tokens_total: String,
 }
 
 /// View-model for a namespace (directory) listing — `GET

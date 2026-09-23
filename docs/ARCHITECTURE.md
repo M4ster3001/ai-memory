@@ -177,6 +177,22 @@ from hook paths.
    no pages, sessions, observations, handoffs, managed workstreams, or
    auto-improvement data; managed continuity history therefore keeps its
    project scope alive even when no lifecycle-hook session has been captured.
+   The same scheduled sweep tick also runs one store-wide
+   `close_abandoned_sessions` batched `UPDATE`: a session with no activity
+   for 48h and no `SessionEnd` gets its `ended_at` stamped from its own last
+   activity, with no summary page and no usage attached — a safety net for
+   `open_session_count` leaking forever on a session nobody ever continues,
+   deliberately narrower than a real end (see the session-usage row below).
+   A session that *is* continued (a new session starts in the same scope
+   while the old one is quiet for 15+ minutes) is closed sooner and more
+   completely, client-side: `render_interrupted_session_context`'s existing
+   read-only recovery packet (`ai-memory-hooks/src/router.rs`) also embeds a
+   machine-parsed marker past that stricter threshold, and the client
+   locates the old session's own transcript, reports its usage, and sends a
+   normal synthetic `SessionEnd` for it — safe even if that session turns
+   out to still be live, since a later real `SessionEnd` with more
+   observations than the early close saw already re-runs the full end path
+   (`SessionEndDisposition::ReEndWithNewWork`, issue #152).
 8. Backups: `ai-memory backup --to <tarball>` uses SQLite's online
    backup API so the source stays writable; `ai-memory restore`
    reverses. Or: `git push` the wiki dir + `rsync` the data dir.
@@ -296,6 +312,7 @@ separately gated Claude Code assistant/Stop excerpt remains capped at 2 KB.
 | `page_feedback` | Append-only `memory_feedback` signals (`helpful` / `not_helpful` / `stale` / `wrong`) keyed by page *version*, with an optional sanitized reason and `salience_after`. Source of truth for the derived `pages.salience`; the lint pass reads unresolved stale/wrong rows joined against `is_latest = 1`, so a rewrite retires the finding. |
 | `page_access` | One row per latest page and qualified operator identity. Supplies the optional access-breadth retention term without changing the existing shared access counter. |
 | `page_evidence` | V63 append-only record of what produced or reaffirmed each page version — consolidation cites the `session` it ran on, written in the page-upsert transaction and cascaded on purge. Surfaced as `evidence_count` in `memory_query(explain=true)` and used to order the opt-in `settled_first` briefing. Ranking-inert: the confidence→authority factor is deferred behind the eval harness (`docs/design-hindsight-borrowings.md` P2). |
+| `session_usage` | V64 one row per session: cumulative input/output/cache-write/cache-read tokens the harness's own transcript reported at `session-end`, plus the last-seen model name. Written client-side (`ai-memory-cli`'s `session_usage` module reads the transcript; `hook.rs` splices it into the session-end body as `_ai_memory_usage`; the writer upserts with `MAX(existing, reported)` per column). Cascades with its session on purge/delete. Surfaced on the /web project page's Tokens stat and Sessions table; `None` (not zero) for a session whose harness never reported usage. |
 | `client_activity` | Server-wide MCP tool-call counters split into reads/writes and bucketed by UTC day. The MCP request choke point flushes buffered calls on a one-minute background interval; failed batches retry from bounded memory. Each day stores at most 128 sanitized client labels plus `other`, so an untrusted `clientInfo.name` cannot create traffic-proportional rows. |
 | `auto_improve_proposals` | Staged learning and maintenance edits with immutable target snapshots and append-only decision events. Pending-target uniqueness is scoped by the qualified staging identity; unattributed proposals retain the historical shared bucket. |
 | `entities`, `entity_page_links` | V38 noun index derived from canonical frontmatter. Names are normalized and unique per project; links target immutable page versions while retrieval filters to the latest version. Scope-pairing triggers prevent cross-project links. Powers the fourth RRF retrieval stream. |
