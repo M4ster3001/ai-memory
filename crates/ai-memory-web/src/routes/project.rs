@@ -13,8 +13,23 @@ use ai_memory_store::lookup_existing_scope;
 
 use crate::state::WebState;
 use crate::templates::{
-    AgentBadge, Folder, PageRow, ProjectMemoryStats, ProjectView, agent_label, humanize, page_href,
+    AgentBadge, Folder, PageRow, ProjectMemoryStats, ProjectView, SessionRow, agent_label,
+    duration_between, fmt_tokens, humanize, page_href,
 };
+
+/// Sessions shown on the project page's Sessions table, newest first.
+const RECENT_SESSIONS_LIMIT: usize = 20;
+
+fn fmt_session_tokens(usage: Option<&ai_memory_store::SessionUsageView>) -> String {
+    match usage {
+        Some(u) => format!(
+            "{} in / {} out",
+            fmt_tokens(u.input_tokens),
+            fmt_tokens(u.output_tokens)
+        ),
+        None => "—".to_owned(),
+    }
+}
 
 /// Handler for `GET /w/:workspace/:project`.
 pub(crate) async fn handler(
@@ -38,6 +53,32 @@ pub(crate) async fn handler(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .into_iter()
         .find(|item| item.workspace_name == workspace && item.project_name == project);
+    // Resolved once, reused for every scope-keyed lookup below (agent
+    // breakdown, token total, session list). A project with no resolvable
+    // scope yet (no sessions recorded) just shows none of those rather than
+    // failing the whole page.
+    let scope = lookup_existing_scope(&state.reader, &workspace, &project)
+        .await
+        .ok();
+
+    let tokens_total = match &scope {
+        Some(scope) => state
+            .reader
+            .total_session_usage(scope.workspace_id, scope.project_id, OwnerFilter::Any)
+            .await
+            .ok()
+            .flatten()
+            .map(|u| {
+                format!(
+                    "{} / {}",
+                    fmt_tokens(u.input_tokens),
+                    fmt_tokens(u.output_tokens)
+                )
+            })
+            .unwrap_or_else(|| "—".to_owned()),
+        None => "—".to_owned(),
+    };
+
     let stats = match summary {
         Some(item) => ProjectMemoryStats {
             page_count: item.page_count,
@@ -49,6 +90,7 @@ pub(crate) async fn handler(
                 .as_deref()
                 .map(humanize)
                 .unwrap_or_default(),
+            tokens_total,
         },
         // A page listing may still be visible while aggregate metadata is
         // being refreshed. Preserve a truthful compiled-page count.
@@ -58,20 +100,17 @@ pub(crate) async fn handler(
             observation_count: 0,
             open_session_count: 0,
             last_activity_relative: String::new(),
+            tokens_total,
         },
     };
 
-    // Which agent CLIs produced this project's memory. This is a
-    // read-only, unauthenticated dashboard shared by every operator on the
-    // project (see the multi-session/multi-user invariant), so the count
+    // Which agent CLIs produced this project's memory. Read-only,
+    // unauthenticated dashboard shared by every operator on the project
+    // (see the multi-session/multi-user invariant), so the count
     // deliberately covers every owner rather than the (nonexistent) caller
-    // identity — same aggregate posture as `stats` above. Best-effort: a
-    // project with no resolvable scope yet (no sessions recorded) just
-    // shows no breakdown rather than failing the whole page.
-    let by_agent: Vec<AgentBadge> = match lookup_existing_scope(&state.reader, &workspace, &project)
-        .await
-    {
-        Ok(scope) => state
+    // identity — same aggregate posture as `stats` above.
+    let by_agent: Vec<AgentBadge> = match &scope {
+        Some(scope) => state
             .reader
             .session_counts_by_agent(scope.workspace_id, scope.project_id, OwnerFilter::Any, None)
             .await
@@ -82,7 +121,35 @@ pub(crate) async fn handler(
                 count: row.sessions,
             })
             .collect(),
-        Err(_) => Vec::new(),
+        None => Vec::new(),
+    };
+
+    // Most-recent sessions for the Sessions table (token-cost visibility).
+    // Same aggregate posture as `by_agent`: every operator's sessions, open
+    // or ended.
+    let sessions: Vec<SessionRow> = match &scope {
+        Some(scope) => state
+            .reader
+            .sessions_for_scope(
+                scope.workspace_id,
+                scope.project_id,
+                OwnerFilter::Any,
+                true,
+                RECENT_SESSIONS_LIMIT,
+                0,
+            )
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|session| SessionRow {
+                agent_label: agent_label(ai_memory_core::AgentKind::from_wire(&session.agent_kind)),
+                started_relative: humanize(&session.started_at),
+                duration: duration_between(&session.started_at, session.ended_at.as_deref()),
+                observation_count: session.observation_count,
+                tokens: fmt_session_tokens(session.usage.as_ref()),
+            })
+            .collect(),
+        None => Vec::new(),
     };
 
     // Best-effort per-page attribution: the harness whose session most
@@ -170,6 +237,7 @@ pub(crate) async fn handler(
         system,
         recent,
         by_agent,
+        sessions,
     }
     .render()
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;

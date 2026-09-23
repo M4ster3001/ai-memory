@@ -65,8 +65,8 @@ pub use reader::{
     ObservationPageResult, ObservationRecord, OpenSession, PageAuthor, PageHit, PageHitWithMeta,
     PageLinks, PageMeta, PageSummary, ProjectSummary, ReaderPool, ReindexTargetStatus, RelatedPage,
     RrfContributions, ScopeRow, SearchExplain, SessionDependentRows, SessionEndDisposition,
-    SessionSummary, SettledPage, StatusCounts, StorageStatus, StoredEmbedding, StoredPageBody,
-    WorkspaceScopeRow, WorkspaceSummary, f32_vec_to_bytes,
+    SessionSummary, SessionUsageView, SettledPage, StatusCounts, StorageStatus, StoredEmbedding,
+    StoredPageBody, WorkspaceScopeRow, WorkspaceSummary, f32_vec_to_bytes,
 };
 pub use retrieval_tuning::{RetrievalTuning, is_session_recall_query};
 pub use scope::{

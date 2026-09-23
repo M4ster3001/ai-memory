@@ -692,6 +692,28 @@ pub struct SessionSummary {
     pub observation_count: u64,
     /// Operator the session belongs to, as stored on the `sessions` row.
     pub actor_user: Option<String>,
+    /// Reported cumulative token usage, when the harness's hook could
+    /// determine it at session end. `None` — not a zeroed
+    /// [`SessionUsageView`] — for a session with no report at all (older
+    /// client, unsupported harness, or an end that fired before this
+    /// feature shipped).
+    pub usage: Option<SessionUsageView>,
+}
+
+/// Cumulative token usage for one session (token-cost visibility), as
+/// surfaced by [`ReaderPool::sessions_for_scope`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SessionUsageView {
+    /// Fresh (non-cached) input tokens.
+    pub input_tokens: u64,
+    /// Output tokens (including any reasoning/thinking breakdown).
+    pub output_tokens: u64,
+    /// Tokens written to a prompt cache.
+    pub cache_write_tokens: u64,
+    /// Tokens served from a prompt cache.
+    pub cache_read_tokens: u64,
+    /// Last-seen model name, when reported.
+    pub model: Option<String>,
 }
 
 /// Aggregate MCP tool-call counts for one client, from
@@ -2770,6 +2792,73 @@ impl ReaderPool {
         .await
     }
 
+    /// Total reported token usage across every session in one scope
+    /// (token-cost visibility) — the project-wide figure the web dashboard's
+    /// "Tokens" stat needs, as opposed to the per-row usage
+    /// [`Self::sessions_for_scope`] returns for its most-recent page.
+    /// `None` when not a single session in scope has reported any usage yet
+    /// (not a zeroed [`SessionUsageView`]).
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn total_session_usage(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        owner_filter: OwnerFilter,
+    ) -> StoreResult<Option<SessionUsageView>> {
+        self.with_conn(move |conn| {
+            let owner_clause = match &owner_filter {
+                OwnerFilter::Any => "",
+                OwnerFilter::User(_) => " AND (s.actor_user IS NULL OR s.actor_user = :actor)",
+                OwnerFilter::Unattributed => " AND s.actor_user IS NULL",
+            };
+            let sql = format!(
+                "SELECT COUNT(*), SUM(u.input_tokens), SUM(u.output_tokens), \
+                        SUM(u.cache_write_tokens), SUM(u.cache_read_tokens) \
+                 FROM session_usage u \
+                 JOIN sessions s ON s.id = u.session_id \
+                 WHERE s.workspace_id = :ws AND s.project_id = :proj{owner_clause}"
+            );
+            let mut stmt = conn.prepare_cached(&sql)?;
+            let ws_bytes = workspace_id.as_bytes();
+            let proj_bytes = project_id.as_bytes();
+            let mut named: Vec<(&str, &dyn rusqlite::ToSql)> = vec![
+                (":ws", &ws_bytes as &dyn rusqlite::ToSql),
+                (":proj", &proj_bytes as &dyn rusqlite::ToSql),
+            ];
+            if let OwnerFilter::User(user) = &owner_filter {
+                named.push((":actor", user));
+            }
+            let (rows, input, output, cache_write, cache_read): (
+                i64,
+                Option<i64>,
+                Option<i64>,
+                Option<i64>,
+                Option<i64>,
+            ) = stmt.query_row(named.as_slice(), |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })?;
+            if rows == 0 {
+                return Ok(None);
+            }
+            Ok(Some(SessionUsageView {
+                input_tokens: u64::try_from(input.unwrap_or(0)).unwrap_or(0),
+                output_tokens: u64::try_from(output.unwrap_or(0)).unwrap_or(0),
+                cache_write_tokens: u64::try_from(cache_write.unwrap_or(0)).unwrap_or(0),
+                cache_read_tokens: u64::try_from(cache_read.unwrap_or(0)).unwrap_or(0),
+                model: None,
+            }))
+        })
+        .await
+    }
+
     /// Return open sessions matching one scoped project and agent.
     ///
     /// Results are newest-first so callers can default to finalizing only the
@@ -3116,8 +3205,11 @@ impl ReaderPool {
                 "SELECT s.id, s.cwd, s.agent_kind, s.started_at, s.ended_at, s.actor_user, \
                         (SELECT COUNT(*) FROM observations o \
                          WHERE o.session_id = s.id \
-                           AND o.workspace_id = :ws AND o.project_id = :proj) AS n \
+                           AND o.workspace_id = :ws AND o.project_id = :proj) AS n, \
+                        u.input_tokens, u.output_tokens, u.cache_write_tokens, \
+                        u.cache_read_tokens, u.model \
                  FROM sessions s \
+                 LEFT JOIN session_usage u ON u.session_id = s.id \
                  WHERE 1 = 1{membership}{owner_clause}{ended_clause} \
                  ORDER BY s.started_at DESC, s.id DESC \
                  LIMIT :limit OFFSET :offset"
@@ -3148,24 +3240,66 @@ impl ReaderPool {
                 let ended_us: Option<i64> = row.get(4)?;
                 let actor_user: Option<String> = row.get(5)?;
                 let n: i64 = row.get(6)?;
+                let input_tokens: Option<i64> = row.get(7)?;
+                let output_tokens: Option<i64> = row.get(8)?;
+                let cache_write_tokens: Option<i64> = row.get(9)?;
+                let cache_read_tokens: Option<i64> = row.get(10)?;
+                let model: Option<String> = row.get(11)?;
                 Ok((
-                    id_bytes, cwd, agent_kind, started_us, ended_us, actor_user, n,
+                    id_bytes,
+                    cwd,
+                    agent_kind,
+                    started_us,
+                    ended_us,
+                    actor_user,
+                    n,
+                    input_tokens,
+                    output_tokens,
+                    cache_write_tokens,
+                    cache_read_tokens,
+                    model,
                 ))
             })?;
             let mut out = Vec::new();
             for row in rows {
-                let (id_bytes, cwd, agent_kind, started_us, ended_us, actor_user, n) = row?;
+                let (
+                    id_bytes,
+                    cwd,
+                    agent_kind,
+                    started_us,
+                    ended_us,
+                    actor_user,
+                    n,
+                    input_tokens,
+                    output_tokens,
+                    cache_write_tokens,
+                    cache_read_tokens,
+                    model,
+                ) = row?;
                 let started_at = jiff::Timestamp::from_microsecond(started_us)
                     .map(|ts| ts.to_string())
                     .unwrap_or_default();
                 let ended_at = ended_us
                     .and_then(|us| jiff::Timestamp::from_microsecond(us).ok())
                     .map(|ts| ts.to_string());
+                // `input_tokens` alone stands in for "a usage row exists": the
+                // LEFT JOIN yields all-NULL columns for a session with no
+                // report, and every real row always carries this column
+                // (defaulted to 0, never NULL) once `upsert_session_usage`
+                // has run.
+                let usage = input_tokens.map(|input_tokens| SessionUsageView {
+                    input_tokens: u64::try_from(input_tokens).unwrap_or(0),
+                    output_tokens: u64::try_from(output_tokens.unwrap_or(0)).unwrap_or(0),
+                    cache_write_tokens: u64::try_from(cache_write_tokens.unwrap_or(0)).unwrap_or(0),
+                    cache_read_tokens: u64::try_from(cache_read_tokens.unwrap_or(0)).unwrap_or(0),
+                    model,
+                });
                 out.push(SessionSummary {
                     session_id: SessionId::from_slice(&id_bytes)?,
                     cwd,
                     agent_kind,
                     started_at,
+                    usage,
                     ended_at,
                     observation_count: u64::try_from(n).unwrap_or(0),
                     actor_user,

@@ -8,8 +8,8 @@ use std::collections::BTreeSet;
 
 use ai_memory_core::{
     AgentKind, EntityId, HandoffAcceptance, HandoffId, IdentityKey, LinkTarget, NewHandoff,
-    NewObservation, NewPage, NewSession, ObservationId, ObservationKind, OwnerFilter, PageEvidence,
-    PageId, PagePath, ProjectId, SessionId, WorkspaceId,
+    NewObservation, NewPage, NewSession, NewSessionUsage, ObservationId, ObservationKind,
+    OwnerFilter, PageEvidence, PageId, PagePath, ProjectId, SessionId, WorkspaceId,
 };
 
 /// Summary returned by [`reorg_sessions`] and exposed via
@@ -1405,6 +1405,40 @@ fn end_session_row(
              ) \
          WHERE id = ?3",
         params![now, page_blob, session_id.as_bytes()],
+    )?;
+    Ok(())
+}
+
+/// Record a session's reported cumulative token usage (token-cost
+/// visibility). The reported values are the harness's own running totals
+/// for the whole session, not deltas, so the upsert keeps `MAX(existing,
+/// reported)` per column: a replayed or out-of-order hook delivery can
+/// therefore never lower a total. `model` only overwrites a stored value
+/// when the new report actually names one, so a later report that could
+/// not determine the model does not blank out an earlier one.
+pub fn upsert_session_usage(conn: &Connection, usage: &NewSessionUsage) -> StoreResult<()> {
+    let now = Timestamp::now().as_microsecond();
+    conn.execute(
+        "INSERT INTO session_usage \
+             (session_id, input_tokens, output_tokens, cache_write_tokens, \
+              cache_read_tokens, model, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+         ON CONFLICT(session_id) DO UPDATE SET \
+             input_tokens = MAX(input_tokens, excluded.input_tokens), \
+             output_tokens = MAX(output_tokens, excluded.output_tokens), \
+             cache_write_tokens = MAX(cache_write_tokens, excluded.cache_write_tokens), \
+             cache_read_tokens = MAX(cache_read_tokens, excluded.cache_read_tokens), \
+             model = COALESCE(excluded.model, model), \
+             updated_at = excluded.updated_at",
+        params![
+            usage.session_id.as_bytes(),
+            i64::try_from(usage.input_tokens).unwrap_or(i64::MAX),
+            i64::try_from(usage.output_tokens).unwrap_or(i64::MAX),
+            i64::try_from(usage.cache_write_tokens).unwrap_or(i64::MAX),
+            i64::try_from(usage.cache_read_tokens).unwrap_or(i64::MAX),
+            usage.model,
+            now,
+        ],
     )?;
     Ok(())
 }
@@ -10893,5 +10927,121 @@ pub(crate) mod tests {
             }
         );
         assert_eq!(audit_row_for(&conn, "release_lifecycle_only_handoff").0, 1);
+    }
+
+    /// Token-cost visibility (#722): the harness reports cumulative totals,
+    /// not deltas, so a later report must only ever raise a stored column,
+    /// never lower it — a replayed or out-of-order hook delivery is
+    /// therefore harmless. `model` only updates when the new report
+    /// actually names one.
+    #[test]
+    fn upsert_session_usage_keeps_the_max_per_column() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let session = hook_session(SessionId::new(), ws, proj, None);
+        begin_session(&mut conn, &session).unwrap();
+
+        upsert_session_usage(
+            &conn,
+            &NewSessionUsage {
+                session_id: session.id,
+                input_tokens: 100,
+                output_tokens: 50,
+                cache_write_tokens: 10,
+                cache_read_tokens: 5,
+                model: Some("claude-sonnet-5".into()),
+            },
+        )
+        .unwrap();
+
+        // A stale, smaller report (e.g. a retried older delivery) must not
+        // lower any column, and an absent model must not blank the stored one.
+        upsert_session_usage(
+            &conn,
+            &NewSessionUsage {
+                session_id: session.id,
+                input_tokens: 10,
+                output_tokens: 5,
+                cache_write_tokens: 1,
+                cache_read_tokens: 0,
+                model: None,
+            },
+        )
+        .unwrap();
+
+        let (input, output, cache_write, cache_read, model): (i64, i64, i64, i64, String) = conn
+            .query_row(
+                "SELECT input_tokens, output_tokens, cache_write_tokens, cache_read_tokens, model \
+                 FROM session_usage WHERE session_id = ?1",
+                params![session.id.as_bytes()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!((input, output, cache_write, cache_read), (100, 50, 10, 5));
+        assert_eq!(model, "claude-sonnet-5");
+
+        // A genuinely larger later report raises every column and updates
+        // the model.
+        upsert_session_usage(
+            &conn,
+            &NewSessionUsage {
+                session_id: session.id,
+                input_tokens: 200,
+                output_tokens: 80,
+                cache_write_tokens: 20,
+                cache_read_tokens: 15,
+                model: Some("claude-opus-5-5".into()),
+            },
+        )
+        .unwrap();
+        let (input, model): (i64, String) = conn
+            .query_row(
+                "SELECT input_tokens, model FROM session_usage WHERE session_id = ?1",
+                params![session.id.as_bytes()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(input, 200);
+        assert_eq!(model, "claude-opus-5-5");
+    }
+
+    /// `session_usage` cascades with its session (V64), same as
+    /// `page_evidence` does with its page (V63) — usage never outlives the
+    /// session it measures.
+    #[test]
+    fn upsert_session_usage_cascades_on_session_purge() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let session = hook_session(SessionId::new(), ws, proj, None);
+        begin_session(&mut conn, &session).unwrap();
+        upsert_session_usage(
+            &conn,
+            &NewSessionUsage {
+                session_id: session.id,
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_write_tokens: 0,
+                cache_read_tokens: 0,
+                model: None,
+            },
+        )
+        .unwrap();
+
+        purge_session(&mut conn, ws, proj, session.id, None, Compaction::Skip).unwrap();
+
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_usage WHERE session_id = ?1",
+                params![session.id.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0);
     }
 }

@@ -132,6 +132,36 @@ fn should_spawn_background_drainer(event: &str) -> bool {
     matches!(event, "session-end" | "stop" | "pre-compact")
 }
 
+/// Best-effort: compute this session's cumulative token usage from the
+/// harness's own transcript, for the agents that have a known transcript
+/// format (see `session_usage`). Every failure path — an unsupported agent,
+/// a payload missing the field this agent needs, an unreadable or
+/// unparseable transcript — returns `None` rather than a zeroed report;
+/// callers must never treat `None` as "zero usage".
+fn compute_session_usage(
+    agent_kind: AgentKind,
+    json: &serde_json::Value,
+    session_id: Option<&str>,
+) -> Option<super::session_usage::SessionUsage> {
+    match agent_kind {
+        AgentKind::ClaudeCode => {
+            let path = json
+                .get("transcript_path")
+                .and_then(serde_json::Value::as_str)?;
+            super::session_usage::extract_claude_code_usage(Path::new(path))
+        }
+        AgentKind::Codex => {
+            let session_id = session_id?;
+            let codex_home = std::env::var_os("CODEX_HOME")
+                .map(PathBuf::from)
+                .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))?;
+            let rollout = super::session_usage::locate_codex_rollout(&codex_home, session_id)?;
+            super::session_usage::extract_codex_usage(&rollout)
+        }
+        _ => None,
+    }
+}
+
 fn session_id_state_path(data_dir: &Path, agent: AgentKind) -> PathBuf {
     data_dir
         .join("hook-state")
@@ -597,6 +627,31 @@ where
             }
             CaptureDisposition::Keep => {}
         }
+    }
+
+    // Token-usage visibility (docs: token-cost tracking): only at
+    // session-end, which fires once per session — never on the frequent
+    // `stop`/`post-tool-use` path — so the bounded transcript read this
+    // performs (a full linear scan for Claude Code, a bounded tail read for
+    // Codex) never touches the hot path. Spliced the same way
+    // `_ai_memory_capture` is above, so it rides the existing session-end
+    // POST/spool/retry path with no new wire format.
+    if args.event == "session-end"
+        && let Some(usage) =
+            compute_session_usage(agent_kind, &json, canonical_session_id.as_deref())
+        && let Some(object) = json.as_object_mut()
+    {
+        object.insert(
+            "_ai_memory_usage".into(),
+            serde_json::json!({
+                "input_tokens": usage.input_tokens,
+                "output_tokens": usage.output_tokens,
+                "cache_write_tokens": usage.cache_write_tokens,
+                "cache_read_tokens": usage.cache_read_tokens,
+                "model": usage.model,
+            }),
+        );
+        payload = serde_json::to_string(&json)?;
     }
 
     let qs = cwd_query_suffix(

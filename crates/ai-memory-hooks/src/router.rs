@@ -16,8 +16,8 @@ use ai_memory_consolidate::{Consolidator, ConsolidatorError};
 use ai_memory_core::{
     ActiveProject, ActorKey, AgentKind, DEFAULT_WORKSPACE_NAME, Handoff, IdentityKey,
     MANAGED_WORKSTREAM_PACKET_MARKER, ManagedRunId, MidSessionRouting, NewHandoff, NewObservation,
-    NewSession, ObservationKind, ProjectId, Sanitized, Sanitizer, SessionId, WorkspaceId,
-    WorkstreamEvent, WorkstreamEventKind,
+    NewSession, NewSessionUsage, ObservationKind, ProjectId, Sanitized, Sanitizer, SessionId,
+    WorkspaceId, WorkstreamEvent, WorkstreamEventKind,
 };
 use ai_memory_store::{
     HookSessionAdmission, IngestObservationOutcome, InterruptedSessionCandidate, ObservationOrder,
@@ -2987,6 +2987,19 @@ async fn process_authorized(
     // On SessionEnd, close boundary-only sessions without generated artifacts.
     // Substantive sessions synthesize the summary page and auto-handoff below.
     if matches!(env.event, HookEvent::SessionEnd) {
+        // Token-usage visibility (docs: session usage tracking): the native
+        // hook spliced an optional `_ai_memory_usage` object into the
+        // session-end body it POSTed (see `ai-memory-cli`'s `hook.rs`). Best
+        // effort and independent of the ephemeral/substantive branching
+        // below — a session with zero generated artifacts still spent
+        // tokens, so this must not be skipped for the lifecycle-only path.
+        // A malformed or absent object, or a write failure, never fails the
+        // SessionEnd request itself.
+        if let Some(usage) = parse_reported_session_usage(&env.raw, session_id)
+            && let Err(e) = state.writer.upsert_session_usage(usage).await
+        {
+            warn!(error = %e, session = %session_id, "session usage upsert failed; continuing");
+        }
         let mut observations = state.reader.observations_for_session(session_id).await?;
         if is_ephemeral_session(&observations) {
             let outcome = state
@@ -3222,6 +3235,63 @@ fn resolve_native_session_id(raw: &str) -> SessionId {
 /// with the store-side SQL in `end_lifecycle_only_session_in_tx`
 /// (ai-memory-store/src/ops.rs): both sides classify every observation set
 /// identically, or the atomic store re-check silently reverts this verdict.
+/// Token count fields are clamped to this ceiling — far above any real
+/// session, but bounds a malformed or hostile report from producing an
+/// unbounded number that later renders oddly.
+const MAX_REPORTED_SESSION_TOKENS: u64 = 1_000_000_000;
+/// `model` is trimmed and capped at this many bytes before storage.
+const MAX_REPORTED_MODEL_BYTES: usize = 64;
+
+/// Parse the optional `_ai_memory_usage` object the native hook splices
+/// into a session-end body (see `ai-memory-cli`'s `hook.rs`). Every field is
+/// optional and defaults to 0/`None` — a malformed number, an object with no
+/// usable fields at all, or the key's absence all read as "nothing to
+/// record" (`None`), never as a zeroed report that would clobber a real one.
+fn parse_reported_session_usage(
+    raw: &serde_json::Value,
+    session_id: SessionId,
+) -> Option<NewSessionUsage> {
+    let usage = raw.get("_ai_memory_usage")?;
+    let field = |key: &str| {
+        usage
+            .get(key)
+            .and_then(serde_json::Value::as_u64)
+            .map(|n| n.min(MAX_REPORTED_SESSION_TOKENS))
+            .unwrap_or(0)
+    };
+    let input_tokens = field("input_tokens");
+    let output_tokens = field("output_tokens");
+    let cache_write_tokens = field("cache_write_tokens");
+    let cache_read_tokens = field("cache_read_tokens");
+    if input_tokens == 0 && output_tokens == 0 && cache_write_tokens == 0 && cache_read_tokens == 0
+    {
+        return None;
+    }
+    let model = usage
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            // Byte-cap on a char boundary: `String::truncate` panics on a
+            // boundary split, which an arbitrary client-supplied model name
+            // (e.g. containing multibyte UTF-8) could otherwise trigger.
+            let mut end = s.len().min(MAX_REPORTED_MODEL_BYTES);
+            while end > 0 && !s.is_char_boundary(end) {
+                end -= 1;
+            }
+            s[..end].to_owned()
+        });
+    Some(NewSessionUsage {
+        session_id,
+        input_tokens,
+        output_tokens,
+        cache_write_tokens,
+        cache_read_tokens,
+        model,
+    })
+}
+
 fn is_ephemeral_session(observations: &[ai_memory_core::Observation]) -> bool {
     !observations.iter().any(|observation| {
         matches!(
@@ -13179,5 +13249,76 @@ mod tests {
         assert!(is_acknowledgment("谢谢"));
         assert!(!is_acknowledgment("fix the bug in main.rs"));
         assert!(!is_acknowledgment("what is the return type?"));
+    }
+
+    /// Token-cost visibility (#722): the native hook splices this object
+    /// into a session-end body (see `ai-memory-cli`'s `hook.rs`). Every
+    /// field is optional and untrusted client input, so parsing must be
+    /// tolerant rather than error out.
+    #[test]
+    fn parse_reported_session_usage_reads_every_field() {
+        let sid = SessionId::new();
+        let raw = serde_json::json!({
+            "_ai_memory_usage": {
+                "input_tokens": 100,
+                "output_tokens": 50,
+                "cache_write_tokens": 10,
+                "cache_read_tokens": 5,
+                "model": "  claude-sonnet-5  ",
+            }
+        });
+        let usage = parse_reported_session_usage(&raw, sid).unwrap();
+        assert_eq!(usage.session_id, sid);
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.output_tokens, 50);
+        assert_eq!(usage.cache_write_tokens, 10);
+        assert_eq!(usage.cache_read_tokens, 5);
+        // Trimmed, not stored with the client's stray whitespace.
+        assert_eq!(usage.model.as_deref(), Some("claude-sonnet-5"));
+    }
+
+    /// Absent key, an all-zero object, and a non-numeric field all read as
+    /// "nothing to record" — never as a zeroed report that would clobber a
+    /// real one via the writer's `MAX(existing, reported)` upsert.
+    #[test]
+    fn parse_reported_session_usage_none_for_absent_or_all_zero() {
+        let sid = SessionId::new();
+        assert!(parse_reported_session_usage(&serde_json::json!({}), sid).is_none());
+        assert!(
+            parse_reported_session_usage(
+                &serde_json::json!({"_ai_memory_usage": {"input_tokens": 0, "output_tokens": 0}}),
+                sid
+            )
+            .is_none()
+        );
+        // A non-numeric field is treated as absent (0), not as an error
+        // that drops the whole report — the other fields still count.
+        let usage = parse_reported_session_usage(
+            &serde_json::json!({"_ai_memory_usage": {"input_tokens": "not a number", "output_tokens": 7}}),
+            sid,
+        )
+        .unwrap();
+        assert_eq!(usage.input_tokens, 0);
+        assert_eq!(usage.output_tokens, 7);
+    }
+
+    /// A ridiculous client-reported value is clamped rather than stored
+    /// verbatim, and blank/whitespace-only model names are dropped instead
+    /// of overwriting a previously stored one with junk.
+    #[test]
+    fn parse_reported_session_usage_clamps_tokens_and_drops_blank_model() {
+        let sid = SessionId::new();
+        let usage = parse_reported_session_usage(
+            &serde_json::json!({
+                "_ai_memory_usage": {
+                    "input_tokens": u64::MAX,
+                    "model": "   ",
+                }
+            }),
+            sid,
+        )
+        .unwrap();
+        assert_eq!(usage.input_tokens, MAX_REPORTED_SESSION_TOKENS);
+        assert_eq!(usage.model, None);
     }
 }

@@ -28,6 +28,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   truncation marker `memory_read_session_observations` already uses. The
   response always carries `truncated` and `total_chars` so a caller knows
   the real size even when the body wasn't cut.
+- Per-session token-cost visibility. The native hook (Claude Code and Codex)
+  reads the harness's own transcript at `session-end` — a full scan for
+  Claude Code's JSONL, a bounded tail read for Codex's rollout file, since
+  those can reach hundreds of MB for a long session — and reports cumulative
+  input/output/cache-write/cache-read totals, which the server stores with a
+  `MAX(existing, reported)` upsert so a replayed or out-of-order delivery can
+  never lower a total. The project overview page now shows a "Tokens" total
+  in the stats card and a Sessions table (agent, start, duration, events,
+  tokens) with the 20 most recent sessions. Best-effort throughout: a session
+  whose harness never reported usage, an unsupported harness, or an older
+  client all just show no number, never a zeroed one.
 
 ### Changed
 - `memory_read_session_observations`'s defaults are smaller: `limit` 50 → 20,

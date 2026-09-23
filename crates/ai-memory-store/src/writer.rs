@@ -12,8 +12,8 @@ use std::thread::{self, JoinHandle};
 
 use ai_memory_core::{
     AgentKind, ApiCredentialId, HandoffAcceptance, HandoffId, IdentityKey, ManagedRunId,
-    NewHandoff, NewObservation, NewPage, NewSession, NewUser, ObservationId, OwnerFilter, PageId,
-    PagePath, ProjectId, Sanitized, SessionId, UserId, UserRole, WorkspaceId,
+    NewHandoff, NewObservation, NewPage, NewSession, NewSessionUsage, NewUser, ObservationId,
+    OwnerFilter, PageId, PagePath, ProjectId, Sanitized, SessionId, UserId, UserRole, WorkspaceId,
 };
 use rusqlite::Connection;
 use tokio::sync::{mpsc, oneshot};
@@ -144,6 +144,10 @@ pub(crate) enum WriteCmd {
     EndLifecycleOnlySession {
         session_id: SessionId,
         reply: oneshot::Sender<StoreResult<LifecycleOnlyEndOutcome>>,
+    },
+    UpsertSessionUsage {
+        usage: NewSessionUsage,
+        reply: oneshot::Sender<StoreResult<()>>,
     },
     SweepHollowProjects {
         min_age_days: u32,
@@ -890,6 +894,21 @@ impl WriterHandle {
             reply: tx,
         })
         .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Record a session's reported cumulative token usage (token-cost
+    /// visibility). Idempotent-safe: the upsert keeps `MAX(existing,
+    /// reported)` per column, so calling this twice with the same or an
+    /// older report never lowers a stored total.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL/state errors
+    /// (including the FK violation from an unknown `usage.session_id`).
+    pub async fn upsert_session_usage(&self, usage: NewSessionUsage) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::UpsertSessionUsage { usage, reply: tx })
+            .await?;
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
@@ -2703,6 +2722,10 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             } => {
                 let result = ops::end_session(&mut conn, &session_id, summary_page_id.as_ref());
                 send_or_warn(reply, result, "end_session");
+            }
+            WriteCmd::UpsertSessionUsage { usage, reply } => {
+                let result = ops::upsert_session_usage(&conn, &usage);
+                send_or_warn(reply, result, "upsert_session_usage");
             }
             WriteCmd::EndSessionWithHandoff {
                 session_id,

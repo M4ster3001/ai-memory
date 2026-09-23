@@ -2396,6 +2396,7 @@ mod tests {
         Sanitized, Sanitizer, SessionId, Tier,
     };
     use ai_memory_llm::{ChatRequest, ChatResponse, LlmResult, SyntheticEmbedder};
+    use ai_memory_web::split_web_routers;
     use ai_memory_wiki::WritePageRequest;
     use axum::http::Request;
     use secrecy::SecretString;
