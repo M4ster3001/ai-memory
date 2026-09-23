@@ -3,10 +3,51 @@
 {% block title %}Projects — ai-memory{% endblock %}
 
 {% block content %}
+<style>
+  /* The shipped Tailwind stylesheet is vendored. Keep these dashboard-only
+     grids explicit so a stale utility build cannot collapse their cards. */
+  .memory-summary-grid, .memory-hook-health-grid, .project-cards-grid { display: grid; grid-template-columns: repeat(1, minmax(0, 1fr)); gap: .75rem; }
+  .project-card-metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .5rem; }
+  .project-card-metric { border: 1px solid rgb(226 232 240); border-radius: .375rem; padding: .5rem; }
+  .project-card-footer { display: flex; align-items: center; justify-content: space-between; gap: .75rem; margin-top: .75rem; }
+  @media (min-width: 640px) { .memory-summary-grid, .memory-hook-health-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .project-cards-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  @media (min-width: 1024px) { .project-cards-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+  @media (min-width: 1024px) { .memory-summary-grid { grid-template-columns: repeat(5, minmax(0, 1fr)); } .memory-hook-health-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
+  .dark .project-card-metric { border-color: rgb(30 41 59); }
+</style>
 <div class="mb-6">
-  <h1 class="text-2xl font-bold text-slate-900 dark:text-slate-100">Projects</h1>
-  <p class="mt-1 text-sm text-slate-500 dark:text-slate-400">All workspaces and projects in your wiki.</p>
+  <h1 class="text-2xl font-bold text-slate-900 dark:text-slate-100">Memory dashboard</h1>
+  <p class="mt-1 text-sm text-slate-500 dark:text-slate-400">Human-facing overview of capture, continuity, and compiled memory.</p>
 </div>
+
+<section aria-label="Memory health overview" class="mb-8">
+  <div class="memory-summary-grid">
+    <div class="rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-4"><div class="text-xs text-slate-500">Projects</div><div class="mt-1 text-2xl font-semibold">{{ dashboard.project_count }}</div></div>
+    <div class="rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-4"><div class="text-xs text-slate-500">Sessions</div><div class="mt-1 text-2xl font-semibold">{{ dashboard.session_count }}</div></div>
+    <div class="rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-4"><div class="text-xs text-slate-500">Captured events</div><div class="mt-1 text-2xl font-semibold">{{ dashboard.observation_count }}</div></div>
+    <div class="rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-4"><div class="text-xs text-slate-500">Compiled pages</div><div class="mt-1 text-2xl font-semibold">{{ dashboard.page_count }}</div></div>
+    <div class="rounded-lg border {% if dashboard.open_session_count > 0 %}border-amber-300 dark:border-amber-800 bg-amber-50 dark:bg-amber-950/20{% else %}border-emerald-200 dark:border-emerald-900 bg-emerald-50 dark:bg-emerald-950/20{% endif %} p-4"><div class="text-xs text-slate-600 dark:text-slate-300">Open sessions</div><div class="mt-1 text-2xl font-semibold">{{ dashboard.open_session_count }}</div></div>
+  </div>
+  <p class="mt-3 text-xs text-slate-500 dark:text-slate-400">
+    {% if dashboard.last_activity_relative != "" %}Last capture {{ dashboard.last_activity_relative }}.{% endif %}
+    Open means no SessionEnd was received; it can be an active agent or an interruption. Counts are metadata only; raw prompts and commands remain in scoped detail views.
+  </p>
+</section>
+
+{% if let Some(ingest) = dashboard.ingest %}
+<section aria-label="Hook capture health" class="mb-8 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900/50 p-5">
+  <div class="flex flex-wrap items-baseline justify-between gap-2">
+    <h2 class="text-base font-semibold text-slate-900 dark:text-slate-100">Hook capture health</h2>
+    <p class="text-xs text-slate-500">Since this server started; counters contain no prompt or command content.</p>
+  </div>
+  <div class="memory-hook-health-grid mt-4 text-sm">
+    <div><div class="text-slate-500">Accepted</div><div class="mt-1 text-xl font-semibold text-emerald-700 dark:text-emerald-300">{{ ingest.accepted }}</div></div>
+    <div><div class="text-slate-500">Policy-dropped</div><div class="mt-1 text-xl font-semibold">{{ ingest.dropped_by_policy }}</div></div>
+    <div><div class="text-slate-500">Capacity-shed</div><div class="mt-1 text-xl font-semibold {% if ingest.shed_saturated > 0 %}text-amber-700 dark:text-amber-300{% endif %}">{{ ingest.shed_saturated }}</div></div>
+    <div><div class="text-slate-500">Rate-limited</div><div class="mt-1 text-xl font-semibold {% if ingest.shed_rate_limited > 0 %}text-amber-700 dark:text-amber-300{% endif %}">{{ ingest.shed_rate_limited }}</div></div>
+  </div>
+</section>
+{% endif %}
 
 <div id="llm-notice" class="mb-6 hidden relative rounded-md border border-amber-200 dark:border-amber-900/50 bg-amber-50 dark:bg-amber-950/30 p-4 pr-10 text-sm text-amber-900 dark:text-amber-200">
   <button id="llm-notice-close" type="button" aria-label="Dismiss permanently" title="Don't show this again"
@@ -117,16 +158,24 @@
   </p>
 </div>
 {% else %}
-<div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+<div class="project-cards-grid">
   {% for card in projects %}
-  <a href="{{ card.href }}" class="block rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-5 hover:border-blue-400 dark:hover:border-blue-600 hover:shadow-sm transition-all">
+  <a href="{{ card.href }}" class="block rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-5 hover:border-blue-400 dark:hover:border-blue-600 hover:shadow-sm transition-all" aria-label="Open {{ card.workspace }}/{{ card.project }}">
     <div class="text-xs font-medium text-slate-400 dark:text-slate-500 mb-1">{{ card.workspace }}</div>
     <div class="text-base font-semibold text-slate-800 dark:text-slate-100 truncate">{{ card.project }}</div>
-    <div class="mt-3 flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
-      <span>{{ card.page_count }} page{% if card.page_count != 1 %}s{% endif %}</span>
+    <div class="project-card-metrics mt-3 text-xs">
+      <div class="project-card-metric"><div class="text-slate-500 dark:text-slate-400">Sessions</div><div class="mt-1 font-semibold text-slate-800 dark:text-slate-100">{{ card.session_count }}</div></div>
+      <div class="project-card-metric"><div class="text-slate-500 dark:text-slate-400">Captured events</div><div class="mt-1 font-semibold text-slate-800 dark:text-slate-100">{{ card.observation_count }}</div></div>
+      <div class="project-card-metric"><div class="text-slate-500 dark:text-slate-400">Compiled pages</div><div class="mt-1 font-semibold text-slate-800 dark:text-slate-100">{{ card.page_count }}</div></div>
+      <div class="project-card-metric {% if card.open_session_count > 0 %}bg-amber-50 dark:bg-amber-950/20{% endif %}"><div class="text-slate-500 dark:text-slate-400">Open sessions</div><div class="mt-1 font-semibold {% if card.open_session_count > 0 %}text-amber-700 dark:text-amber-300{% else %}text-emerald-700 dark:text-emerald-300{% endif %}">{{ card.open_session_count }}</div></div>
+    </div>
+    <div class="project-card-footer text-xs text-slate-500 dark:text-slate-400">
       {% if card.last_updated_relative != "" %}
-      <span>{{ card.last_updated_relative }}</span>
+      <span>Last capture {{ card.last_updated_relative }}</span>
+      {% else %}
+      <span>No capture yet</span>
       {% endif %}
+      <span class="font-medium text-blue-700 dark:text-blue-300">Open project â†’</span>
     </div>
   </a>
   {% endfor %}

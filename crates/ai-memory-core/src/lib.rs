@@ -64,7 +64,7 @@ pub use message::{
     AgentMessage, MessageBox, MessageClaim, MessageOrigin, MessageState, NewAgentMessage,
     UNTRUSTED_MESSAGE_NOTICE,
 };
-pub use observation::{NewObservation, NewSession, Observation, ObservationKind};
+pub use observation::{NewObservation, NewSession, NewSessionUsage, Observation, ObservationKind};
 pub use page::{
     FeedbackKind, LinkTarget, MAX_ENTITIES_PER_PAGE, MAX_ENTITY_LEN, NewPage, Page, PageEvidence,
     PageEvidenceKind, Relation, Tier, frontmatter_entity_names, normalize_entities,

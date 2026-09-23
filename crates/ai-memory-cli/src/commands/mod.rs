@@ -76,6 +76,7 @@ pub mod run;
 pub mod run_autowire;
 pub mod search;
 pub mod serve;
+pub mod session_usage;
 pub mod setup_agent;
 pub mod show;
 pub mod status;

@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- The read-only human web home now presents a privacy-preserving memory
+  dashboard: projects, sessions, sanitized capture events, compiled pages,
+  open-session continuity signals, and last activity. Project cards now
+  distinguish captured work from compiled pages, so active hooks no longer
+  look empty merely because their sessions have not ended (#721).
+- The production web dashboard now also exposes content-free, process-lifetime
+  hook-health counters (accepted, policy-dropped, capacity-shed, and
+  rate-limited) without persisting or rendering prompt, command, path, or
+  payload data (#721).
+- The project overview page now shows which agent CLIs produced a project's
+  memory: an "Agents" badge row in the stats card (session counts per
+  harness) and, on each Recent Activity entry, the harness whose session
+  most recently contributed evidence to that page version. Both are
+  best-effort and additive — pages or projects with no session evidence
+  simply show no badge.
+- `memory_read_page` now accepts an optional `max_chars` (default 12000, min
+  500, max 64000) that caps the returned body with the same visible
+  truncation marker `memory_read_session_observations` already uses. The
+  response always carries `truncated` and `total_chars` so a caller knows
+  the real size even when the body wasn't cut.
+- Per-session token-cost visibility. The native hook (Claude Code and Codex)
+  reads the harness's own transcript at `session-end` — a full scan for
+  Claude Code's JSONL, a bounded tail read for Codex's rollout file, since
+  those can reach hundreds of MB for a long session — and reports cumulative
+  input/output/cache-write/cache-read totals, which the server stores with a
+  `MAX(existing, reported)` upsert so a replayed or out-of-order delivery can
+  never lower a total. The project overview page now shows a "Tokens" total
+  in the stats card and a Sessions table (agent, start, duration, events,
+  tokens) with the 20 most recent sessions. Best-effort throughout: a session
+  whose harness never reported usage, an unsupported harness, or an older
+  client all just show no number, never a zeroed one.
+- A session that never gets a graceful `session-end` — most commonly a paid
+  quota running out mid-task, so the harness gets killed and the operator
+  switches to a different agent/account to keep going — no longer stays
+  "open" and token-less forever. When a new session starts in the same
+  scope and finds one quiet for at least 15 minutes, the client best-effort
+  locates that old session's own transcript (Claude Code and Codex), reports
+  its usage, and closes it with a normal synthetic `session-end` — safe even
+  if the old session turns out to still be live, since a later real
+  `session-end` with more work already re-runs the full end path. A separate,
+  much more conservative scheduled sweep (48h of no activity, every scope)
+  closes sessions that are never continued anywhere, so `open_session_count`
+  stops leaking forever; that path never attaches usage or triggers
+  consolidation, since the server has no access to a client's transcript
+  outside a live hook request.
+
+### Changed
+- `memory_read_session_observations`'s defaults are smaller: `limit` 50 → 20,
+  `body_max_chars` 4000 → 1000. A caller that needs more can still raise
+  either explicitly (up to the unchanged ceilings of 200 and 16384). This
+  makes a routine "what did this session do" lookup materially cheaper by
+  default; the retrieval skill now also documents a narrow
+  `order="desc"` + small `kinds`/`limit`/`body_max_chars` recipe for that
+  question instead of reading the whole session.
+
 ### Fixed
 - `memory_message_pop` and `memory_message_list` no longer return a silent
   empty result when the inbox scope was *inferred* rather than named. A caller
@@ -700,6 +756,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resuming session started with no context. The escaping is linear and reuses
   the same BusyBox replacement-doubling probe as the four existing escapes
   (#732).
+- A new agent session now receives a bounded, read-only recovery snapshot when
+  the previous substantive session in the same project disappeared without a
+  `SessionEnd` (for example API quota exhaustion, a killed process, or a machine
+  restart). The snapshot is assembled on demand from at most 64 already
+  sanitized observations and capped at 6,000 characters, so it does not create
+  a rolling copy of the transcript or an unbounded in-memory read. Selection is
+  project- and owner-scoped, excludes the receiving session, preserves the
+  untrusted-memory boundary, and never closes or claims the source because it
+  may still be a legitimate parallel agent. Normal single-use handoffs and
+  managed workstream packets remain unchanged (#720).
 
 ## [2.2.1] - 2026-09-12
 

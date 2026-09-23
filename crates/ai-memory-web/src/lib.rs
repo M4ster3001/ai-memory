@@ -35,7 +35,7 @@ mod templates;
 
 pub use mount::{
     SplitWebRouters, WebMountSpec, inject_base_href, inject_base_path_meta, normalize_prefix,
-    split_web_routers, web_base_href,
+    split_web_routers, split_web_routers_with_metrics, web_base_href,
 };
 pub use state::WebState;
 

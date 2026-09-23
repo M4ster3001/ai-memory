@@ -8,7 +8,9 @@ use axum::http::StatusCode;
 use axum::response::Html;
 
 use crate::state::WebState;
-use crate::templates::{OkfDialog, ProjectCard, ProjectsView, humanize, project_href};
+use crate::templates::{
+    DashboardStats, IngestStats, OkfDialog, ProjectCard, ProjectsView, humanize, project_href,
+};
 
 /// Handler for `GET /`.
 pub(crate) async fn handler(
@@ -20,15 +22,40 @@ pub(crate) async fn handler(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
+    let dashboard = DashboardStats {
+        project_count: summaries.len(),
+        page_count: summaries.iter().map(|s| s.page_count).sum(),
+        session_count: summaries.iter().map(|s| s.session_count).sum(),
+        observation_count: summaries.iter().map(|s| s.observation_count).sum(),
+        open_session_count: summaries.iter().map(|s| s.open_session_count).sum(),
+        last_activity_relative: summaries
+            .iter()
+            .find_map(|s| s.last_activity.as_deref())
+            .map(humanize)
+            .unwrap_or_default(),
+        ingest: state.ingest_metrics.as_ref().map(|metrics| {
+            let snapshot = metrics.snapshot();
+            IngestStats {
+                accepted: snapshot.accepted,
+                dropped_by_policy: snapshot.dropped_by_policy,
+                shed_saturated: snapshot.shed_saturated,
+                shed_rate_limited: snapshot.shed_rate_limited,
+            }
+        }),
+    };
     let projects = summaries
         .into_iter()
         .map(|s| {
-            let last_updated_relative = s.last_updated.as_deref().map(humanize).unwrap_or_default();
+            let last_updated_relative =
+                s.last_activity.as_deref().map(humanize).unwrap_or_default();
             let href = project_href(&s.workspace_name, &s.project_name);
             ProjectCard {
                 workspace: s.workspace_name,
                 project: s.project_name,
                 page_count: s.page_count,
+                session_count: s.session_count,
+                observation_count: s.observation_count,
+                open_session_count: s.open_session_count,
                 last_updated_relative,
                 href,
             }
@@ -38,6 +65,7 @@ pub(crate) async fn handler(
     let okf_dialog = okf_dialog(&state);
     let html = ProjectsView {
         projects,
+        dashboard,
         okf_dialog,
     }
     .render()
