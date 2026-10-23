@@ -22,6 +22,7 @@ version in [`docs/changelog/`](docs/changelog/):
 
 
 ### Added
+- Added bundled web documentation, searchable feature activation guides, per-release changelogs, and authenticated Markdown/JSON references for agents (#721).
 - Redesigned the responsive dashboard with persistent workspace navigation, searchable project cards, per-agent consumption and coverage, session response drilldowns, and filterable token investigation signals (#721).
 - Added a browser inbox with non-consuming received/sent history and an authorized composer for registered project agents; addressed messages now route to the selected harness through MCP or CLI while existing shared mail remains compatible (#721).
 - Added live, deduplicated response token accounting for Claude Code and Codex, with per-response input/output/cache diagnostics and investigation signals in the project dashboard (#722).
