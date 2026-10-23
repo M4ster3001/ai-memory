@@ -20,7 +20,7 @@ use crate::codex_responses::{CodexResponsesAuth, post_codex_responses};
 use crate::error::{LlmError, LlmResult};
 use crate::openai::{STRUCTURED_OUTPUT_SCHEMA_NAME, enforce_strict_object_schemas};
 use crate::provider::LlmProvider;
-use crate::stored_token::{StoredOAuthToken, refresh_grant};
+use crate::stored_token::{StoredOAuthToken, credential_endpoint, refresh_grant};
 use crate::text::truncate_with_ellipsis;
 use crate::types::{ChatRequest, ChatResponse, ExtraHeaders, ReasoningEffort, Usage};
 
@@ -42,8 +42,9 @@ pub const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub const OAUTH_SCOPES: &str = "openid profile email offline_access";
 
 /// Status code used when the Codex SSE stream carries a terminal error
-/// event (`response.failed`/`response.incomplete`/`response.cancelled`
-/// or a top-level `error` payload). 502 ("Bad Gateway") models the
+/// event (`response.failed`/`response.cancelled`, a
+/// `response.incomplete` the output budget does not explain, or a
+/// top-level `error` payload). 502 ("Bad Gateway") models the
 /// situation accurately: the upstream connected, but the response it
 /// sent was not a usable completion — the Codex backend, not
 /// ai-memory's HTTP layer, produced the failure.
@@ -154,7 +155,10 @@ impl OpenAiOAuthProvider {
                 token_path.display()
             ))
         })?;
-        let client = reqwest::Client::builder().build().map_err(LlmError::from)?;
+        let client = reqwest::Client::builder()
+            .redirect(crate::redirect::same_origin_redirects())
+            .build()
+            .map_err(LlmError::from)?;
         Ok(Self {
             client,
             model: model.into(),
@@ -261,7 +265,11 @@ impl LlmProvider for OpenAiOAuthProvider {
                 self.reasoning_effort,
             ))
             .await?;
-        let text = extract_output_text(&response).unwrap_or_default();
+        // No content at all is a distinct terminal failure, not a JSON parse
+        // error, as the OpenAI path already treats it: `unwrap_or_default()` fed
+        // an empty string to serde, so the caller saw "EOF while parsing a value
+        // at line 1 column 0", which names neither the model nor the cause.
+        let text = require_output_text(&response, &self.model)?;
         serde_json::from_str::<serde_json::Value>(&text).map_err(LlmError::from)
     }
 }
@@ -270,9 +278,11 @@ async fn refresh_access_token(
     client: &reqwest::Client,
     current: &OpenAiOAuthToken,
 ) -> LlmResult<OpenAiOAuthToken> {
+    let token_endpoint =
+        credential_endpoint("OpenAI OAuth token endpoint", OPENAI_OAUTH_TOKEN_URL)?;
     let token_response = refresh_grant::<OpenAiOAuthTokenResponse>(
         client,
-        OPENAI_OAUTH_TOKEN_URL,
+        &token_endpoint,
         current.refresh.expose_secret(),
         CODEX_CLIENT_ID,
         "openai-oauth refresh failed",
@@ -328,7 +338,7 @@ pub(crate) fn build_request<'a>(
     }
 }
 
-pub(crate) fn parse_sse_response(body: &str) -> LlmResult<CodexResponsesResponse> {
+pub(crate) fn parse_sse_response(body: &str, model: &str) -> LlmResult<CodexResponsesResponse> {
     let mut current_event: Option<String> = None;
     let mut data_lines: Vec<&str> = Vec::new();
     let mut output_text = String::new();
@@ -356,6 +366,7 @@ pub(crate) fn parse_sse_response(body: &str) -> LlmResult<CodexResponsesResponse
             return Err(LlmError::Provider {
                 status: SSE_TERMINAL_ERROR_STATUS,
                 body: truncate_with_ellipsis(trimmed, SSE_ERROR_BODY_TRIM),
+                retry_after: None,
             });
         }
         let kind = value
@@ -373,10 +384,32 @@ pub(crate) fn parse_sse_response(body: &str) -> LlmResult<CodexResponsesResponse
                 let response = value.get("response").cloned().unwrap_or(value);
                 completed = Some(serde_json::from_value(response)?);
             }
+            // An `incomplete` stop for `max_output_tokens` is an output-budget
+            // stop, not a provider fault, and the 502 below is transient: the
+            // fallback chain and the SessionEnd queue would re-send the same
+            // expensive prompt only to have it truncated again at the same
+            // budget. The OpenAI and Copilot paths already report this stop as
+            // `TruncatedResponse`, which is terminal. Every other non-completed
+            // status keeps the 502 path.
+            "response.incomplete"
+                if value
+                    .pointer("/response/incomplete_details/reason")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("max_output_tokens") =>
+            {
+                return Err(LlmError::TruncatedResponse {
+                    model: model.to_owned(),
+                    completion_tokens: value
+                        .pointer("/response/usage/output_tokens")
+                        .and_then(serde_json::Value::as_u64)
+                        .and_then(|tokens| u32::try_from(tokens).ok()),
+                });
+            }
             "response.failed" | "response.incomplete" | "response.cancelled" | "error" => {
                 return Err(LlmError::Provider {
                     status: SSE_TERMINAL_ERROR_STATUS,
                     body: truncate_with_ellipsis(trimmed, SSE_ERROR_BODY_TRIM),
+                    retry_after: None,
                 });
             }
             _ => {}
@@ -428,14 +461,17 @@ pub(crate) fn parse_sse_response(body: &str) -> LlmResult<CodexResponsesResponse
     Ok(response)
 }
 
-fn model_uses_default_temperature(model: &str) -> bool {
+/// Models on the ChatGPT/Codex and Copilot backends that reject a
+/// caller-supplied `temperature`. Shared by the `openai-oauth`, `codex`
+/// and `copilot` providers.
+pub(crate) fn model_uses_default_temperature(model: &str) -> bool {
     let m = model.to_ascii_lowercase();
-    m.starts_with("gpt-5") || m.starts_with('o')
+    m.starts_with("gpt-5") || m.starts_with("gpt-6") || m.starts_with('o')
 }
 
 #[derive(Debug, Serialize)]
 pub(crate) struct CodexResponsesRequest<'a> {
-    model: &'a str,
+    pub(crate) model: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     instructions: Option<&'a str>,
     input: Vec<CodexInputMessage<'a>>,
@@ -546,6 +582,17 @@ pub(crate) fn extract_output_text(response: &CodexResponsesResponse) -> Option<S
         .filter_map(|content| content.text.as_deref())
         .find(|text| !text.is_empty())
         .map(ToOwned::to_owned)
+}
+
+pub(crate) fn require_output_text(
+    response: &CodexResponsesResponse,
+    model: &str,
+) -> LlmResult<String> {
+    extract_output_text(response)
+        .filter(|text| !text.trim().is_empty())
+        .ok_or_else(|| LlmError::EmptyContent {
+            model: model.to_owned(),
+        })
 }
 
 fn extract_account_id_from_jwt(token: &str) -> Option<String> {
@@ -707,6 +754,19 @@ mod tests {
     }
 
     #[test]
+    fn codex_request_omits_gpt6_temperature() {
+        let request = ChatRequest {
+            system: None,
+            messages: vec![crate::types::ChatMessage::user("hello")],
+            temperature: Some(0.2),
+            max_tokens: 123,
+        };
+        let value =
+            serde_json::to_value(build_request("gpt-6-luna", &request, None, None)).unwrap();
+        assert!(value.get("temperature").is_none());
+    }
+
+    #[test]
     fn codex_request_moves_system_to_instructions_and_omits_gpt5_temperature() {
         let request = ChatRequest {
             system: Some("sys".into()),
@@ -752,7 +812,7 @@ mod tests {
             "data: [DONE]\n\n"
         );
 
-        let response = parse_sse_response(body).unwrap();
+        let response = parse_sse_response(body, "gpt-5.5").unwrap();
         assert_eq!(response.model.as_deref(), Some("gpt-5.5"));
         assert_eq!(response.output_text.as_deref(), Some("hello"));
         let usage = response.usage.expect("usage from completed event");
@@ -762,20 +822,15 @@ mod tests {
 
     #[test]
     fn parse_sse_response_surfaces_terminal_failure_events() {
-        for event in [
-            "response.failed",
-            "response.incomplete",
-            "response.cancelled",
-            "error",
-        ] {
+        for event in ["response.failed", "response.cancelled", "error"] {
             let body = format!(
                 "event: {event}\n\
                  data: {{\"type\":\"{event}\",\"error\":{{\"message\":\"stream stopped\"}}}}\n\n"
             );
 
-            let err = parse_sse_response(&body).expect_err("terminal event must fail");
+            let err = parse_sse_response(&body, "gpt-5.5").expect_err("terminal event must fail");
             match err {
-                LlmError::Provider { status, body } => {
+                LlmError::Provider { status, body, .. } => {
                     assert_eq!(status, 502);
                     assert!(body.contains(event), "body should include event: {body}");
                     assert!(
@@ -788,6 +843,62 @@ mod tests {
         }
     }
 
+    /// A `response.incomplete` stop whose `incomplete_details.reason` is
+    /// `max_output_tokens` is an output-budget stop, so it must land in the
+    /// terminal `truncated-response` class rather than the transient 502 that
+    /// `is_transient()` tells the fallback chain and the SessionEnd queue to
+    /// re-send. `incomplete` for any other reason stays on the 502 path (the
+    /// control below).
+    #[test]
+    fn parse_sse_response_maps_incomplete_to_truncated_response() {
+        let body = concat!(
+            "event: response.incomplete\n",
+            "data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",",
+            "\"model\":\"gpt-5.5-wire\",\"usage\":{\"input_tokens\":12,\"output_tokens\":16000},",
+            "\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n"
+        );
+
+        let err = parse_sse_response(body, "gpt-5.5").expect_err("a budget stop must not parse");
+        match &err {
+            LlmError::TruncatedResponse {
+                model,
+                completion_tokens,
+            } => {
+                assert_eq!(
+                    model, "gpt-5.5",
+                    "the configured model label, not the wire one"
+                );
+                assert_eq!(*completion_tokens, Some(16_000));
+            }
+            other => panic!("expected TruncatedResponse, got {other:?}"),
+        }
+        assert_eq!(err.class(), "truncated-response");
+        assert!(!err.is_transient(), "a budget stop must not be retried");
+    }
+
+    /// Control for the arm above: a `response.incomplete` the output budget
+    /// does not explain keeps the terminal 502 path.
+    #[test]
+    fn parse_sse_response_keeps_non_budget_incomplete_on_provider_path() {
+        let body = concat!(
+            "event: response.incomplete\n",
+            "data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",",
+            "\"incomplete_details\":{\"reason\":\"content_filter\"}}}\n\n"
+        );
+
+        let err = parse_sse_response(body, "gpt-5.5").expect_err("terminal event must fail");
+        match err {
+            LlmError::Provider { status, body, .. } => {
+                assert_eq!(status, SSE_TERMINAL_ERROR_STATUS);
+                assert!(
+                    body.contains("content_filter"),
+                    "body should carry the reason: {body}"
+                );
+            }
+            other => panic!("expected Provider error, got {other:?}"),
+        }
+    }
+
     #[test]
     fn parse_sse_response_requires_completed_event() {
         let body = concat!(
@@ -796,7 +907,8 @@ mod tests {
             "data: [DONE]\n\n",
         );
 
-        let err = parse_sse_response(body).expect_err("missing completed event must fail");
+        let err =
+            parse_sse_response(body, "gpt-5.5").expect_err("missing completed event must fail");
         assert!(
             err.to_string()
                 .contains("stream closed before response.completed"),
@@ -812,10 +924,10 @@ mod tests {
     #[test]
     fn parse_sse_response_promotes_top_level_error_without_event_header() {
         let body = "data: {\"error\":{\"message\":\"context length exceeded\"}}\n\n";
-        let err = parse_sse_response(body)
+        let err = parse_sse_response(body, "gpt-5.5")
             .expect_err("top-level error payload must surface as a terminal error");
         match err {
-            LlmError::Provider { status, body } => {
+            LlmError::Provider { status, body, .. } => {
                 assert_eq!(status, super::SSE_TERMINAL_ERROR_STATUS);
                 assert!(
                     body.contains("context length exceeded"),
@@ -836,7 +948,7 @@ mod tests {
         // `data:` line carrying an unterminated JSON object, no blank
         // line after — the post-loop flush is what runs.
         let body = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hel";
-        let err = parse_sse_response(body).expect_err("truncated stream must fail");
+        let err = parse_sse_response(body, "gpt-5.5").expect_err("truncated stream must fail");
         assert!(
             err.to_string()
                 .contains("stream truncated before final event closed"),
@@ -849,7 +961,7 @@ mod tests {
     /// "stream closed before response.completed" error.
     #[test]
     fn parse_sse_response_empty_body_reports_no_completed_event() {
-        let err = parse_sse_response("").expect_err("empty body must fail");
+        let err = parse_sse_response("", "gpt-5.5").expect_err("empty body must fail");
         assert!(
             err.to_string()
                 .contains("stream closed before response.completed"),
@@ -872,7 +984,7 @@ mod tests {
             "data: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-5.5\",\"output_text\":\"line1\\nline2\",\"output\":[]}}\n\n",
             "data: [DONE]\n\n",
         );
-        let resp = parse_sse_response(body).expect("multi-line content must parse");
+        let resp = parse_sse_response(body, "gpt-5.5").expect("multi-line content must parse");
         assert_eq!(resp.output_text.as_deref(), Some("line1\nline2"));
     }
 
@@ -907,5 +1019,18 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(extract_output_text(&nested).as_deref(), Some("nested"));
+    }
+
+    #[test]
+    fn responses_structured_output_requires_non_blank_text() {
+        for response in [
+            serde_json::from_value(json!({"output": []})).unwrap(),
+            serde_json::from_value(json!({"output_text": " \n\t", "output": []})).unwrap(),
+        ] {
+            let error = require_output_text(&response, "gpt-empty")
+                .expect_err("missing or blank Responses output must be empty content");
+            assert_eq!(error.class(), "empty-content");
+            assert!(matches!(error, LlmError::EmptyContent { model } if model == "gpt-empty"));
+        }
     }
 }

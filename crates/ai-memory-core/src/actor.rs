@@ -88,6 +88,40 @@ pub struct ActorContext {
     pub client: Option<String>,
 }
 
+/// The user this request is authorized *as*, for per-repository grants.
+///
+/// Distinct from the bare `UserId` the middleware also stamps, and the
+/// distinction is the whole point. `UserId` answers "who wrote this" and is
+/// always present for a database user, because attribution must not depend on
+/// a policy setting. This answers "whose access applies", and is stamped for
+/// every database user — never for the root token, which authenticates from
+/// configuration and is authorized above per-project granularity, and never on
+/// an install with no database users, where there is nobody to tell apart.
+///
+/// Every guard reads a missing `AuthorizedViewer` as "no per-project check
+/// applies". A present one is checked against the project's access mode: an
+/// `open` project admits every viewer, which is how every project behaves
+/// until an operator restricts it, so stamping every user changes nothing on
+/// upgrade.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthorizedViewer(pub crate::UserId);
+
+/// Marks a request that authenticated with the legacy browser credential: the
+/// root bearer sent as HTTP Basic, or an `ai_memory_auth` cookie an older build
+/// set. That path exists only until human auth is set up and admits GET only,
+/// so a page served through it can tell the viewer that a change it would post
+/// cannot succeed, instead of offering a control that always fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LegacyBrowserAuth;
+
+impl AuthorizedViewer {
+    /// The user id inside.
+    #[must_use]
+    pub const fn user(self) -> crate::UserId {
+        self.0
+    }
+}
+
 /// Authorization tier the auth middleware resolved this request to.
 ///
 /// Identity ([`ActorContext`]) carries *who* the request is from;

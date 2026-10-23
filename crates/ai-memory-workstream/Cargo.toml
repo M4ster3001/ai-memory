@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+homepage.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "Read-only native harness adapters and managed launch planning for ai-memory."
@@ -17,6 +18,7 @@ sha2.workspace = true
 # Kimi wire records timestamp in ms epoch; jiff renders them RFC3339 like the
 # other harnesses' native ISO strings.
 jiff.workspace = true
+libc.workspace = true
 rusqlite.workspace = true
 tokio.workspace = true
 uuid.workspace = true

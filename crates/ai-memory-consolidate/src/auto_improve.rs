@@ -11,23 +11,45 @@ use std::pin::Pin;
 use std::process::Stdio;
 use std::time::Duration;
 
-use ai_memory_core::{Observation, PagePath, ProjectId, SessionId, WorkspaceId};
+use ai_memory_core::{PagePath, ProjectId, Sanitizer, SessionId, WorkspaceId};
 use ai_memory_llm::{
-    ChatMessage, ChatRequest, LlmError, LlmProvider, Role, complete_structured_with_operation_id,
+    ChatMessage, ChatRequest, LlmError, LlmOperationId, LlmProvider, Role,
+    complete_structured_with_operation_id,
 };
-use ai_memory_store::{AutoImproveRejectionSummary, BriefingPage, ReaderPool, StoredPageBody};
+use ai_memory_store::{
+    AutoImproveRejectionSummary, BriefingPage, ReaderPool, StoreError, StoredPageBody,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::projection::{ObservationProjectionConfig, cap_text_with_marker, project_observations};
+use crate::code_fence::CodeFence;
+use crate::path_sanitize::slugify_page_path;
+use crate::projection::{
+    ObservationProjectionConfig, ProjectedObservations, cap_text_with_marker, project_observations,
+    project_session_observations,
+};
 
 const CHARS_PER_TOKEN: usize = 4;
 const PROMPT_RESERVE_TOKENS: usize = 1_000;
 const MAX_PROPOSAL_BODY_CHARS: usize = 32_000;
 /// Default number of existing pages included as patchable context.
 pub const DEFAULT_AUTO_IMPROVE_MAX_PATCHABLE_PAGES: usize = 8;
+
+/// Wiki folders whose page bodies the reviewer may read, by path prefix.
+///
+/// This list decides which of a project's durable knowledge the model can see
+/// before it proposes anything. `render_recent_pages` gives every other page as
+/// one line — path, title, kind, updated_at — so a page outside these folders
+/// reaches the reviewer as a title and nothing else, and the model cannot tell
+/// that what it is about to propose is already written down (#834).
+///
+/// The default is the historical pair. It is a default rather than a constant
+/// because folder choice should not silently decide model visibility: a project
+/// that keeps its invariants in `decisions/` or `gotchas/` — which the wiki's own
+/// conventions encourage — can add them instead of restructuring its wiki.
+pub const DEFAULT_AUTO_IMPROVE_PATCHABLE_PAGE_PREFIXES: [&str; 2] = ["_rules/", "procedures/"];
 /// Default maximum body chars rendered for one patchable target page.
 pub const DEFAULT_AUTO_IMPROVE_MAX_PATCHABLE_BODY_CHARS: usize = 8_000;
 /// Default maximum patch edits per proposal.
@@ -57,7 +79,7 @@ const SAMPLE_LIMIT_WITHOUT_SESSION_PAGE: usize = 72;
 // persisted at up to 2 KB, but the reviewer only ever sees its first 1500 chars
 // here (head-biased). A late correction inside a long Stop body must fall within
 // this window to influence the reviewer.
-const MAX_OBSERVATION_BODY_CHARS: usize = 1_500;
+pub(crate) const MAX_OBSERVATION_BODY_CHARS: usize = 1_500;
 const PROMPT_SCAFFOLD_RESERVE_CHARS: usize = 4_000;
 pub(crate) const MAX_REJECTION_CONTEXT_CHARS: usize = 12_000;
 const MAX_REJECTION_PATH_CHARS: usize = 256;
@@ -81,6 +103,9 @@ pub const DEFAULT_AUTO_IMPROVE_MAX_PROPOSALS: usize = 5;
 pub const DEFAULT_AUTO_IMPROVE_PROPOSAL_ACTOR: &str = "auto_improve";
 /// Default wiki-relative folder for pending proposal sidecar markdown.
 pub const DEFAULT_AUTO_IMPROVE_PENDING_PATH: &str = "_pending/auto-improve";
+/// Evidence label of the entry the eval gate adds to a passing proposal; its
+/// structured result attaches to this entry.
+const AUTO_IMPROVE_EVAL_EVIDENCE_PAGE: &str = "auto_improve_eval";
 
 /// Default target prefixes guarded by the optional external eval command.
 pub fn default_auto_improve_eval_targets() -> Vec<String> {
@@ -134,8 +159,14 @@ pub struct AutoImproveReviewConfig {
     pub proposal_actor: String,
     /// Wiki-relative pending proposal sidecar folder.
     pub pending_path: String,
-    /// Maximum existing _rules/ and procedures/ pages included for patch proposals.
+    /// Maximum existing patchable pages included for patch proposals.
     pub max_patchable_pages: usize,
+    /// Wiki folder prefixes whose page bodies the reviewer may read.
+    ///
+    /// Defaults to [`DEFAULT_AUTO_IMPROVE_PATCHABLE_PAGE_PREFIXES`]. Pages outside
+    /// these folders are still listed by title, but their content is never sent,
+    /// so the reviewer cannot notice that a proposal duplicates them (#834).
+    pub patchable_page_prefixes: Vec<String>,
     /// Maximum body chars rendered per patchable target page.
     pub max_patchable_body_chars: usize,
     /// Maximum patch edits per proposal.
@@ -172,6 +203,10 @@ impl Default for AutoImproveReviewConfig {
             proposal_actor: DEFAULT_AUTO_IMPROVE_PROPOSAL_ACTOR.into(),
             pending_path: DEFAULT_AUTO_IMPROVE_PENDING_PATH.into(),
             max_patchable_pages: DEFAULT_AUTO_IMPROVE_MAX_PATCHABLE_PAGES,
+            patchable_page_prefixes: DEFAULT_AUTO_IMPROVE_PATCHABLE_PAGE_PREFIXES
+                .iter()
+                .map(|p| (*p).to_string())
+                .collect(),
             max_patchable_body_chars: DEFAULT_AUTO_IMPROVE_MAX_PATCHABLE_BODY_CHARS,
             max_edits_per_proposal: DEFAULT_AUTO_IMPROVE_MAX_EDITS_PER_PROPOSAL,
             max_edit_content_chars: DEFAULT_AUTO_IMPROVE_MAX_EDIT_CONTENT_CHARS,
@@ -211,6 +246,34 @@ pub enum AutoImproveError {
     /// Optional external eval command failed unexpectedly.
     #[error("auto-improve eval gate failed: {0}")]
     Eval(String),
+}
+
+/// Redacted one-line summary of an auto-improve review failure:
+/// `auto-improve failed: class=<class> status=<status-or-none>`.
+///
+/// For the MCP boundary where the full `Display` of [`AutoImproveError`]
+/// would leak a provider response body to the tool caller
+/// (`AutoImproveError::Llm` is transparent to [`LlmError`]). `class` is a
+/// fixed label per variant (or [`LlmError::class`] for LLM failures) and
+/// `status` is the HTTP status captured by the failure
+/// ([`LlmError::http_status`]), or `none`. It never carries the cause's
+/// `Display`, a response body, URL, prompt, token, or headers.
+#[must_use]
+pub fn redacted_auto_improve_summary(error: &AutoImproveError) -> String {
+    let (class, status) = match error {
+        AutoImproveError::Store(_) => ("store", None),
+        AutoImproveError::Llm(llm) => (llm.class(), llm.http_status()),
+        AutoImproveError::Memory(_) => ("memory", None),
+        AutoImproveError::SessionNotFound(_) => ("session-not-found", None),
+        AutoImproveError::SessionOutOfScope { .. } => ("session-out-of-scope", None),
+        AutoImproveError::Eval(_) => ("eval", None),
+    };
+    format!(
+        "auto-improve failed: class={class} status={}",
+        status
+            .map(|status| status.to_string())
+            .unwrap_or_else(|| "none".into())
+    )
 }
 
 /// Result alias for auto-improvement review.
@@ -295,7 +358,12 @@ pub struct AutoImproveProposal {
     #[serde(default, alias = "body", alias = "markdown", alias = "content")]
     pub body_markdown: String,
     /// `full_page` (default) or `patch`.
+    ///
+    /// Advertised as an enum for the same reason as `operation`; still a
+    /// `String` so an unconstrained provider's `"full"` reaches
+    /// [`normalize_edit_mode`] instead of failing to deserialise.
     #[serde(default = "default_edit_mode")]
+    #[schemars(extend("enum" = ["full_page", "patch"]))]
     pub edit_mode: String,
     /// Patch edits for existing _rules/ or procedures/ pages.
     #[serde(default)]
@@ -356,6 +424,26 @@ fn normalize_operation(raw: &str) -> String {
 
 fn default_edit_mode() -> String {
     "full_page".into()
+}
+
+/// Map the ways a model spells the two supported edit modes onto their
+/// canonical form.
+///
+/// Same narrow policy as [`normalize_operation`]: the system prompt says
+/// "Full-page proposals", and models answer `"full"`. Unknown values are left
+/// untouched so they still fail validation.
+fn normalize_edit_mode(raw: &str) -> String {
+    let squashed: String = raw
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|c| !matches!(c, ' ' | '_' | '-'))
+        .collect();
+    match squashed.as_str() {
+        "" | "fullpage" | "full" => default_edit_mode(),
+        "patch" => "patch".into(),
+        _ => raw.to_string(),
+    }
 }
 
 /// A candidate the reviewer or validator rejected.
@@ -424,6 +512,38 @@ pub struct AutoImproveReport {
     pub rejected_candidates: Vec<AutoImproveRejectedCandidate>,
     /// Non-fatal validation or budget notes.
     pub warnings: Vec<String>,
+    #[serde(default, skip_deserializing, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) eval_results: Vec<AutoImproveEvalResult>,
+}
+
+impl AutoImproveReport {
+    /// Serialize the server's observations of the existing eval executions.
+    pub fn eval_results(&self) -> impl Serialize + '_ {
+        &self.eval_results
+    }
+
+    /// Pending evidence, with the observed result attached only to its evaluated body.
+    ///
+    /// # Errors
+    /// Returns an error if evidence cannot be serialized.
+    pub fn proposal_evidence_json(
+        &self,
+        proposal: &AutoImproveProposal,
+    ) -> serde_json::Result<serde_json::Value> {
+        let mut evidence = serde_json::to_value(&proposal.evidence)?;
+        if let Some(result) = self.eval_results.iter().find(|result| {
+            result.status == EvalStatus::Success
+                && result.target_path == proposal.path
+                && result.after_body_sha256 == sha256_hex(proposal.body_markdown.as_bytes())
+        }) && let Some(entry) = evidence.as_array_mut().and_then(|entries| {
+            entries
+                .iter_mut()
+                .rfind(|entry| entry["page"] == AUTO_IMPROVE_EVAL_EVIDENCE_PAGE)
+        }) {
+            entry["eval_result"] = serde_json::to_value(result)?;
+        }
+        Ok(evidence)
+    }
 }
 
 /// Run a read-only auto-improvement review for one session.
@@ -444,26 +564,6 @@ pub async fn run_auto_improve_review(
             if session_ws == workspace_id && session_proj == project_id => {}
         Some(_) => return Err(AutoImproveError::SessionOutOfScope { session_id }),
         None => return Err(AutoImproveError::SessionNotFound(session_id)),
-    }
-
-    let observations = reader.observations_for_session(session_id).await?;
-    let duration = session_duration_secs(&observations);
-    if let Some(rejection) = preflight_rejection(&observations, duration, &cfg) {
-        return Ok(AutoImproveReport {
-            session_id: session_id.to_string(),
-            observations_considered: observations.len(),
-            session_duration_secs: duration,
-            estimated_input_tokens: 0,
-            provider: "none".into(),
-            model: "none".into(),
-            min_confidence: cfg.min_confidence,
-            proposal_actor: cfg.proposal_actor,
-            pending_path: cfg.pending_path,
-            summary: "session skipped by preflight filters".into(),
-            proposals: Vec::new(),
-            rejected_candidates: vec![rejection],
-            warnings: Vec::new(),
-        });
     }
 
     let briefing = reader
@@ -503,73 +603,204 @@ pub async fn run_auto_improve_review(
     )
     .await?;
     let rejection_context = load_rejection_context(reader, workspace_id, project_id, &cfg).await?;
-    let prompt_input = build_prompt_input(
-        session_id,
-        &observations,
-        duration,
+    // The prompt sections and the observation budget are knowable before
+    // any row is read; the single snapshot read below is the only read that
+    // touches the session's rows — totals, the preflight decision and the
+    // projection all come out of one transaction, so the report, the
+    // refusal and the prompt's "Observation count" and dump describe the
+    // same generation of the session.
+    let sections = auto_improve_prompt_sections(
         session_page.as_ref(),
         &reviewer_recent_pages,
         &patchable_pages,
         &rejection_context,
         &cfg,
     );
-    let prompt_patchable_pages: Vec<_> = patchable_pages
-        .iter()
-        .filter(|page| prompt_input.patchable_paths.contains(&page.path))
-        .cloned()
-        .collect();
-    let existing_index =
-        ExistingPageIndex::from_pages(&reviewer_recent_pages, &prompt_patchable_pages);
-    let estimated_input_tokens = estimate_tokens(&prompt_input.prompt);
-    let request = ChatRequest {
-        system: Some(AUTO_IMPROVE_SYSTEM_PROMPT.to_string()),
-        messages: vec![ChatMessage {
-            role: Role::User,
-            content: prompt_input.prompt,
-        }],
-        max_tokens: DEFAULT_REVIEW_MAX_TOKENS,
-        temperature: Some(0.1),
-    };
-    let raw: AutoImproveLlmResponse =
-        complete_structured_with_operation_id(llm, request, session_id.into()).await?;
-    let (mut proposals, mut rejected_candidates, mut warnings) =
-        validate_response(raw, &cfg, &existing_index);
-    rejected_candidates.extend(prompt_input.rejected_candidates);
-    warnings.extend(prompt_input.warnings);
-    apply_eval_gate(
-        reader,
-        workspace_id,
-        project_id,
-        &cfg.eval,
-        &mut proposals,
-        &mut rejected_candidates,
-        &mut warnings,
+    let projection_cfg = ObservationProjectionConfig::new(
+        sections.observation_budget,
+        sections.selected_limit,
+        MAX_OBSERVATION_BODY_CHARS,
     )
-    .await?;
-
-    Ok(AutoImproveReport {
-        session_id: session_id.to_string(),
-        observations_considered: observations.len(),
-        session_duration_secs: duration,
-        estimated_input_tokens,
-        provider: llm.name().to_string(),
-        model: llm.model().to_string(),
-        min_confidence: cfg.min_confidence,
-        proposal_actor: cfg.proposal_actor,
-        pending_path: cfg.pending_path,
-        summary: if proposals.is_empty() {
-            "review completed; no validated proposals".into()
-        } else {
-            format!(
-                "review completed; {} proposal(s) validated",
-                proposals.len()
+    .with_context_label("auto-improve");
+    let closure_cfg = cfg.clone();
+    let outcome = reader
+        .read_session_observations(workspace_id, project_id, session_id, move |snap| {
+            let totals = snap.projection_totals()?;
+            let duration =
+                session_duration_from_span(totals.first_created_at, totals.last_created_at);
+            // Test-only seam (S37d): runs after the totals read and before
+            // the preflight decision or any row read. Production builds
+            // never carry it.
+            #[cfg(test)]
+            {
+                let seam = {
+                    let mut seams = REVIEW_INTERPOSE.lock().unwrap();
+                    seams
+                        .iter()
+                        .position(|(owner, _)| *owner == session_id)
+                        .map(|at| seams.swap_remove(at).1)
+                };
+                if let Some(seam) = seam {
+                    seam();
+                }
+            }
+            if let Some(rejection) = preflight_rejection(totals.total, duration, &closure_cfg) {
+                // Rejected before a single row is read.
+                return Ok(ReviewOutcome::Rejected {
+                    total: totals.total,
+                    duration,
+                    rejection,
+                });
+            }
+            let projected = if totals.total == 0 {
+                // A present session with no observations and no preflight
+                // minimums still gets reviewed with the empty `(none)`
+                // projection, exactly as the full-load path did.
+                project_observations(&[], &projection_cfg)
+            } else {
+                project_session_observations(snap, &projection_cfg)?
+                    .map(|(projected, _stats)| projected)
+                    .ok_or(StoreError::SessionCollision)?
+            };
+            Ok(ReviewOutcome::Reviewed {
+                total: totals.total,
+                duration,
+                projected,
+            })
+        })
+        .await?;
+    match outcome {
+        // Preflight rejected the session from its own generation's totals:
+        // same report the old path returned, no LLM call.
+        ReviewOutcome::Rejected {
+            total,
+            duration,
+            rejection,
+        } => Ok(AutoImproveReport {
+            session_id: session_id.to_string(),
+            observations_considered: total,
+            session_duration_secs: duration,
+            estimated_input_tokens: 0,
+            provider: "none".into(),
+            model: "none".into(),
+            min_confidence: cfg.min_confidence,
+            proposal_actor: cfg.proposal_actor,
+            pending_path: cfg.pending_path,
+            summary: "session skipped by preflight filters".into(),
+            proposals: Vec::new(),
+            rejected_candidates: vec![rejection],
+            warnings: Vec::new(),
+            eval_results: Vec::new(),
+        }),
+        ReviewOutcome::Reviewed {
+            total,
+            duration,
+            projected,
+        } => {
+            let prompt_input = build_prompt_input(
+                session_id,
+                &projected,
+                projected.total_count,
+                duration,
+                sections,
+                &cfg,
+            );
+            let prompt_patchable_pages: Vec<_> = patchable_pages
+                .iter()
+                .filter(|page| prompt_input.patchable_paths.contains(&page.path))
+                .cloned()
+                .collect();
+            let existing_index =
+                ExistingPageIndex::from_pages(&reviewer_recent_pages, &prompt_patchable_pages);
+            let estimated_input_tokens = estimate_tokens(&prompt_input.prompt);
+            let request = ChatRequest {
+                system: Some(AUTO_IMPROVE_SYSTEM_PROMPT.to_string()),
+                messages: vec![ChatMessage {
+                    role: Role::User,
+                    content: prompt_input.prompt,
+                }],
+                max_tokens: DEFAULT_REVIEW_MAX_TOKENS,
+                temperature: Some(0.1),
+            };
+            // One review call is one LLM operation: a fresh identity, never
+            // the agent's session id — two reviews of the same session must
+            // not look like one operation on the provider side.
+            let operation_id =
+                LlmOperationId::for_workload(ai_memory_llm::LlmWorkload::AutoImprove);
+            let raw: AutoImproveLlmResponse =
+                complete_structured_with_operation_id(llm, request, operation_id).await?;
+            let (mut proposals, mut rejected_candidates, mut warnings) =
+                validate_response(raw, &cfg, &existing_index);
+            rejected_candidates.extend(prompt_input.rejected_candidates);
+            warnings.extend(prompt_input.warnings);
+            let eval_results = apply_eval_gate(
+                reader,
+                workspace_id,
+                project_id,
+                &cfg.eval,
+                &mut proposals,
+                &mut rejected_candidates,
+                &mut warnings,
             )
-        },
-        proposals,
-        rejected_candidates,
-        warnings,
-    })
+            .await?;
+
+            Ok(AutoImproveReport {
+                session_id: session_id.to_string(),
+                observations_considered: total,
+                session_duration_secs: duration,
+                estimated_input_tokens,
+                provider: llm.name().to_string(),
+                model: llm.model().to_string(),
+                min_confidence: cfg.min_confidence,
+                proposal_actor: cfg.proposal_actor,
+                pending_path: cfg.pending_path,
+                summary: if proposals.is_empty() {
+                    "review completed; no validated proposals".into()
+                } else {
+                    format!(
+                        "review completed; {} proposal(s) validated",
+                        proposals.len()
+                    )
+                },
+                proposals,
+                rejected_candidates,
+                warnings,
+                eval_results,
+            })
+        }
+    }
 }
+
+/// What the review's single snapshot read produced: the preflight's
+/// refusal (decided from the same totals, no row read) or the session's
+/// one-generation totals plus its bounded projection.
+enum ReviewOutcome {
+    Rejected {
+        total: usize,
+        duration: u64,
+        rejection: AutoImproveRejectedCandidate,
+    },
+    Reviewed {
+        total: usize,
+        duration: u64,
+        projected: ProjectedObservations,
+    },
+}
+
+/// Test-only seam for the review's single-snapshot read: push the session
+/// under test with a callback, and that session's review removes and runs
+/// the callback once, right after the totals aggregate, before the
+/// preflight decision and before any row is read. A test deletes rows
+/// through a second connection there and proves the report, the preflight
+/// and the prompt still describe one generation. Keyed by session so a
+/// review that another test runs in parallel never consumes it. Never
+/// compiled in.
+#[cfg(test)]
+pub(crate) type ReviewInterpose = (SessionId, Box<dyn FnOnce() + Send>);
+
+#[cfg(test)]
+pub(crate) static REVIEW_INTERPOSE: std::sync::Mutex<Vec<ReviewInterpose>> =
+    std::sync::Mutex::new(Vec::new());
 
 #[derive(Debug, Serialize)]
 struct AutoImproveEvalRequest<'a> {
@@ -594,6 +825,58 @@ struct AutoImproveEvalResponse {
     reason: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum EvalStatus {
+    Success,
+    Rejected,
+    Failure,
+    Timeout,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct AutoImproveEvalResult {
+    eval_id: uuid::Uuid,
+    target_path: String,
+    checker_name: String,
+    checker_invocation_digest: String,
+    proposal_sha256: Option<String>,
+    before_body_sha256: String,
+    after_body_sha256: String,
+    materialized_base_body_sha256: Option<String>,
+    status: EvalStatus,
+    passed: Option<bool>,
+    score_before: Option<f64>,
+    score_after: Option<f64>,
+    reason: Option<String>,
+}
+
+fn eval_request<'a>(
+    proposal: &'a AutoImproveProposal,
+    before_body: &'a str,
+) -> AutoImproveEvalRequest<'a> {
+    AutoImproveEvalRequest {
+        path: &proposal.path,
+        kind: &proposal.kind,
+        operation: &proposal.operation,
+        edit_mode: &proposal.edit_mode,
+        title: &proposal.title,
+        confidence: proposal.confidence,
+        rationale: &proposal.rationale,
+        before_body,
+        after_body: &proposal.body_markdown,
+        expected_base_body_sha256: proposal.expected_base_body_sha256.as_deref(),
+    }
+}
+
+fn sanitize_eval_reason(reason: &str) -> String {
+    cap_text_with_marker(
+        &Sanitizer::builtin().scrub(reason),
+        MAX_EVAL_REASON_CHARS,
+        "eval reason",
+    )
+}
+
 pub(crate) async fn apply_eval_gate(
     reader: &ReaderPool,
     workspace_id: WorkspaceId,
@@ -602,9 +885,9 @@ pub(crate) async fn apply_eval_gate(
     proposals: &mut Vec<AutoImproveProposal>,
     rejected: &mut Vec<AutoImproveRejectedCandidate>,
     warnings: &mut Vec<String>,
-) -> AutoImproveResult<()> {
+) -> AutoImproveResult<Vec<AutoImproveEvalResult>> {
     if !eval.enabled {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let mut before_bodies = BTreeMap::new();
     for proposal in proposals.iter() {
@@ -618,8 +901,10 @@ pub(crate) async fn apply_eval_gate(
             .unwrap_or_default();
         before_bodies.insert(proposal.path.clone(), before_body);
     }
-    apply_eval_gate_with_before_bodies(eval, proposals, rejected, warnings, &before_bodies).await;
-    Ok(())
+    Ok(
+        apply_eval_gate_with_before_bodies(eval, proposals, rejected, warnings, &before_bodies)
+            .await,
+    )
 }
 
 async fn apply_eval_gate_with_before_bodies(
@@ -628,9 +913,9 @@ async fn apply_eval_gate_with_before_bodies(
     rejected: &mut Vec<AutoImproveRejectedCandidate>,
     warnings: &mut Vec<String>,
     before_bodies: &BTreeMap<String, String>,
-) {
+) -> Vec<AutoImproveEvalResult> {
     if !eval.enabled {
-        return;
+        return Vec::new();
     }
     if eval.command.trim().is_empty() {
         warnings.push(
@@ -639,26 +924,60 @@ async fn apply_eval_gate_with_before_bodies(
     }
 
     let mut accepted = Vec::with_capacity(proposals.len());
+    let mut results = Vec::new();
     for mut proposal in proposals.drain(..) {
         if !eval_targets_path(eval, &proposal.path) {
             accepted.push(proposal);
             continue;
         }
         let before_body = before_bodies.get(&proposal.path).map_or("", String::as_str);
-        match run_eval_for_proposal(eval, &proposal, before_body).await {
+        let stdin = serde_json::to_vec(&eval_request(&proposal, before_body))
+            .map_err(|e| EvalRunError::Error(e.to_string()));
+        let program = eval.command.split_whitespace().next().unwrap_or("");
+        let mut result = AutoImproveEvalResult {
+            eval_id: uuid::Uuid::now_v7(),
+            target_path: proposal.path.clone(),
+            checker_name: sanitize_eval_reason(program.rsplit(['/', '\\']).next().unwrap_or("")),
+            checker_invocation_digest: sha256_hex(eval.command.as_bytes()),
+            proposal_sha256: stdin.as_ref().ok().map(|bytes| sha256_hex(bytes)),
+            before_body_sha256: sha256_hex(before_body.as_bytes()),
+            after_body_sha256: sha256_hex(proposal.body_markdown.as_bytes()),
+            materialized_base_body_sha256: proposal.expected_base_body_sha256.clone(),
+            status: EvalStatus::Failure,
+            passed: None,
+            score_before: None,
+            score_after: None,
+            reason: None,
+        };
+        let outcome = match stdin {
+            Ok(stdin) => run_eval_for_proposal(eval, stdin).await,
+            Err(error) => Err(error),
+        };
+        match outcome {
             Ok(outcome) => {
+                result.passed = Some(outcome.passed);
+                result.score_before = outcome.score_before;
+                result.score_after = outcome.score_after;
                 let delta = outcome
                     .score_before
                     .zip(outcome.score_after)
                     .map(|(before, after)| after - before);
                 let delta_ok = delta.is_none_or(|value| value >= eval.min_delta);
                 if outcome.passed && delta_ok {
+                    result.status = EvalStatus::Success;
+                    result.reason = outcome.reason.as_deref().map(sanitize_eval_reason);
                     proposal.evidence.push(AutoImproveEvidence {
-                        page: "auto_improve_eval".into(),
+                        page: AUTO_IMPROVE_EVAL_EVIDENCE_PAGE.into(),
                         quote: format_eval_evidence(&outcome, delta),
                     });
                     accepted.push(proposal);
                 } else {
+                    result.status = EvalStatus::Rejected;
+                    result.reason = Some(sanitize_eval_reason(&format_eval_failure(
+                        &outcome,
+                        delta,
+                        eval.min_delta,
+                    )));
                     rejected.push(eval_rejection(
                         "eval_gate_failed",
                         &proposal,
@@ -666,17 +985,21 @@ async fn apply_eval_gate_with_before_bodies(
                     ));
                 }
             }
-            Err(EvalRunError::Timeout) => rejected.push(eval_rejection(
-                "eval_gate_timeout",
-                &proposal,
-                format!("eval command timed out after {}s", eval.timeout_secs),
-            )),
+            Err(EvalRunError::Timeout) => {
+                result.status = EvalStatus::Timeout;
+                let reason = format!("eval command timed out after {}s", eval.timeout_secs);
+                result.reason = Some(reason.clone());
+                rejected.push(eval_rejection("eval_gate_timeout", &proposal, reason));
+            }
             Err(EvalRunError::Error(message)) => {
+                result.reason = Some(sanitize_eval_reason(&message));
                 rejected.push(eval_rejection("eval_gate_error", &proposal, message))
             }
         }
+        results.push(result);
     }
     *proposals = accepted;
+    results
 }
 
 fn eval_targets_path(eval: &AutoImproveEvalConfig, path: &str) -> bool {
@@ -694,26 +1017,12 @@ enum EvalRunError {
 
 async fn run_eval_for_proposal(
     eval: &AutoImproveEvalConfig,
-    proposal: &AutoImproveProposal,
-    before_body: &str,
+    stdin: Vec<u8>,
 ) -> Result<AutoImproveEvalResponse, EvalRunError> {
     let mut parts = eval.command.split_whitespace();
     let Some(program) = parts.next() else {
         return Err(EvalRunError::Error("eval command is empty".into()));
     };
-    let input = AutoImproveEvalRequest {
-        path: &proposal.path,
-        kind: &proposal.kind,
-        operation: &proposal.operation,
-        edit_mode: &proposal.edit_mode,
-        title: &proposal.title,
-        confidence: proposal.confidence,
-        rationale: &proposal.rationale,
-        before_body,
-        after_body: &proposal.body_markdown,
-        expected_base_body_sha256: proposal.expected_base_body_sha256.as_deref(),
-    };
-    let stdin = serde_json::to_vec(&input).map_err(|e| EvalRunError::Error(e.to_string()))?;
     let mut child = tokio::process::Command::new(program)
         .args(parts)
         .stdin(Stdio::piped())
@@ -834,11 +1143,7 @@ fn format_eval_failure(
     delta: Option<f64>,
     min_delta: f64,
 ) -> String {
-    let reason = cap_text_with_marker(
-        outcome.reason.as_deref().unwrap_or("eval did not pass"),
-        MAX_EVAL_REASON_CHARS,
-        "eval reason",
-    );
+    let reason = sanitize_eval_reason(outcome.reason.as_deref().unwrap_or("eval did not pass"));
     match (
         outcome.passed,
         outcome.score_before,
@@ -860,7 +1165,7 @@ fn eval_rejection(
     AutoImproveRejectedCandidate {
         reason: reason.into(),
         evidence: cap_text_with_marker(
-            &evidence,
+            &Sanitizer::builtin().scrub(&evidence),
             MAX_REJECTION_SUMMARY_CHARS,
             "eval rejection evidence",
         ),
@@ -951,6 +1256,18 @@ fn normalize_title(title: &str) -> String {
         .to_lowercase()
 }
 
+/// Whether the reviewer may read this page's body, by folder prefix (#834).
+///
+/// An empty prefix list means no page body is sent, which is the honest reading
+/// of "no folders are patchable" — not "every folder is". An empty *prefix*
+/// would match every path, so it is ignored rather than silently opening the
+/// whole wiki.
+pub(crate) fn is_patchable_path(path: &str, prefixes: &[String]) -> bool {
+    prefixes
+        .iter()
+        .any(|prefix| !prefix.is_empty() && path.starts_with(prefix.as_str()))
+}
+
 pub(crate) async fn load_patchable_pages(
     reader: &ReaderPool,
     workspace_id: WorkspaceId,
@@ -961,7 +1278,7 @@ pub(crate) async fn load_patchable_pages(
     let mut out = Vec::new();
     for page in recent_pages
         .iter()
-        .filter(|p| p.path.starts_with("_rules/") || p.path.starts_with("procedures/"))
+        .filter(|p| is_patchable_path(&p.path, &cfg.patchable_page_prefixes))
         .take(cfg.max_patchable_pages)
     {
         if let Some(body) = reader
@@ -1010,18 +1327,28 @@ pub(crate) async fn load_rejection_context(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_prompt_input(
-    session_id: SessionId,
-    observations: &[Observation],
-    duration_secs: u64,
+/// The reviewer prompt's pre-rendered sections and the character budget
+/// the observation dump may consume, computed once before the session's
+/// rows are read: the bounded read needs the budget up front, and the
+/// prompt assembly must reuse exactly these renders.
+pub(crate) struct PromptSections {
+    recent: String,
+    patchable: RenderedPatchablePages,
+    session_page_section: String,
+    rejection_text: String,
+    pub(crate) observation_budget: usize,
+    pub(crate) selected_limit: usize,
+    warnings: Vec<String>,
+}
+
+pub(crate) fn auto_improve_prompt_sections(
     session_page: Option<&StoredPageBody>,
     recent_pages: &[BriefingPage],
     patchable_pages: &[PatchablePageContext],
     rejection_context: &[AutoImproveRejectionSummary],
     cfg: &AutoImproveReviewConfig,
-) -> PromptInput {
+) -> PromptSections {
     let mut warnings = Vec::new();
-    let mut rejected_candidates = Vec::new();
     let usable_tokens = cfg.max_input_tokens.saturating_sub(PROMPT_RESERVE_TOKENS);
     let usable_chars = usable_tokens.saturating_mul(CHARS_PER_TOKEN);
 
@@ -1052,26 +1379,86 @@ fn build_prompt_input(
     } else {
         SAMPLE_LIMIT_WITHOUT_SESSION_PAGE
     };
-    let projected_observations = project_observations(
+    PromptSections {
+        recent,
+        patchable,
+        session_page_section,
+        rejection_text,
+        observation_budget,
+        selected_limit,
+        warnings,
+    }
+}
+
+/// Test-only entry point keeping the old `build_prompt_input` signature: it
+/// projects an already-materialised slice in memory, then delegates to the
+/// production builder. Lets the unit tests below pin the prompt without a
+/// store.
+#[cfg(test)]
+// The signature mirrors the pre-change production builder verbatim, which
+// took eight arguments; the lint is waived rather than reshaped.
+#[allow(clippy::too_many_arguments)]
+fn test_prompt_input(
+    session_id: SessionId,
+    observations: &[ai_memory_core::Observation],
+    duration_secs: u64,
+    session_page: Option<&StoredPageBody>,
+    recent_pages: &[BriefingPage],
+    patchable_pages: &[PatchablePageContext],
+    rejection_context: &[AutoImproveRejectionSummary],
+    cfg: &AutoImproveReviewConfig,
+) -> PromptInput {
+    let sections = auto_improve_prompt_sections(
+        session_page,
+        recent_pages,
+        patchable_pages,
+        rejection_context,
+        cfg,
+    );
+    let projected = crate::projection::project_observations(
         observations,
         &ObservationProjectionConfig::new(
-            observation_budget,
-            selected_limit,
+            sections.observation_budget,
+            sections.selected_limit,
             MAX_OBSERVATION_BODY_CHARS,
         )
         .with_context_label("auto-improve"),
     );
-    warnings.extend(projected_observations.warnings.iter().cloned());
-    let rendered_observations = projected_observations.text;
-    let selected_count = projected_observations.selected_count;
+    build_prompt_input(
+        session_id,
+        &projected,
+        observations.len(),
+        duration_secs,
+        sections,
+        cfg,
+    )
+}
+
+fn build_prompt_input(
+    session_id: SessionId,
+    projected: &ProjectedObservations,
+    total: usize,
+    duration_secs: u64,
+    sections: PromptSections,
+    cfg: &AutoImproveReviewConfig,
+) -> PromptInput {
+    let mut warnings = sections.warnings;
+    let mut rejected_candidates = Vec::new();
+    let recent = sections.recent;
+    let session_page_section = sections.session_page_section;
+    let rejection_text = sections.rejection_text;
+    let patchable = sections.patchable;
+
+    warnings.extend(projected.warnings.iter().cloned());
+    let rendered_observations = projected.text.clone();
+    let selected_count = projected.selected_count;
     let patchable_text = &patchable.text;
 
-    if selected_count < observations.len() {
+    if selected_count < total {
         rejected_candidates.push(AutoImproveRejectedCandidate {
             reason: "input_budget_sampled".into(),
             evidence: format!(
-                "selected {selected_count} of {} observations for scalable review",
-                observations.len()
+                "selected {selected_count} of {total} observations for scalable review",
             ),
             target_path: None,
             kind: None,
@@ -1095,7 +1482,7 @@ fn build_prompt_input(
          Consolidated session page, primary source when present:\n{session_page_section}\n\n\
          Selected observations, sampled for scale and supporting evidence:\n{rendered_observations}\n\n\
          Return proposals only for durable lessons. Prefer gotchas/, decisions/, concepts/, procedures/, _rules/, _slots/current-focus.md, or notes/. Use _rules/ exactly for rules; never rules/. Full-page proposal body markdown must begin with '# <title>'; patch proposals use edits and are materialized by validation. Full-page and materialized patch final bodies for _rules/ and procedures/ must stay within their page token budgets. Reject no-activity sessions, smoke tests, release markers, one-off task narratives, transient failures, generic routing snippets, and agent instruction text unless the session explicitly changed project policy.",
-        observations.len(),
+        total,
         cfg.min_confidence,
         cfg.max_proposals_per_run,
         cfg.include_raw_fallback,
@@ -1304,22 +1691,17 @@ fn parse_markdown_sections(body: &str) -> Vec<MarkdownSection> {
 fn heading_positions(body: &str) -> Vec<(usize, usize, String)> {
     let mut out = Vec::new();
     let mut offset = 0;
-    let mut in_fence = false;
+    let mut fence = None;
     for line in body.split_inclusive('\n') {
         let trimmed = line.trim_end_matches(['\r', '\n']);
-        if is_fence_line(trimmed) {
-            in_fence = !in_fence;
-        } else if !in_fence && let Some(level) = heading_level(trimmed) {
+        let (next_fence, is_code) = CodeFence::step(fence, trimmed);
+        fence = next_fence;
+        if !is_code && let Some(level) = heading_level(trimmed) {
             out.push((offset, level, trimmed.to_string()));
         }
         offset += line.len();
     }
     out
-}
-
-fn is_fence_line(line: &str) -> bool {
-    let trimmed = line.trim_start();
-    trimmed.starts_with("```") || trimmed.starts_with("~~~")
 }
 
 fn heading_level(line: &str) -> Option<usize> {
@@ -1384,17 +1766,16 @@ fn truncate_to_budget(input: &str, max_bytes: usize, marker: &str) -> String {
 }
 
 fn preflight_rejection(
-    observations: &[Observation],
+    total: usize,
     duration_secs: u64,
     cfg: &AutoImproveReviewConfig,
 ) -> Option<AutoImproveRejectedCandidate> {
-    if observations.len() < cfg.min_observations {
+    if total < cfg.min_observations {
         return Some(AutoImproveRejectedCandidate {
             reason: "too_few_observations".into(),
             evidence: format!(
                 "{} observations below configured minimum {}",
-                observations.len(),
-                cfg.min_observations
+                total, cfg.min_observations
             ),
             target_path: None,
             kind: None,
@@ -1485,8 +1866,18 @@ pub(crate) fn validate_response(
 fn normalize_proposal(proposal: &mut AutoImproveProposal, warnings: &mut Vec<String>) {
     normalize_kind(proposal, warnings);
 
-    if proposal.edit_mode.trim().is_empty() {
-        proposal.edit_mode = default_edit_mode();
+    // Server-owned: set when a patch is materialized. The schema still shows
+    // it to the model, and a model-supplied non-hash value on a full-page
+    // proposal would reach staging and fail the whole run on `hex_to_sha256`.
+    proposal.expected_base_body_sha256 = None;
+
+    let original_edit_mode = proposal.edit_mode.clone();
+    proposal.edit_mode = normalize_edit_mode(&original_edit_mode);
+    if !original_edit_mode.trim().is_empty() && proposal.edit_mode != original_edit_mode {
+        warnings.push(format!(
+            "proposal {} edit_mode normalized from {:?} to {:?}",
+            proposal.path, original_edit_mode, proposal.edit_mode
+        ));
     }
     if proposal.edit_mode == "patch" {
         return;
@@ -1576,6 +1967,13 @@ fn validate_proposal(
     if proposal.operation != CANONICAL_OPERATION {
         return Err("unsupported_operation".into());
     }
+    // Confidence is documented as `0.0..=1.0`. A model that answers in percent
+    // (`85`) would clear the floor below and be stored, and shown to the
+    // reviewer, as 8500%. NaN fails every comparison, so it needs this test
+    // too.
+    if !(0.0..=1.0).contains(&proposal.confidence) {
+        return Err("confidence_out_of_range".into());
+    }
     if proposal.confidence < cfg.min_confidence {
         return Err("confidence_below_threshold".into());
     }
@@ -1590,7 +1988,18 @@ fn validate_proposal(
     {
         return Err("missing_evidence".into());
     }
-    let path = PagePath::new(proposal.path.clone()).map_err(|_| "invalid_path".to_string())?;
+    // Same class as bootstrap #847 / consolidation #848: a model-produced
+    // path with a Windows-illegal character (e.g. `:`) passes `PagePath::new`
+    // and would be staged, then fail `ensure_portable` at approve time.
+    // Sanitize before constructing the path so the staged proposal is
+    // applyable; a path that is still unportable after slugify is rejected
+    // rather than queued.
+    let cleaned = slugify_page_path(&proposal.path);
+    let path = PagePath::new(&cleaned).map_err(|_| "invalid_path".to_string())?;
+    if path.ensure_portable().is_err() {
+        return Err("invalid_path".into());
+    }
+    proposal.path = path.as_str().to_string();
     match proposal.edit_mode.as_str() {
         "" | "full_page" => {
             validate_full_page_proposal(proposal, cfg, existing_index, path.as_str())
@@ -1842,14 +2251,14 @@ fn kind_matches_path(kind: &str, path: &str) -> bool {
     }
 }
 
-fn session_duration_secs(observations: &[Observation]) -> u64 {
-    let (Some(first), Some(last)) = (observations.first(), observations.last()) else {
+/// Session duration in whole seconds from the snapshot's aggregate
+/// `created_at` span: same arithmetic as the materialised load used to give,
+/// no rows read.
+fn session_duration_from_span(first: Option<i64>, last: Option<i64>) -> u64 {
+    let (Some(first), Some(last)) = (first, last) else {
         return 0;
     };
-    let diff_us = last
-        .created_at
-        .as_microsecond()
-        .saturating_sub(first.created_at.as_microsecond());
+    let diff_us = last.saturating_sub(first);
     u64::try_from(diff_us / 1_000_000).unwrap_or(0)
 }
 
@@ -1879,12 +2288,67 @@ Every proposal must include bounded evidence quotes, confidence, rationale, and 
 mod tests {
     use super::*;
     use ai_memory_core::{
-        AgentKind, NewObservation, NewSession, ObservationId, ObservationKind, Sanitized, Sanitizer,
+        AgentKind, NewObservation, NewSession, Observation, ObservationId, ObservationKind,
+        Sanitized, Sanitizer,
     };
-    use ai_memory_llm::{ChatResponse, LlmResult};
+    use ai_memory_llm::{ChatResponse, LlmError, LlmResult};
     use ai_memory_store::Store;
     use jiff::Timestamp;
     use tempfile::TempDir;
+
+    /// Body a fake provider returns in the redaction tests; the summary must
+    /// never contain it.
+    const AUTO_IMPROVE_REDACTION_SENTINEL: &str = "SENTINEL_PRIVATE_BODY";
+
+    /// The summary is the only failure text the `memory_auto_improve` MCP
+    /// call returns, so it must expose class/status and drop the provider
+    /// body.
+    #[test]
+    fn auto_improve_redacted_summary_exposes_class_and_status_without_body() {
+        let error = AutoImproveError::Llm(LlmError::Provider {
+            status: 400,
+            body: AUTO_IMPROVE_REDACTION_SENTINEL.into(),
+            retry_after: None,
+        });
+        let summary = redacted_auto_improve_summary(&error);
+        assert_eq!(summary, "auto-improve failed: class=provider status=400");
+        assert!(!summary.contains(AUTO_IMPROVE_REDACTION_SENTINEL));
+    }
+
+    /// Non-LLM variants take a static label with `status=none`; the shape
+    /// stays stable and the cause's `Display` never enters the summary.
+    #[test]
+    fn auto_improve_redacted_summary_non_llm_variants_report_none_status() {
+        for (error, class) in [
+            (
+                AutoImproveError::SessionNotFound(ai_memory_core::SessionId::new()),
+                "session-not-found",
+            ),
+            (
+                AutoImproveError::SessionOutOfScope {
+                    session_id: ai_memory_core::SessionId::new(),
+                },
+                "session-out-of-scope",
+            ),
+            (
+                AutoImproveError::Eval(AUTO_IMPROVE_REDACTION_SENTINEL.into()),
+                "eval",
+            ),
+            (
+                AutoImproveError::Llm(LlmError::NotConfigured(
+                    AUTO_IMPROVE_REDACTION_SENTINEL.into(),
+                )),
+                "not-configured",
+            ),
+        ] {
+            let summary = redacted_auto_improve_summary(&error);
+            assert_eq!(
+                summary,
+                format!("auto-improve failed: class={class} status=none")
+            );
+            assert!(!summary.contains(AUTO_IMPROVE_REDACTION_SENTINEL));
+        }
+    }
 
     struct FakeLlm;
 
@@ -1976,6 +2440,66 @@ mod tests {
         }
     }
 
+    /// Records the operation id of every structured call (one review call
+    /// is one LLM operation) and returns an empty proposal set — the id is
+    /// the subject under test, not the proposals.
+    struct OpIdCapturingLlm {
+        ids: std::sync::Arc<std::sync::Mutex<Vec<LlmOperationId>>>,
+    }
+
+    impl OpIdCapturingLlm {
+        fn new() -> Self {
+            Self {
+                ids: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+
+        fn ids(&self) -> Vec<LlmOperationId> {
+            self.ids.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for OpIdCapturingLlm {
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+
+        fn model(&self) -> &'static str {
+            "fake-model"
+        }
+
+        async fn complete(&self, _request: ChatRequest) -> LlmResult<ChatResponse> {
+            Ok(ChatResponse {
+                text: "unused".into(),
+                usage: None,
+                model: "fake-model".into(),
+            })
+        }
+
+        async fn complete_structured_raw(
+            &self,
+            _request: ChatRequest,
+            _schema: serde_json::Value,
+        ) -> LlmResult<serde_json::Value> {
+            Ok(serde_json::json!({
+                "summary": "no durable lesson",
+                "proposals": [],
+                "rejected_candidates": []
+            }))
+        }
+
+        async fn complete_structured_raw_with_operation_id(
+            &self,
+            request: ChatRequest,
+            schema: serde_json::Value,
+            operation_id: LlmOperationId,
+        ) -> LlmResult<serde_json::Value> {
+            self.ids.lock().unwrap().push(operation_id);
+            self.complete_structured_raw(request, schema).await
+        }
+    }
+
     fn cfg() -> AutoImproveReviewConfig {
         AutoImproveReviewConfig {
             min_observations: 3,
@@ -1987,6 +2511,10 @@ mod tests {
             proposal_actor: "auto_improve".into(),
             pending_path: "_pending/auto-improve".into(),
             max_patchable_pages: DEFAULT_AUTO_IMPROVE_MAX_PATCHABLE_PAGES,
+            patchable_page_prefixes: DEFAULT_AUTO_IMPROVE_PATCHABLE_PAGE_PREFIXES
+                .iter()
+                .map(|p| (*p).to_string())
+                .collect(),
             max_patchable_body_chars: DEFAULT_AUTO_IMPROVE_MAX_PATCHABLE_BODY_CHARS,
             max_edits_per_proposal: DEFAULT_AUTO_IMPROVE_MAX_EDITS_PER_PROPOSAL,
             max_edit_content_chars: DEFAULT_AUTO_IMPROVE_MAX_EDIT_CONTENT_CHARS,
@@ -2034,10 +2562,10 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn write_eval_script(body: &str) -> String {
+    fn write_eval_script(body: &str) -> (tempfile::TempDir, String) {
         use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::TempDir::new().unwrap().keep();
-        let path = dir.join("eval.sh");
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("eval.sh");
         std::fs::write(&path, body).unwrap();
         let mut perms = std::fs::metadata(&path).unwrap().permissions();
         perms.set_mode(0o755);
@@ -2046,13 +2574,14 @@ mod tests {
         // temp file directly. Some Linux filesystems can briefly report
         // ETXTBSY for direct exec under parallel tests even after write(2)
         // returns and the file handle has been dropped.
-        format!("sh {}", path.display())
+        let command = format!("sh {}", path.display());
+        (dir, command)
     }
 
     #[cfg(windows)]
-    fn write_eval_script(body: &str) -> String {
-        let dir = tempfile::TempDir::new().unwrap().keep();
-        let path = dir.join("eval.ps1");
+    fn write_eval_script(body: &str) -> (tempfile::TempDir, String) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("eval.ps1");
         let body = match body {
             "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"score_before\":0.72,\"score_after\":0.76,\"passed\":true}'\n" => {
                 "$null = [Console]::In.ReadToEnd()\n[Console]::Out.Write('{\"score_before\":0.72,\"score_after\":0.76,\"passed\":true}')\n"
@@ -2061,6 +2590,9 @@ mod tests {
             "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"score_before\":0.72,\"score_after\":0.70,\"passed\":true}'\n" => {
                 "$null = [Console]::In.ReadToEnd()\n[Console]::Out.Write('{\"score_before\":0.72,\"score_after\":0.70,\"passed\":true}')\n"
                     .into()
+            }
+            "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"passed\":false,\"reason\":\"structure check failed\"}'\n" => {
+                "$null = [Console]::In.ReadToEnd()\n[Console]::Out.Write('{\"passed\":false,\"reason\":\"structure check failed\"}')\n".into()
             }
             "#!/bin/sh\ncat >/dev/null\nexit 7\n" => {
                 "$null = [Console]::In.ReadToEnd()\nexit 7\n".into()
@@ -2075,18 +2607,19 @@ mod tests {
                 "$null = [Console]::In.ReadToEnd()\nStart-Sleep -Seconds 12\n".into()
             }
             "#!/bin/sh\nsleep 5\n" => "Start-Sleep -Seconds 20\n".into(),
-            "#!/bin/sh\ni=0\nwhile [ $i -lt 70000 ]; do printf x; i=$((i + 1)); done\n" => {
+            "#!/bin/sh\nprintf '%070000d' 0\n" => {
                 let chunk = "x".repeat(100);
                 format!("for ($i = 0; $i -lt 700; $i++) {{ [Console]::Out.Write('{chunk}') }}\n")
             }
             other => panic!("unmapped eval script fixture for Windows: {other:?}"),
         };
         std::fs::write(&path, body).unwrap();
-        format!(
+        let command = format!(
             "{} -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File {}",
             ai_memory_test_support::powershell_exe(),
             path.display()
-        )
+        );
+        (dir, command)
     }
 
     #[tokio::test]
@@ -2094,7 +2627,7 @@ mod tests {
         let mut proposals = vec![proposal("_rules/test.md", "rule", 0.9)];
         let mut rejected = Vec::new();
         let mut warnings = Vec::new();
-        apply_eval_gate_with_before_bodies(
+        let results = apply_eval_gate_with_before_bodies(
             &AutoImproveEvalConfig::default(),
             &mut proposals,
             &mut rejected,
@@ -2102,6 +2635,7 @@ mod tests {
             &BTreeMap::new(),
         )
         .await;
+        assert!(results.is_empty());
         assert_eq!(proposals.len(), 1);
         assert!(rejected.is_empty());
         assert!(warnings.is_empty());
@@ -2109,7 +2643,7 @@ mod tests {
 
     #[tokio::test]
     async fn passing_eval_allows_proposal_and_records_evidence() {
-        let script = write_eval_script(
+        let (_eval_dir, script) = write_eval_script(
             "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"score_before\":0.72,\"score_after\":0.76,\"passed\":true}'\n",
         );
         let mut proposals = vec![proposal("_rules/test.md", "rule", 0.9)];
@@ -2133,15 +2667,77 @@ mod tests {
         assert!(rejected.is_empty());
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn structured_eval_records_server_observation() {
+        let (_eval_dir, command) = write_eval_script(
+            "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"passed\":true,\"score_before\":0.72,\"score_after\":0.76,\"run_id\":\"caller-run\",\"eval_id\":\"caller-eval\",\"checker_invocation_digest\":\"caller-digest\",\"after_body_sha256\":\"caller-body\"}'\n",
+        );
+        let candidate = proposal("_rules/test.md", "rule", 0.9);
+        let proposal_digest = sha256_hex(
+            &serde_json::to_vec(&AutoImproveEvalRequest {
+                path: &candidate.path,
+                kind: &candidate.kind,
+                operation: &candidate.operation,
+                edit_mode: &candidate.edit_mode,
+                title: &candidate.title,
+                confidence: candidate.confidence,
+                rationale: &candidate.rationale,
+                before_body: "original body",
+                after_body: &candidate.body_markdown,
+                expected_base_body_sha256: candidate.expected_base_body_sha256.as_deref(),
+            })
+            .unwrap(),
+        );
+        let after_digest = sha256_hex(candidate.body_markdown.as_bytes());
+        let mut proposals = vec![candidate];
+        let mut rejected = Vec::new();
+        let results = apply_eval_gate_with_before_bodies(
+            &eval_cfg(command.clone()),
+            &mut proposals,
+            &mut rejected,
+            &mut Vec::new(),
+            &BTreeMap::from([("_rules/test.md".into(), "original body".into())]),
+        )
+        .await;
+        let results = serde_json::to_value(results).unwrap();
+        assert_eq!(results[0]["status"], "success");
+        assert!(results[0].get("run_id").is_none());
+        assert_ne!(results[0]["eval_id"], "caller-eval");
+        assert_eq!(
+            results[0]["eval_id"]
+                .as_str()
+                .unwrap()
+                .parse::<uuid::Uuid>()
+                .unwrap()
+                .get_version_num(),
+            7,
+        );
+        assert_eq!(results[0]["checker_name"], "sh");
+        assert_eq!(
+            results[0]["checker_invocation_digest"],
+            sha256_hex(command.as_bytes())
+        );
+        assert_eq!(results[0]["proposal_sha256"], proposal_digest);
+        assert_eq!(
+            results[0]["before_body_sha256"],
+            sha256_hex(b"original body")
+        );
+        assert_eq!(results[0]["after_body_sha256"], after_digest);
+        assert!(results[0]["materialized_base_body_sha256"].is_null());
+        assert_eq!(proposals.len(), 1);
+        assert!(rejected.is_empty());
+    }
+
     #[tokio::test]
     async fn failing_eval_filters_and_records_rejection() {
-        let script = write_eval_script(
+        let (_eval_dir, script) = write_eval_script(
             "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"score_before\":0.72,\"score_after\":0.70,\"passed\":true}'\n",
         );
         let mut proposals = vec![proposal("procedures/test.md", "procedure", 0.9)];
         let mut rejected = Vec::new();
         let mut warnings = Vec::new();
-        apply_eval_gate_with_before_bodies(
+        let results = apply_eval_gate_with_before_bodies(
             &eval_cfg(script),
             &mut proposals,
             &mut rejected,
@@ -2149,6 +2745,12 @@ mod tests {
             &BTreeMap::new(),
         )
         .await;
+        assert_eq!(
+            serde_json::to_value(&results).unwrap()[0]["status"],
+            "rejected"
+        );
+        assert_eq!(results[0].passed, Some(true));
+        assert_eq!(results[0].score_after, Some(0.70));
         assert!(proposals.is_empty());
         assert_eq!(rejected.len(), 1);
         assert_eq!(rejected[0].reason, "eval_gate_failed");
@@ -2156,6 +2758,84 @@ mod tests {
             rejected[0].target_path.as_deref(),
             Some("procedures/test.md")
         );
+    }
+
+    #[tokio::test]
+    async fn eval_reports_rejected_when_scorer_returns_false() {
+        let (_eval_dir, script) = write_eval_script(
+            "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"passed\":false,\"reason\":\"structure check failed\"}'\n",
+        );
+        let mut proposals = vec![proposal("procedures/test.md", "procedure", 0.9)];
+        let mut rejected = Vec::new();
+        let results = apply_eval_gate_with_before_bodies(
+            &eval_cfg(script),
+            &mut proposals,
+            &mut rejected,
+            &mut Vec::new(),
+            &BTreeMap::new(),
+        )
+        .await;
+        assert_eq!(
+            serde_json::to_value(&results).unwrap()[0]["status"],
+            "rejected"
+        );
+        assert_eq!(results[0].passed, Some(false));
+        assert!(proposals.is_empty());
+        assert_eq!(rejected[0].reason, "eval_gate_failed");
+    }
+
+    // #834: the folder filter decides which of a project's durable knowledge the
+    // reviewer can read at all. Everything outside it arrives as a title, so the
+    // model cannot tell that a proposal duplicates a page that already exists.
+    #[test]
+    fn default_prefixes_match_the_historical_pair() {
+        let cfg = AutoImproveReviewConfig::default();
+        assert_eq!(cfg.patchable_page_prefixes, vec!["_rules/", "procedures/"]);
+    }
+
+    #[test]
+    fn the_default_still_hides_decisions_and_gotchas() {
+        // Pinning the reported blindness rather than only the fix: this is the
+        // behaviour a project with no `_rules/` pages actually gets today.
+        let prefixes = AutoImproveReviewConfig::default().patchable_page_prefixes;
+        assert!(is_patchable_path("_rules/testing.md", &prefixes));
+        assert!(is_patchable_path("procedures/release.md", &prefixes));
+        assert!(!is_patchable_path("decisions/0001-storage.md", &prefixes));
+        assert!(!is_patchable_path("gotchas/sqlite-wal.md", &prefixes));
+    }
+
+    #[test]
+    fn configuring_a_folder_makes_its_pages_readable() {
+        let prefixes = vec!["_rules/".to_string(), "decisions/".to_string()];
+        assert!(is_patchable_path("decisions/0001-storage.md", &prefixes));
+        assert!(is_patchable_path("_rules/testing.md", &prefixes));
+        // Not configured, so still title-only.
+        assert!(!is_patchable_path("procedures/release.md", &prefixes));
+    }
+
+    #[test]
+    fn an_empty_list_reads_no_page_bodies() {
+        // "No folders are patchable" must not mean "every folder is".
+        assert!(!is_patchable_path("_rules/testing.md", &[]));
+        assert!(!is_patchable_path("decisions/0001.md", &[]));
+    }
+
+    #[test]
+    fn an_empty_prefix_does_not_open_the_whole_wiki() {
+        // `"".starts_with` matches every path, so a stray empty entry would turn
+        // the filter off silently. It is ignored instead.
+        let prefixes = vec![String::new()];
+        assert!(!is_patchable_path("sessions/2026-09-21.md", &prefixes));
+        assert!(!is_patchable_path("anything.md", &prefixes));
+    }
+
+    #[test]
+    fn prefixes_match_folders_not_bare_name_prefixes() {
+        // `_rules/` carries its separator, so a sibling folder whose name merely
+        // starts with the same letters is not swept in.
+        let prefixes = vec!["decisions/".to_string()];
+        assert!(is_patchable_path("decisions/0001.md", &prefixes));
+        assert!(!is_patchable_path("decisions-archive/0001.md", &prefixes));
     }
 
     #[tokio::test]
@@ -2174,13 +2854,13 @@ mod tests {
                 "eval_gate_timeout",
             ),
         ];
-        for (command, expected_reason) in cases {
+        for ((_eval_dir, command), expected_reason) in cases {
             let mut cfg = eval_cfg(command);
             cfg.timeout_secs = if cfg!(windows) { 8 } else { 1 };
             let mut proposals = vec![proposal("_rules/test.md", "rule", 0.9)];
             let mut rejected = Vec::new();
             let mut warnings = Vec::new();
-            apply_eval_gate_with_before_bodies(
+            let results = apply_eval_gate_with_before_bodies(
                 &cfg,
                 &mut proposals,
                 &mut rejected,
@@ -2188,6 +2868,22 @@ mod tests {
                 &BTreeMap::new(),
             )
             .await;
+            assert_eq!(results.len(), 1);
+            assert_eq!(
+                results[0].status,
+                if expected_reason == "eval_gate_timeout" {
+                    EvalStatus::Timeout
+                } else {
+                    EvalStatus::Failure
+                }
+            );
+            assert!(results[0].passed.is_none());
+            assert!(
+                results[0]
+                    .reason
+                    .as_ref()
+                    .is_some_and(|reason| !reason.is_empty())
+            );
             assert!(proposals.is_empty());
             assert_eq!(rejected[0].reason, expected_reason);
         }
@@ -2195,7 +2891,7 @@ mod tests {
 
     #[tokio::test]
     async fn eval_timeout_covers_blocked_stdin_write() {
-        let script = write_eval_script("#!/bin/sh\nsleep 5\n");
+        let (_eval_dir, script) = write_eval_script("#!/bin/sh\nsleep 5\n");
         let mut cfg = eval_cfg(script);
         cfg.timeout_secs = 1;
         let mut proposal = proposal("_rules/test.md", "rule", 0.9);
@@ -2230,9 +2926,10 @@ mod tests {
 
     #[tokio::test]
     async fn oversized_eval_stdout_fails_closed() {
-        let script = write_eval_script(
-            "#!/bin/sh\ni=0\nwhile [ $i -lt 70000 ]; do printf x; i=$((i + 1)); done\n",
-        );
+        // One zero-padded printf writes the 70,000 bytes at once. A shell loop
+        // printing one byte per iteration took longer than the gate's 2s
+        // timeout on a loaded machine, which failed the test as a timeout.
+        let (_eval_dir, script) = write_eval_script("#!/bin/sh\nprintf '%070000d' 0\n");
         let mut proposals = vec![proposal("_rules/test.md", "rule", 0.9)];
         let mut rejected = Vec::new();
         let mut warnings = Vec::new();
@@ -2275,13 +2972,26 @@ mod tests {
         assert!(evidence.len() < MAX_EVAL_REASON_CHARS + 200);
     }
 
+    #[test]
+    fn eval_reason_scrubs_a_secret_straddling_the_cap() {
+        let reason = format!(
+            "{} ghp_{}",
+            "a".repeat(MAX_EVAL_REASON_CHARS - 12),
+            "F".repeat(36)
+        );
+        let captured = sanitize_eval_reason(&reason);
+        assert!(!captured.contains("ghp_"));
+        assert!(captured.contains("[REDACTED:"));
+        assert!(captured.chars().count() < MAX_EVAL_REASON_CHARS + 100);
+    }
+
     #[tokio::test]
     async fn non_targeted_proposal_bypasses_eval() {
-        let script = write_eval_script("#!/bin/sh\nexit 7\n");
+        let (_eval_dir, script) = write_eval_script("#!/bin/sh\nexit 7\n");
         let mut proposals = vec![proposal("gotchas/test.md", "gotcha", 0.9)];
         let mut rejected = Vec::new();
         let mut warnings = Vec::new();
-        apply_eval_gate_with_before_bodies(
+        let results = apply_eval_gate_with_before_bodies(
             &eval_cfg(script),
             &mut proposals,
             &mut rejected,
@@ -2289,6 +2999,7 @@ mod tests {
             &BTreeMap::new(),
         )
         .await;
+        assert!(results.is_empty());
         assert_eq!(proposals.len(), 1);
         assert!(rejected.is_empty());
     }
@@ -2334,6 +3045,7 @@ mod tests {
         store
             .writer
             .begin_session(NewSession {
+                occurred_at: None,
                 id: session_id,
                 workspace_id: ws,
                 project_id: proj,
@@ -2348,6 +3060,7 @@ mod tests {
                 .writer
                 .insert_observation(Sanitized::new(
                     NewObservation {
+                        occurred_at: None,
                         session_id,
                         workspace_id: ws,
                         project_id: proj,
@@ -2387,6 +3100,107 @@ mod tests {
         assert_eq!(report.proposals.len(), 1);
         assert_eq!(report.proposals[0].path, "procedures/release.md");
         assert!(report.rejected_candidates.is_empty());
+    }
+
+    /// Operation identity: two auto-improve reviews of the SAME session are
+    /// two LLM operations — two distinct fresh UUID v7 ids (the
+    /// gateway-compatible 36-character form), never the session id — so a
+    /// gateway cannot confuse one session's two reviews with one operation.
+    #[tokio::test]
+    async fn two_reviews_of_one_session_get_distinct_operation_ids() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "proj", None)
+            .await
+            .unwrap();
+        let session_id = ai_memory_core::SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: None,
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Other,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        for i in 0..3 {
+            store
+                .writer
+                .insert_observation(Sanitized::new(
+                    NewObservation {
+                        occurred_at: None,
+                        session_id,
+                        workspace_id: ws,
+                        project_id: proj,
+                        kind: if i == 0 {
+                            ObservationKind::SessionStart
+                        } else {
+                            ObservationKind::UserPrompt
+                        },
+                        extension: None,
+                        source_event: None,
+                        title: format!("event {i}"),
+                        body: "run the full gate before release".into(),
+                        importance: 5,
+                    },
+                    &Sanitizer::builtin(),
+                ))
+                .await
+                .unwrap();
+        }
+
+        // Two reviews of the same session, one LLM operation each.
+        let llm = OpIdCapturingLlm::new();
+        for _ in 0..2 {
+            let report = run_auto_improve_review(
+                &store.reader,
+                &llm,
+                ws,
+                proj,
+                session_id,
+                AutoImproveReviewConfig {
+                    min_session_duration_secs: 0,
+                    ..cfg()
+                },
+            )
+            .await
+            .unwrap();
+            assert!(report.proposals.is_empty());
+        }
+
+        let ids = llm.ids();
+        assert_eq!(ids.len(), 2, "one structured LLM call per review");
+        assert_ne!(
+            ids[0], ids[1],
+            "two reviews of one session get distinct operation ids"
+        );
+        for id in &ids {
+            assert_eq!(
+                id.workload(),
+                ai_memory_llm::LlmWorkload::AutoImprove,
+                "auto-improve reviews keep their closed workload label"
+            );
+            let s = id.to_string();
+            assert_eq!(s.len(), 36, "the hyphenated wire form is 36 chars: {s}");
+            let parsed = uuid::Uuid::parse_str(&s).expect("parses as a UUID");
+            assert_eq!(parsed.get_version_num(), 7, "fresh UUID v7: {s}");
+            assert_ne!(
+                s,
+                session_id.to_string(),
+                "the operation id is never the session id"
+            );
+        }
     }
 
     /// The reviewer's recent-page context must surface durable pages and drop
@@ -2438,6 +3252,7 @@ mod tests {
         store
             .writer
             .begin_session(NewSession {
+                occurred_at: None,
                 id: session_id,
                 workspace_id: ws,
                 project_id: proj,
@@ -2452,6 +3267,7 @@ mod tests {
                 .writer
                 .insert_observation(Sanitized::new(
                     NewObservation {
+                        occurred_at: None,
                         session_id,
                         workspace_id: ws,
                         project_id: proj,
@@ -2604,6 +3420,53 @@ mod tests {
         assert!(warnings.is_empty());
     }
 
+    /// Same class as bootstrap #847 / consolidation #848: the reviewer LLM
+    /// echoes a conventional-commit subject into the page path. That passes
+    /// `PagePath::new` (deliberately tolerant) but fails `ensure_portable`,
+    /// so the proposal is staged and then cannot be applied.
+    #[test]
+    fn windows_illegal_model_path_is_sanitized_before_staging() {
+        let raw_path = "concepts/build(sandbox): orchestrate.md";
+        assert!(
+            PagePath::new(raw_path).is_ok(),
+            "precondition: PagePath::new is deliberately tolerant of ':'"
+        );
+        assert!(
+            PagePath::new(raw_path).unwrap().ensure_portable().is_err(),
+            "precondition: the raw model path is not portable"
+        );
+
+        let raw: AutoImproveLlmResponse = serde_json::from_value(serde_json::json!({
+            "summary": "ok",
+            "proposals": [{
+                "path": raw_path,
+                "title": "Orchestrate the run",
+                "kind": "concept",
+                "confidence": 0.91,
+                "rationale": "The session recorded a durable conventional-commit workflow.",
+                "evidence": [{"quote": "build(sandbox): orchestrate the run"}],
+                "body_markdown": "# Orchestrate the run\n\nKeep the sandbox build orchestrated."
+            }],
+            "rejected_candidates": []
+        }))
+        .unwrap();
+
+        let (accepted, rejected, warnings) =
+            validate_response(raw, &cfg(), &ExistingPageIndex::default());
+        assert!(
+            rejected.is_empty(),
+            "sanitized path should be accepted: {rejected:?}"
+        );
+        assert!(warnings.is_empty());
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(accepted[0].path, "concepts/build(sandbox)- orchestrate.md");
+        let path = PagePath::new(&accepted[0].path).unwrap();
+        assert!(
+            path.ensure_portable().is_ok(),
+            "staged path must be applyable"
+        );
+    }
+
     #[test]
     fn proposal_body_accepts_common_markdown_aliases() {
         let raw: AutoImproveLlmResponse = serde_json::from_value(serde_json::json!({
@@ -2702,7 +3565,7 @@ mod tests {
             pinned: false,
         };
 
-        let prompt = build_prompt_input(
+        let prompt = test_prompt_input(
             session_id,
             &observations,
             3_600,
@@ -2749,7 +3612,7 @@ mod tests {
             ),
         ];
         assert!(observations.len() < 48);
-        let prompt = build_prompt_input(
+        let prompt = test_prompt_input(
             SessionId::new(),
             &observations,
             3_600,
@@ -2789,7 +3652,7 @@ mod tests {
             sections: parse_markdown_sections(&body),
             body,
         }];
-        let prompt = build_prompt_input(
+        let prompt = test_prompt_input(
             session_id,
             &observations,
             3_600,
@@ -2846,7 +3709,7 @@ mod tests {
             created_at: 1,
         }];
 
-        let prompt = build_prompt_input(
+        let prompt = test_prompt_input(
             session_id,
             &observations,
             3_600,
@@ -2904,7 +3767,7 @@ mod tests {
             ..cfg()
         };
 
-        let prompt = build_prompt_input(
+        let prompt = test_prompt_input(
             session_id,
             &observations,
             3_600,
@@ -3003,6 +3866,28 @@ mod tests {
         assert_eq!(rejected.len(), 2);
         assert_eq!(rejected[0].reason, "confidence_below_threshold");
         assert_eq!(rejected[1].reason, "unsupported_path_prefix");
+    }
+
+    #[test]
+    fn validation_rejects_confidence_outside_the_unit_interval() {
+        let raw = AutoImproveLlmResponse {
+            summary: "ok".into(),
+            proposals: vec![
+                proposal("gotchas/percent.md", "gotcha", 85.0),
+                proposal("gotchas/nan.md", "gotcha", f32::NAN),
+                proposal("gotchas/negative.md", "gotcha", -0.5),
+                proposal("gotchas/one.md", "gotcha", 1.0),
+            ],
+            rejected_candidates: Vec::new(),
+        };
+        let (accepted, rejected, _warnings) =
+            validate_response(raw, &cfg(), &ExistingPageIndex::default());
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(accepted[0].path, "gotchas/one.md");
+        assert_eq!(rejected.len(), 3);
+        for rejection in &rejected {
+            assert_eq!(rejection.reason, "confidence_out_of_range");
+        }
     }
 
     #[test]
@@ -3199,6 +4084,66 @@ mod tests {
             validate_proposal(&mut deleting, &cfg, &index),
             Err("unsupported_operation".into())
         );
+    }
+
+    /// Same shape as #458 on the neighbouring field: `gpt-oss-20b` via LM
+    /// Studio answered `"edit_mode": "full"` for every candidate, so every run
+    /// ended with zero accepted proposals and only `unsupported_edit_mode`
+    /// rejections.
+    #[test]
+    fn a_proposal_saying_full_is_accepted_as_full_page() {
+        let mut candidate = proposal("gotchas/thing.md", "gotcha", 0.91);
+        candidate.edit_mode = "full".into();
+        let raw = AutoImproveLlmResponse {
+            summary: "ok".into(),
+            proposals: vec![candidate],
+            rejected_candidates: Vec::new(),
+        };
+        let (accepted, rejected, warnings) =
+            validate_response(raw, &cfg(), &ExistingPageIndex::default());
+        assert!(rejected.is_empty(), "got {rejected:?}");
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(accepted[0].edit_mode, "full_page");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("edit_mode normalized from \"full\"")),
+            "normalisation should be reported, got {warnings:?}"
+        );
+
+        let mut unknown = proposal("gotchas/thing.md", "gotcha", 0.91);
+        unknown.edit_mode = "rewrite".into();
+        let raw = AutoImproveLlmResponse {
+            summary: "ok".into(),
+            proposals: vec![unknown],
+            rejected_candidates: Vec::new(),
+        };
+        let (accepted, rejected, _) = validate_response(raw, &cfg(), &ExistingPageIndex::default());
+        assert!(accepted.is_empty());
+        assert_eq!(rejected[0].reason, "unsupported_edit_mode");
+    }
+
+    /// Once `"full"` stopped being rejected, the same `gpt-oss-20b` runs
+    /// failed at staging with `invalid expected_base_body_sha256: expected 64
+    /// hex chars`: the model filled in a field only the server can compute.
+    #[test]
+    fn a_model_supplied_base_sha_is_dropped_from_full_page_proposals() {
+        for supplied in ["", "null", "abc123", "N/A"] {
+            let mut candidate = proposal("gotchas/thing.md", "gotcha", 0.91);
+            candidate.expected_base_body_sha256 = Some(supplied.into());
+            let raw = AutoImproveLlmResponse {
+                summary: "ok".into(),
+                proposals: vec![candidate],
+                rejected_candidates: Vec::new(),
+            };
+            let (accepted, rejected, _) =
+                validate_response(raw, &cfg(), &ExistingPageIndex::default());
+            assert!(rejected.is_empty(), "{supplied:?}: got {rejected:?}");
+            assert_eq!(
+                accepted[0].expected_base_body_sha256, None,
+                "{supplied:?} must not survive to staging"
+            );
+        }
     }
 
     #[test]
@@ -3525,6 +4470,42 @@ mod tests {
     }
 
     #[test]
+    fn heading_parser_closes_a_fence_only_on_its_own_glyph_and_length() {
+        // A lone ``` inside a ~~~ block is code, not the end of the block.
+        let body = "# Release\n\n## Steps\n~~~sh\ncat <<'EOF'\n```\nEOF\n~~~\n\n## Verify\nTwo\n";
+        let sections = parse_markdown_sections(body);
+        let verify = sections
+            .iter()
+            .find(|s| s.anchor == "## Verify")
+            .expect("the heading after the block is found");
+        let steps = sections.iter().find(|s| s.anchor == "## Steps").unwrap();
+        assert_eq!(
+            steps.end, verify.start,
+            "## Steps ends where ## Verify starts"
+        );
+
+        // A shorter run does not close a longer fence.
+        let body = "# Release\n\n````md\n```\n## Not Anchor\n```\n````\n\n## Steps\nOne\n";
+        let sections = parse_markdown_sections(body);
+        assert!(!sections.iter().any(|s| s.anchor == "## Not Anchor"));
+        assert!(sections.iter().any(|s| s.anchor == "## Steps"));
+    }
+
+    #[test]
+    fn heading_parser_ignores_headings_after_an_indented_pseudo_closer() {
+        let body = "# Release\n\n````md\n    ````\n## Injected Anchor\n````\n\n## Verify\nTwo\n";
+        let sections = parse_markdown_sections(body);
+        assert!(
+            !sections.iter().any(|s| s.anchor == "## Injected Anchor"),
+            "the four-space pseudo-closer must remain code"
+        );
+        assert!(
+            sections.iter().any(|s| s.anchor == "## Verify"),
+            "the real closer must expose the following heading"
+        );
+    }
+
+    #[test]
     fn patch_rejects_duplicate_headings_and_extra_h1_introduced_by_edits() {
         let body = "# Release\n\n## Steps\nOne\n";
         let duplicate = patch_proposal("append", "## Steps", "## Steps\nAgain");
@@ -3610,3 +4591,68 @@ mod operation_normalization_tests {
         assert_eq!(parsed.operation, "create");
     }
 }
+
+#[cfg(test)]
+mod edit_mode_normalization_tests {
+    use super::*;
+
+    #[test]
+    fn the_spellings_models_actually_emit_are_accepted() {
+        for raw in [
+            "full_page",
+            "full",
+            "Full",
+            "full-page",
+            "Full Page",
+            "FULLPAGE",
+            "",
+            "  ",
+        ] {
+            assert_eq!(
+                normalize_edit_mode(raw),
+                "full_page",
+                "{raw:?} means full page and must normalise"
+            );
+        }
+        for raw in ["patch", "PATCH", " Patch "] {
+            assert_eq!(normalize_edit_mode(raw), "patch", "{raw:?} must normalise");
+        }
+    }
+
+    #[test]
+    fn unknown_edit_modes_are_left_to_fail() {
+        for raw in ["rewrite", "replace", "append", "diff", "delete"] {
+            assert_eq!(
+                normalize_edit_mode(raw),
+                raw,
+                "{raw:?} is not a supported mode and must keep failing validation"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_constrains_edit_mode_to_the_supported_values() {
+        let schema = schemars::schema_for!(AutoImproveProposal);
+        let value = serde_json::to_value(&schema).expect("schema serialises");
+        let variants = value
+            .pointer("/properties/edit_mode/enum")
+            .and_then(|e| e.as_array())
+            .expect("edit_mode carries an enum constraint");
+        assert_eq!(
+            variants,
+            &vec![serde_json::json!("full_page"), serde_json::json!("patch")]
+        );
+    }
+
+    #[test]
+    fn a_non_canonical_edit_mode_still_deserialises() {
+        let parsed: AutoImproveProposal =
+            serde_json::from_value(serde_json::json!({ "edit_mode": "full" }))
+                .expect("must not fail to parse; normalisation happens before validation");
+        assert_eq!(parsed.edit_mode, "full");
+    }
+}
+
+#[cfg(test)]
+#[path = "auto_improve_oracle.rs"]
+pub(crate) mod auto_improve_oracle;

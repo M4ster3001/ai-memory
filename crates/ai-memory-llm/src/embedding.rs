@@ -18,11 +18,12 @@ use std::time::Duration;
 use async_trait::async_trait;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tracing::debug;
 
 use crate::error::{LlmError, LlmResult};
 use crate::openai::normalize_openai_base;
-use crate::response::{provider_error_body, response_json_limited, response_text_limited};
+use crate::response::{provider_error, response_json_limited, response_text_limited};
 use crate::text::{truncate_for_embedding, truncate_with_ellipsis};
 
 /// Conservative per-request input cap for OpenAI-compatible embedding APIs
@@ -39,8 +40,34 @@ pub trait Embedder: Send + Sync {
     /// Short identifier (e.g. `openai`, `voyage`, `synthetic`).
     fn provider(&self) -> &'static str;
 
-    /// Model identifier (e.g. `text-embedding-3-small`).
+    /// Model identifier (e.g. `text-embedding-3-small`). The exact string
+    /// sent on the wire — never suffixed or altered. See
+    /// [`Self::model_identity`] for the value that should be stored
+    /// alongside a vector or used to select eligible stored vectors.
     fn model(&self) -> &str;
+
+    /// The `model` component of the stored/matched `(provider, model, dim)`
+    /// identity for a **document** embedding — distinct from [`Self::model`]
+    /// (the wire model name) whenever the effective document-side input
+    /// text is not what the model id alone implies. Defaults to
+    /// `self.model().to_string()`: providers with no such distinction (every
+    /// provider except the two below) are unaffected.
+    ///
+    /// `OpenAiEmbedder`/`OpenAiCompatEmbedder` override this to fold in a
+    /// fingerprint of their configured `document_prefix` when it is
+    /// non-empty, so a page embedded under one document prefix is never
+    /// silently matched against, or mixed with, vectors embedded under a
+    /// different (or no) prefix — the same `(provider, model, dim)`
+    /// refuse-on-mismatch and stale-row machinery that already protects
+    /// against a plain model swap now also protects against a document
+    /// prefix change. An empty prefix reproduces `self.model()` exactly
+    /// (the pre-existing identity), so upgrading installs with no prefix
+    /// configured need no migration. The **query** prefix never affects
+    /// this: only the text actually embedded and stored needs a distinct
+    /// identity, and a query is never stored.
+    fn model_identity(&self) -> String {
+        self.model().to_string()
+    }
 
     /// Vector dimensionality.
     fn dim(&self) -> u32;
@@ -60,6 +87,60 @@ pub trait Embedder: Send + Sync {
     }
 }
 
+/// A search query embedded for the vector stream, with the stored-vector
+/// identity it may be compared against.
+#[derive(Debug, Clone)]
+pub struct QueryVector {
+    /// The query embedding.
+    pub vector: Vec<f32>,
+    /// Provider of the eligible stored vectors.
+    pub provider: String,
+    /// Model identity of the eligible stored vectors. This is
+    /// [`Embedder::model_identity`], not [`Embedder::model`]: stored vectors
+    /// are keyed by the document identity, which a configured document
+    /// prefix folds in.
+    pub model: String,
+    /// Dimensionality of the eligible stored vectors.
+    pub dim: u32,
+}
+
+/// Embed `query` for hybrid retrieval, or `None` when the embedder fails.
+///
+/// The one place every search surface (`memory_query`, the web search) turns
+/// a query into a vector, so they select the same stored vectors. A failure
+/// degrades the search to FTS5 + entity + graph rather than failing it.
+pub async fn embed_search_query(embedder: &dyn Embedder, query: &str) -> Option<QueryVector> {
+    // `embed_query`, not `embed`: an asymmetric embedder (configured
+    // query/document prefixes, or Google's RETRIEVAL_QUERY task type)
+    // must see this text on the query side, not the document side.
+    match embedder.embed_query(query).await {
+        Ok(vector) => Some(QueryVector {
+            vector,
+            provider: embedder.provider().to_string(),
+            model: embedder.model_identity(),
+            dim: embedder.dim(),
+        }),
+        Err(LlmError::CapacityBusy(_)) => {
+            debug!(
+                provider = embedder.provider(),
+                model = embedder.model(),
+                "embedding capacity stayed busy past the bounded query wait; \
+                 degrading search to FTS5 + entity + graph"
+            );
+            None
+        }
+        Err(e) => {
+            tracing::warn!(
+                provider = embedder.provider(),
+                model = embedder.model(),
+                error = %e,
+                "embedder failed; degrading search to FTS5 + entity + graph"
+            );
+            None
+        }
+    }
+}
+
 /// OpenAI Embeddings API (`text-embedding-3-small` by default, 1536 dim).
 pub struct OpenAiEmbedder {
     client: reqwest::Client,
@@ -67,6 +148,8 @@ pub struct OpenAiEmbedder {
     base_url: String,
     model: String,
     dim: u32,
+    query_prefix: String,
+    document_prefix: String,
 }
 
 impl OpenAiEmbedder {
@@ -82,6 +165,7 @@ impl OpenAiEmbedder {
         // sub-second. When the embedder still fails, memory_query
         // degrades gracefully to FTS5 + entity + graph (see server.rs).
         let client = reqwest::Client::builder()
+            .redirect(crate::redirect::same_origin_redirects())
             .timeout(Duration::from_secs(120))
             .build()?;
         Ok(Self {
@@ -90,6 +174,8 @@ impl OpenAiEmbedder {
             base_url: "https://api.openai.com".into(),
             model: model.into(),
             dim,
+            query_prefix: String::new(),
+            document_prefix: String::new(),
         })
     }
 
@@ -97,6 +183,20 @@ impl OpenAiEmbedder {
     #[must_use]
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
         self.base_url = url.into();
+        self
+    }
+
+    /// Set the query/document prefixes prepended before embedding (see
+    /// [`OpenAiCompatEmbedder::with_prefixes`]). Empty strings are a no-op,
+    /// so this is safe to call unconditionally with the configured values.
+    #[must_use]
+    pub fn with_prefixes(
+        mut self,
+        query_prefix: impl Into<String>,
+        document_prefix: impl Into<String>,
+    ) -> Self {
+        self.query_prefix = query_prefix.into();
+        self.document_prefix = document_prefix.into();
         self
     }
 }
@@ -122,6 +222,7 @@ pub(crate) fn parse_openai_embedding_values(body: &str, status: u16) -> LlmResul
     let v: serde_json::Value = serde_json::from_str(body).map_err(|e| LlmError::Provider {
         status,
         body: truncate_with_ellipsis(&format!("openai embeddings json: {e}; body={body}"), 1024),
+        retry_after: None,
     })?;
     if let Some(err) = v.get("error") {
         let msg = err
@@ -132,6 +233,7 @@ pub(crate) fn parse_openai_embedding_values(body: &str, status: u16) -> LlmResul
         return Err(LlmError::Provider {
             status,
             body: truncate_with_ellipsis(msg, 1024),
+            retry_after: None,
         });
     }
     if let Some(data) = v.get("data").and_then(|d| d.as_array()) {
@@ -141,6 +243,7 @@ pub(crate) fn parse_openai_embedding_values(body: &str, status: u16) -> LlmResul
                 &format!("openai embeddings data[] empty; body={body}"),
                 512,
             ),
+            retry_after: None,
         })?;
         let emb = first
             .get("embedding")
@@ -151,6 +254,7 @@ pub(crate) fn parse_openai_embedding_values(body: &str, status: u16) -> LlmResul
                     &format!("missing embedding array in data[0]; body={body}"),
                     512,
                 ),
+                retry_after: None,
             })?;
         let mut out = Vec::with_capacity(emb.len());
         for n in emb {
@@ -160,6 +264,7 @@ pub(crate) fn parse_openai_embedding_values(body: &str, status: u16) -> LlmResul
                     &format!("non-numeric embedding value in data[0]; body={body}"),
                     512,
                 ),
+                retry_after: None,
             })?;
             out.push(f as f32);
         }
@@ -175,6 +280,7 @@ pub(crate) fn parse_openai_embedding_values(body: &str, status: u16) -> LlmResul
                 &format!("openai embeddings shape: {e}; body={body}"),
                 1024,
             ),
+            retry_after: None,
         })?;
     let first = parsed.data.into_iter().next().ok_or_else(|| {
         LlmError::UnexpectedShape(format!(
@@ -185,10 +291,61 @@ pub(crate) fn parse_openai_embedding_values(body: &str, status: u16) -> LlmResul
     Ok(first.embedding)
 }
 
+/// Retried statuses for every remote embedder's request: a rate limit and a
+/// transient "out of capacity" answer. Everything else — other 4xx and
+/// 5xx — is handled exactly as before: no retry.
+fn is_retryable_embedding_status(status: u16) -> bool {
+    matches!(status, 429 | 503)
+}
+
+/// Cap for a single wait taken from `Retry-After`; larger values are
+/// clamped so one bad header cannot stall a call for minutes.
+const MAX_RETRY_AFTER_SECS: u64 = 32;
+
+/// Total wait budget for one embedding call: the worst case of the
+/// previous fixed backoff (2+4+8+16+32). When the next wait would push
+/// the call past this, the loop gives up and returns the error of the
+/// last status, so search (`embed_search_query`) and the inline
+/// write-page embed never wait longer than a 429 storm already could.
+const MAX_RETRY_WAIT_BUDGET: Duration = Duration::from_secs(62);
+
+/// Decide the wait before the next attempt of a remote embedding request
+/// (every HTTP embedder shares this policy), or give up.
+///
+/// Only 429 and 503 are retriable ([`is_retryable_embedding_status`]).
+/// `attempt` is the 1-based index of the attempt being decided: up to
+/// five new attempts are allowed, and attempt 6 is already past the
+/// budget of retries. A whole-second `Retry-After` header (e.g.
+/// `Retry-After: 5`) is honoured, clamped to [`MAX_RETRY_AFTER_SECS`];
+/// a missing header, a non-whole-second value (the HTTP-date form is not
+/// supported) or an unparseable one falls back to the historical
+/// `2^attempt` seconds (2, 4, 8, 16, 32). `None` means the call should
+/// stop and report the last status: a non-retriable status, more than
+/// five new attempts, or `waited + delay` exceeding
+/// [`MAX_RETRY_WAIT_BUDGET`].
+pub(crate) fn retry_delay(
+    status: reqwest::StatusCode,
+    retry_after: Option<&reqwest::header::HeaderValue>,
+    attempt: u32,
+    waited: Duration,
+) -> Option<Duration> {
+    if !is_retryable_embedding_status(status.as_u16()) || attempt > 5 {
+        return None;
+    }
+    let delay = match retry_after
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        Some(secs) => Duration::from_secs(secs.min(MAX_RETRY_AFTER_SECS)),
+        None => Duration::from_secs(2u64.saturating_pow(attempt)),
+    };
+    (waited + delay <= MAX_RETRY_WAIT_BUDGET).then_some(delay)
+}
+
 /// Shared OpenAI-shape embedding request: head-truncate, POST
 /// `/embeddings` (bearer auth only when a key is present — local
-/// engines such as Ollama and LM Studio run keyless), retry 429 with
-/// backoff, parse, dim-check, unit-normalise.
+/// engines such as Ollama and LM Studio run keyless), retry 429 and 503
+/// honouring `Retry-After`, parse, dim-check, unit-normalise.
 async fn openai_style_embed(
     client: &reqwest::Client,
     base_url: &str,
@@ -210,6 +367,7 @@ async fn openai_style_embed(
         model,
     };
     let mut attempt = 0u32;
+    let mut waited = Duration::ZERO;
     loop {
         let mut builder = client.post(&url);
         if let Some(key) = api_key {
@@ -217,27 +375,27 @@ async fn openai_style_embed(
         }
         let resp = builder.json(&req).send().await?;
         let status = resp.status();
-        if status.as_u16() == 429 && attempt < 5 {
+        // Read the header while the response is still owned here: nothing
+        // below may consume the body before the wait is decided.
+        let retry_after = resp.headers().get(reqwest::header::RETRY_AFTER);
+        if let Some(delay) = retry_delay(status, retry_after, attempt + 1, waited) {
             attempt += 1;
-            let delay = Duration::from_secs(2u64.saturating_pow(attempt));
-            debug!(attempt, ?delay, "openai embeddings rate-limited; retrying");
+            waited += delay;
+            debug!(
+                attempt,
+                ?delay,
+                status = status.as_u16(),
+                "openai embeddings 429/503; retrying"
+            );
             tokio::time::sleep(delay).await;
             continue;
         }
         // Client errors (e.g. input > 8192 tokens) are not retried.
         if status.as_u16() == 400 {
-            let body = provider_error_body(resp).await;
-            return Err(LlmError::Provider {
-                status: status.as_u16(),
-                body,
-            });
+            return Err(provider_error(resp).await);
         }
         if !status.is_success() {
-            let body = provider_error_body(resp).await;
-            return Err(LlmError::Provider {
-                status: status.as_u16(),
-                body,
-            });
+            return Err(provider_error(resp).await);
         }
         let body = response_text_limited(resp).await?;
         let values = parse_openai_embedding_values(&body, status.as_u16())?;
@@ -262,6 +420,10 @@ impl Embedder for OpenAiEmbedder {
         &self.model
     }
 
+    fn model_identity(&self) -> String {
+        document_prefix_identity(&self.model, &self.document_prefix)
+    }
+
     fn dim(&self) -> u32 {
         self.dim
     }
@@ -274,6 +436,32 @@ impl Embedder for OpenAiEmbedder {
             &self.model,
             self.dim,
             text,
+        )
+        .await
+    }
+
+    async fn embed_document(&self, text: &str) -> LlmResult<Vec<f32>> {
+        let prefixed = prepend_prefix(&self.document_prefix, text);
+        openai_style_embed(
+            &self.client,
+            &self.base_url,
+            Some(&self.api_key),
+            &self.model,
+            self.dim,
+            &prefixed,
+        )
+        .await
+    }
+
+    async fn embed_query(&self, text: &str) -> LlmResult<Vec<f32>> {
+        let prefixed = prepend_prefix(&self.query_prefix, text);
+        openai_style_embed(
+            &self.client,
+            &self.base_url,
+            Some(&self.api_key),
+            &self.model,
+            self.dim,
+            &prefixed,
         )
         .await
     }
@@ -291,6 +479,21 @@ pub struct OpenAiCompatEmbedder {
     base_url: String,
     model: String,
     dim: u32,
+    /// Prepended to every query text before embedding (before truncation).
+    /// Empty by default: symmetric models (most OpenAI-compatible servers)
+    /// see no behaviour change. Asymmetric models need a query-side
+    /// instruction the OpenAI-compatible `/v1/embeddings` wire format has
+    /// no field for — the client has to prepend it instead.
+    /// `nvidia/Nemotron-3-Embed-1B-BF16` and base E5 models use a simple
+    /// `"query: "` / `"passage: "` pair; `e5-mistral-7b-instruct` and
+    /// Qwen3-Embedding instead need a full task-instruction string with
+    /// different exact spacing each (documents plain for both — see
+    /// `ai-memory-cli/src/config.rs`'s `embedding_query_prefix` field doc
+    /// comment for the two exact templates). See `with_prefixes`.
+    query_prefix: String,
+    /// Document-side counterpart of `query_prefix` (e.g. `"passage: "` for
+    /// Nemotron-3-Embed / base E5 — not every model needs one).
+    document_prefix: String,
 }
 
 impl OpenAiCompatEmbedder {
@@ -308,6 +511,7 @@ impl OpenAiCompatEmbedder {
         // Same cold-load tolerance as OpenAiEmbedder: first request
         // after an Ollama model unload can take ~30s.
         let client = reqwest::Client::builder()
+            .redirect(crate::redirect::same_origin_redirects())
             .timeout(Duration::from_secs(120))
             .build()?;
         Ok(Self {
@@ -316,7 +520,29 @@ impl OpenAiCompatEmbedder {
             base_url: base_url.into(),
             model: model.into(),
             dim,
+            query_prefix: String::new(),
+            document_prefix: String::new(),
         })
+    }
+
+    /// Set the strings prepended to query / document text before embedding,
+    /// applied ahead of the existing truncation so truncation still bounds
+    /// the whole request body (prefix included). Pass empty strings for no
+    /// prefix (the default); safe to call unconditionally with a possibly
+    /// unset operator setting.
+    ///
+    /// Publisher-specified prefixes are exact strings, often with a
+    /// significant trailing space (e.g. Nemotron-3-Embed / the E5 family
+    /// use `"query: "` and `"passage: "`) — callers must not trim them.
+    #[must_use]
+    pub fn with_prefixes(
+        mut self,
+        query_prefix: impl Into<String>,
+        document_prefix: impl Into<String>,
+    ) -> Self {
+        self.query_prefix = query_prefix.into();
+        self.document_prefix = document_prefix.into();
+        self
     }
 }
 
@@ -328,6 +554,10 @@ impl Embedder for OpenAiCompatEmbedder {
 
     fn model(&self) -> &str {
         &self.model
+    }
+
+    fn model_identity(&self) -> String {
+        document_prefix_identity(&self.model, &self.document_prefix)
     }
 
     fn dim(&self) -> u32 {
@@ -342,6 +572,32 @@ impl Embedder for OpenAiCompatEmbedder {
             &self.model,
             self.dim,
             text,
+        )
+        .await
+    }
+
+    async fn embed_document(&self, text: &str) -> LlmResult<Vec<f32>> {
+        let prefixed = prepend_prefix(&self.document_prefix, text);
+        openai_style_embed(
+            &self.client,
+            &self.base_url,
+            self.api_key.as_ref(),
+            &self.model,
+            self.dim,
+            &prefixed,
+        )
+        .await
+    }
+
+    async fn embed_query(&self, text: &str) -> LlmResult<Vec<f32>> {
+        let prefixed = prepend_prefix(&self.query_prefix, text);
+        openai_style_embed(
+            &self.client,
+            &self.base_url,
+            self.api_key.as_ref(),
+            &self.model,
+            self.dim,
+            &prefixed,
         )
         .await
     }
@@ -368,6 +624,7 @@ impl VoyageEmbedder {
         // sub-second. When the embedder still fails, memory_query
         // degrades gracefully to FTS5 + entity + graph (see server.rs).
         let client = reqwest::Client::builder()
+            .redirect(crate::redirect::same_origin_redirects())
             .timeout(Duration::from_secs(120))
             .build()?;
         Ok(Self {
@@ -387,6 +644,10 @@ impl VoyageEmbedder {
     }
 }
 
+/// Sent without a client-side cut: Voyage's `truncation` defaults to true and
+/// shortens an over-long input to the model's own context (4k-32k tokens), so
+/// the shared 8 KB head cut would only discard text the model can embed.
+/// <https://docs.voyageai.com/docs/embeddings>
 #[derive(Debug, Serialize)]
 struct VoyageRequest<'a> {
     input: [&'a str; 1],
@@ -423,20 +684,34 @@ impl Embedder for VoyageEmbedder {
             input: [text],
             model: &self.model,
         };
-        let resp = self
-            .client
-            .post(&url)
-            .bearer_auth(self.api_key.expose_secret())
-            .json(&req)
-            .send()
-            .await?;
+        let mut attempt = 0u32;
+        let mut waited = Duration::ZERO;
+        let resp = loop {
+            let resp = self
+                .client
+                .post(&url)
+                .bearer_auth(self.api_key.expose_secret())
+                .json(&req)
+                .send()
+                .await?;
+            let status = resp.status();
+            let retry_after = resp.headers().get(reqwest::header::RETRY_AFTER);
+            let Some(delay) = retry_delay(status, retry_after, attempt + 1, waited) else {
+                break resp;
+            };
+            attempt += 1;
+            waited += delay;
+            debug!(
+                attempt,
+                ?delay,
+                status = status.as_u16(),
+                "voyage embeddings 429/503; retrying"
+            );
+            tokio::time::sleep(delay).await;
+        };
         let status = resp.status();
         if !status.is_success() {
-            let body = provider_error_body(resp).await;
-            return Err(LlmError::Provider {
-                status: status.as_u16(),
-                body,
-            });
+            return Err(provider_error(resp).await);
         }
         let parsed: VoyageResponse = response_json_limited(resp).await?;
         let first =
@@ -501,6 +776,49 @@ impl Embedder for SyntheticEmbedder {
     }
 }
 
+/// Prepend `prefix` to `text` for an asymmetric embedding model, applied
+/// BEFORE [`truncate_for_embedding`] so truncation always bounds the whole
+/// request body (prefix included) rather than letting a prefix push the
+/// text itself past the server's token limit. An empty prefix — the
+/// default — returns `text` unchanged and borrowed, so the unset case
+/// allocates nothing.
+pub(crate) fn prepend_prefix<'a>(prefix: &str, text: &'a str) -> std::borrow::Cow<'a, str> {
+    if prefix.is_empty() {
+        std::borrow::Cow::Borrowed(text)
+    } else {
+        std::borrow::Cow::Owned(format!("{prefix}{text}"))
+    }
+}
+
+/// The `model` component of the stored embedding identity for a document
+/// embedder configured with `document_prefix`. An empty prefix returns
+/// `model` unchanged — the pre-existing identity, so an install with no
+/// document prefix configured needs no migration. A non-empty prefix
+/// appends a versioned SHA-256 fingerprint of the prefix bytes: `+dp1-`
+/// followed by the first 16 hex characters (64 bits) of
+/// `SHA-256(document_prefix)`. Not the raw prefix text itself, which
+/// could be long, contain characters awkward in a stored column, or leak
+/// an operator's exact instruction string into logs/admin output more
+/// than necessary — and not a 32-bit hash (an earlier revision used
+/// `fnv1a` truncated to 32 bits, which a search for a same-length ASCII
+/// collision found in minutes: `"Document category 5hvhw0: "` and
+/// `"Document category 1i4yh8i: "` both fingerprinted to `5c7f37a2`,
+/// which would have silently mixed two different prefixes' vectors under
+/// one identity — see `document_prefix_identity_does_not_collide_on_the_known_fnv32_pair`
+/// below). SHA-256 truncated to 64 bits keeps the collision probability
+/// negligible for the small number of prefixes one deployment actually
+/// configures over time, without needing the full 256-bit digest in a
+/// column meant to stay human-scannable. The `dp1` version tag lets a
+/// future change to this scheme be distinguished from today's rather than
+/// risking a silent collision with an old identity under a new one.
+pub(crate) fn document_prefix_identity(model: &str, document_prefix: &str) -> String {
+    if document_prefix.is_empty() {
+        return model.to_string();
+    }
+    let digest = format!("{:x}", Sha256::digest(document_prefix.as_bytes()));
+    format!("{model}+dp1-{}", &digest[..16])
+}
+
 /// Unit-normalise so dot-product equals cosine similarity.
 pub(crate) fn normalise(mut v: Vec<f32>) -> Vec<f32> {
     let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -531,6 +849,312 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn header(value: &'static str) -> reqwest::header::HeaderValue {
+        reqwest::header::HeaderValue::from_static(value)
+    }
+
+    #[test]
+    fn retry_delay_honours_whole_second_retry_after_on_429_and_503() {
+        let five = Duration::from_secs(5);
+        assert_eq!(
+            retry_delay(
+                reqwest::StatusCode::from_u16(429).unwrap(),
+                Some(&header("5")),
+                1,
+                Duration::ZERO
+            ),
+            Some(five)
+        );
+        assert_eq!(
+            retry_delay(
+                reqwest::StatusCode::from_u16(503).unwrap(),
+                Some(&header("5")),
+                1,
+                Duration::ZERO
+            ),
+            Some(five)
+        );
+    }
+
+    #[test]
+    fn retry_delay_clamps_retry_after_to_the_per_wait_cap() {
+        let capped = Duration::from_secs(32);
+        assert_eq!(
+            retry_delay(
+                reqwest::StatusCode::from_u16(429).unwrap(),
+                Some(&header("120")),
+                1,
+                Duration::ZERO
+            ),
+            Some(capped)
+        );
+        assert_eq!(
+            retry_delay(
+                reqwest::StatusCode::from_u16(503).unwrap(),
+                Some(&header("120")),
+                1,
+                Duration::ZERO
+            ),
+            Some(capped)
+        );
+    }
+
+    #[test]
+    fn retry_delay_falls_back_to_exponential_backoff_without_a_valid_header() {
+        let status = reqwest::StatusCode::from_u16(503).unwrap();
+        // Missing header: the historical 2^attempt seconds.
+        assert_eq!(
+            retry_delay(status, None, 1, Duration::ZERO),
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(
+            retry_delay(status, None, 3, Duration::ZERO),
+            Some(Duration::from_secs(8))
+        );
+        assert_eq!(
+            retry_delay(status, None, 5, Duration::ZERO),
+            Some(Duration::from_secs(32))
+        );
+        // A non-whole-second value is not supported (HTTP-date form):
+        // same fallback as an absent header.
+        assert_eq!(
+            retry_delay(status, Some(&header("abc")), 1, Duration::ZERO),
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(
+            retry_delay(
+                status,
+                Some(&header("Wed, 21 Oct 2015 07:28:00 GMT")),
+                1,
+                Duration::ZERO
+            ),
+            Some(Duration::from_secs(2))
+        );
+    }
+
+    #[test]
+    fn retry_delay_refuses_non_retriable_statuses() {
+        let header5 = Some(&header("5"));
+        for status in [400u16, 404, 500, 502] {
+            let code = reqwest::StatusCode::from_u16(status).unwrap();
+            assert_eq!(
+                retry_delay(code, header5, 1, Duration::ZERO),
+                None,
+                "status {status}"
+            );
+            assert_eq!(
+                retry_delay(code, None, 1, Duration::ZERO),
+                None,
+                "status {status}"
+            );
+        }
+    }
+
+    #[test]
+    fn retry_delay_stops_after_five_new_attempts() {
+        let status = reqwest::StatusCode::from_u16(503).unwrap();
+        assert_eq!(
+            retry_delay(status, Some(&header("0")), 5, Duration::from_secs(30)),
+            Some(Duration::ZERO),
+            "attempt 5 stays inside the attempt cap and the 62 s budget"
+        );
+        assert_eq!(
+            retry_delay(status, Some(&header("0")), 6, Duration::ZERO),
+            None
+        );
+        assert_eq!(retry_delay(status, None, 6, Duration::ZERO), None);
+        assert_eq!(retry_delay(status, None, 7, Duration::ZERO), None);
+    }
+
+    #[test]
+    fn retry_delay_gives_up_when_the_wait_budget_is_exhausted() {
+        let status = reqwest::StatusCode::from_u16(503).unwrap();
+        // 35 s already waited plus a 30 s Retry-After would reach 65 s.
+        assert_eq!(
+            retry_delay(status, Some(&header("30")), 1, Duration::from_secs(35)),
+            None
+        );
+        // A clamped 120 s header (32 s) after 32 s already waited: 64 s > 62 s.
+        assert_eq!(
+            retry_delay(status, Some(&header("120")), 2, Duration::from_secs(32)),
+            None
+        );
+        // Boundary control: the previous worst case (30 s waited + 32 s)
+        // still fits the budget, so behaviour is unchanged at the limit.
+        assert_eq!(
+            retry_delay(status, None, 5, Duration::from_secs(30)),
+            Some(Duration::from_secs(32))
+        );
+    }
+
+    #[test]
+    fn document_prefix_identity_is_unchanged_when_the_prefix_is_empty() {
+        // The legacy-identity guarantee: an install with no document
+        // prefix configured must key its vectors exactly as before this
+        // feature, so it needs no migration.
+        assert_eq!(
+            document_prefix_identity("nomic-embed-text", ""),
+            "nomic-embed-text"
+        );
+    }
+
+    #[test]
+    fn document_prefix_identity_changes_deterministically_with_the_prefix() {
+        let base = document_prefix_identity("nomic-embed-text", "passage: ");
+        assert_ne!(
+            base, "nomic-embed-text",
+            "a set prefix must not reuse the legacy identity"
+        );
+        assert!(base.starts_with("nomic-embed-text+dp1-"));
+        // Deterministic: the same (model, prefix) always produces the same
+        // identity, so pages embedded in different requests still land
+        // under one queryable identity.
+        assert_eq!(
+            base,
+            document_prefix_identity("nomic-embed-text", "passage: ")
+        );
+    }
+
+    #[test]
+    fn document_prefix_identity_distinguishes_different_prefixes() {
+        // Two distinct document prefixes on the same model must not
+        // collide — otherwise a prefix *change* would look like no change
+        // at all to the refuse-on-mismatch / stale-row machinery.
+        let a = document_prefix_identity("nomic-embed-text", "passage: ");
+        let b = document_prefix_identity("nomic-embed-text", "document: ");
+        assert_ne!(a, b);
+    }
+
+    /// Regression test for a real collision found in an earlier revision
+    /// of `document_prefix_identity`, which truncated `fnv1a` to 32 bits:
+    /// `"Document category 5hvhw0: "` and `"Document category 1i4yh8i: "`
+    /// both fingerprinted to `5c7f37a2` (verified independently in
+    /// Python), which would have silently mixed the two prefixes' vectors
+    /// under one stored identity. The SHA-256-based fingerprint here does
+    /// not collide on this pair (also independently verified: their first
+    /// 16 hex characters are `b32006f5a41f3d24` and `513594f86d5883fd`).
+    #[test]
+    fn document_prefix_identity_does_not_collide_on_the_known_fnv32_pair() {
+        let a = document_prefix_identity("nomic-embed-text", "Document category 5hvhw0: ");
+        let b = document_prefix_identity("nomic-embed-text", "Document category 1i4yh8i: ");
+        assert_ne!(
+            a, b,
+            "these two prefixes collided under the old 32-bit fnv1a fingerprint; \
+             the new SHA-256-based one must not repeat that collision"
+        );
+    }
+
+    #[test]
+    fn model_identity_defaults_to_model_for_providers_without_prefixes() {
+        // Providers that never got the document-prefix override (google,
+        // voyage, local, copilot, synthetic) must see byte-identical
+        // behaviour: `model_identity` defaults to `model().to_string()`.
+        let e = SyntheticEmbedder::new(8);
+        assert_eq!(e.model_identity(), e.model());
+    }
+
+    #[test]
+    fn openai_compat_embedder_model_identity_reflects_the_document_prefix() {
+        let unset = OpenAiCompatEmbedder::new("http://localhost:9/v1", None, "nomic-embed-text", 8)
+            .expect("embedder builds");
+        assert_eq!(unset.model_identity(), "nomic-embed-text");
+
+        let with_prefix =
+            OpenAiCompatEmbedder::new("http://localhost:9/v1", None, "nomic-embed-text", 8)
+                .expect("embedder builds")
+                .with_prefixes("query: ", "passage: ");
+        assert_ne!(with_prefix.model_identity(), "nomic-embed-text");
+        assert_eq!(
+            with_prefix.model_identity(),
+            document_prefix_identity("nomic-embed-text", "passage: ")
+        );
+        // The query prefix must NOT affect the stored identity — only
+        // documents are stored; a query is never persisted.
+        let query_only =
+            OpenAiCompatEmbedder::new("http://localhost:9/v1", None, "nomic-embed-text", 8)
+                .expect("embedder builds")
+                .with_prefixes("query: ", "");
+        assert_eq!(query_only.model_identity(), "nomic-embed-text");
+    }
+
+    #[test]
+    fn openai_embedder_model_identity_reflects_the_document_prefix() {
+        let unset =
+            OpenAiEmbedder::new(SecretString::from("k"), "text-embedding-3-small", 1536).unwrap();
+        assert_eq!(unset.model_identity(), "text-embedding-3-small");
+
+        let with_prefix =
+            OpenAiEmbedder::new(SecretString::from("k"), "text-embedding-3-small", 1536)
+                .unwrap()
+                .with_prefixes("query: ", "passage: ");
+        assert_ne!(with_prefix.model_identity(), "text-embedding-3-small");
+    }
+
+    /// Transport-level proof that `OpenAiEmbedder` (not just
+    /// `OpenAiCompatEmbedder`, covered in
+    /// `tests/suite/openai_compat_embedder.rs`) actually sends the
+    /// configured prefix on the wire — `with_prefixes` alone only proves
+    /// the fields are stored, not that `embed_query`/`embed_document` use
+    /// them in the real HTTP request body.
+    #[tokio::test]
+    async fn openai_embedder_sends_the_prefix_on_the_wire() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(move |req: &Request| {
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+                assert_eq!(body["input"], "query: find the runbook");
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "data": [{ "embedding": vec![0.5_f32; 4] }],
+                }))
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let e = OpenAiEmbedder::new(SecretString::from("sk-test"), "text-embedding-3-small", 4)
+            .unwrap()
+            .with_base_url(server.uri())
+            .with_prefixes("query: ", "passage: ");
+
+        e.embed_query("find the runbook")
+            .await
+            .expect("embed_query succeeds");
+    }
+
+    /// Voyage truncates server side by default, so a long page goes out whole
+    /// rather than through the 8 KB head cut the other HTTP embedders need.
+    #[tokio::test]
+    async fn voyage_embedder_sends_a_long_input_whole() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let page = "word ".repeat(8_000);
+        let expected = page.clone();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(move |req: &Request| {
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+                assert_eq!(body["input"][0], expected.as_str());
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "data": [{ "embedding": [0.6_f32, 0.8] }],
+                }))
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let e = VoyageEmbedder::new(SecretString::from("test-key"), "voyage-3-large", 2)
+            .unwrap()
+            .with_base_url(server.uri());
+
+        e.embed(&page).await.expect("voyage embed succeeds");
+    }
 
     #[tokio::test]
     async fn synthetic_embedder_produces_unit_vectors() {
@@ -591,5 +1215,66 @@ mod tests {
         let body = r#"{"data":[{"embedding":[0.1,"oops",0.3]}]}"#;
         let err = parse_openai_embedding_values(body, 200).unwrap_err();
         assert!(matches!(err, LlmError::Provider { status: 200, .. }));
+    }
+
+    #[test]
+    fn prepend_prefix_applies_publisher_instruction() {
+        // Nemotron-3-Embed / the E5 family: exact publisher strings,
+        // including the significant trailing space.
+        assert_eq!(
+            prepend_prefix("query: ", "find the release runbook"),
+            "query: find the release runbook"
+        );
+        assert_eq!(
+            prepend_prefix("passage: ", "the release runbook says..."),
+            "passage: the release runbook says..."
+        );
+    }
+
+    #[test]
+    fn prepend_prefix_unset_leaves_text_unchanged() {
+        // The default (empty prefix) must be a true no-op, byte for byte,
+        // and borrow rather than allocate.
+        let text = "unchanged text";
+        let out = prepend_prefix("", text);
+        assert_eq!(out, text);
+        assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn prefix_is_applied_before_truncation_so_it_still_bounds_the_whole_input() {
+        // A prefix pushes the *total* input closer to the cap; truncation
+        // must run on prefix+text together, never on text alone with the
+        // prefix appended afterwards (which could exceed the server limit).
+        let long_text = "x".repeat(50_000);
+        let prefixed = prepend_prefix("passage: ", &long_text);
+        let truncated = truncate_for_embedding(&prefixed, OPENAI_EMBED_MAX_TOKENS);
+        assert!(truncated.starts_with("passage: "));
+        assert!(truncated.len() <= 8_000, "must respect the hard byte cap");
+        assert!(truncated.ends_with('…'));
+    }
+
+    #[test]
+    fn openai_compat_embedder_defaults_to_no_prefix() {
+        // Construction without `with_prefixes` must be byte-identical to
+        // before this feature existed.
+        let e = OpenAiCompatEmbedder::new("http://localhost:9/v1", None, "nomic-embed-text", 8)
+            .expect("embedder builds");
+        assert_eq!(e.query_prefix, "");
+        assert_eq!(e.document_prefix, "");
+    }
+
+    #[test]
+    fn openai_compat_embedder_stores_configured_prefixes() {
+        let e = OpenAiCompatEmbedder::new(
+            "http://localhost:9/v1",
+            None,
+            "nvidia/Nemotron-3-Embed-1B-BF16",
+            2048,
+        )
+        .expect("embedder builds")
+        .with_prefixes("query: ", "passage: ");
+        assert_eq!(e.query_prefix, "query: ");
+        assert_eq!(e.document_prefix, "passage: ");
     }
 }

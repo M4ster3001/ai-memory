@@ -66,6 +66,9 @@ pub async fn run(config: &Config, args: MoveSessionArgs) -> Result<()> {
         create: args.create,
     };
     let report: serde_json::Value = post_json(&endpoint, "/admin/move-session", &request).await?;
+    if let Some(warning) = report["manifest_warning"].as_str() {
+        eprintln!("ai-memory: warning: {warning}");
+    }
 
     if request.session_id.is_some() {
         print_session_report(&report, args.confirm);
@@ -261,14 +264,26 @@ fn apply_command(args: &MoveSessionArgs) -> String {
         cmd.push_str(&id.to_string());
     }
     if let Some(project) = &args.from_project {
-        cmd.push_str(&format!(" --from-project {project}"));
+        cmd.push_str(&format!(
+            " --from-project {}",
+            super::render_shared::native_shell_quote(project)
+        ));
     }
     if let Some(ws) = &args.from_workspace {
-        cmd.push_str(&format!(" --from-workspace {ws}"));
+        cmd.push_str(&format!(
+            " --from-workspace {}",
+            super::render_shared::native_shell_quote(ws)
+        ));
     }
-    cmd.push_str(&format!(" --to {}", args.to));
+    cmd.push_str(&format!(
+        " --to {}",
+        super::render_shared::native_shell_quote(&args.to)
+    ));
     if let Some(ws) = &args.to_workspace {
-        cmd.push_str(&format!(" --to-workspace {ws}"));
+        cmd.push_str(&format!(
+            " --to-workspace {}",
+            super::render_shared::native_shell_quote(ws)
+        ));
     }
     if args.pages != "move" {
         cmd.push_str(&format!(" --pages {}", args.pages));

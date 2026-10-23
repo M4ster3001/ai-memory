@@ -17,6 +17,7 @@ async fn make_state(tmp: &TempDir) -> (AdminState, Store) {
     let db_path = store.db_path().to_path_buf();
     let state = AdminState {
         ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+        mcp_metrics: std::sync::Arc::new(ai_memory_mcp::McpMetrics::default()),
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
@@ -26,6 +27,8 @@ async fn make_state(tmp: &TempDir) -> (AdminState, Store) {
         embedder: None,
         provider_health: ai_memory_llm::ProviderHealth::default(),
         decay_params: DecayParams::default(),
+        contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+        contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
         data_dir: tmp.path().to_path_buf(),
         db_path,
         bind: "127.0.0.1:49374".to_string(),
@@ -44,6 +47,11 @@ async fn body_json(resp: axum::response::Response) -> serde_json::Value {
         .await
         .unwrap();
     serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
+}
+
+#[cfg(unix)]
+fn symlink(target: &std::path::Path, link: &std::path::Path) {
+    std::os::unix::fs::symlink(target, link).unwrap();
 }
 
 /// A page present in the store but NOT on disk (the index is ahead of the
@@ -148,6 +156,58 @@ async fn read_page_serves_on_disk_page() {
         "written to disk via the wiki",
         "{body}"
     );
+    assert!(body.get("served_from").is_none(), "{body}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn read_page_does_not_db_fallback_through_a_symlink() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default".to_string())
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch".to_string(), None)
+        .await
+        .unwrap();
+    let path = PagePath::new("notes/linked.md").unwrap();
+    state
+        .wiki
+        .write_page(WritePageRequest {
+            workspace_id: ws,
+            project_id: proj,
+            path: path.clone(),
+            frontmatter: serde_json::json!({"title": "Stored Copy"}),
+            body: "database fallback must stay hidden".to_string(),
+            tier: Tier::Semantic,
+            pinned: false,
+            title: Some("Stored Copy".into()),
+            admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let outside = TempDir::new().unwrap();
+    let canary = outside.path().join("page.md");
+    std::fs::write(&canary, "outside canary").unwrap();
+    let abs = state.wiki.abs_path(ws, proj, &path);
+    std::fs::remove_file(&abs).unwrap();
+    symlink(&canary, &abs);
+
+    let resp = get(
+        state,
+        "/admin/read-page?workspace=default&project=scratch&path=notes%2Flinked.md",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = body_json(resp).await;
+    assert!(body["error"].as_str().unwrap_or("").contains("confinement"));
     assert!(body.get("served_from").is_none(), "{body}");
 }
 
@@ -258,4 +318,90 @@ async fn read_page_missing_scope_does_not_create_workspace_or_project() {
         missing_ws.is_none(),
         "read-page must not create a missing workspace"
     );
+}
+
+/// An expired page is still served by its exact path, but the response says
+/// so: search and the listings leave such a page out, and `read-page` shows
+/// the flag. A live page's response has no `expired` key.
+#[tokio::test]
+async fn read_page_marks_an_expired_page() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default".to_string())
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch".to_string(), None)
+        .await
+        .unwrap();
+    for (path, expires_at) in [
+        ("notes/dated.md", "2000-01-01"),
+        ("notes/later.md", "2999-01-01"),
+    ] {
+        state
+            .wiki
+            .write_page(WritePageRequest {
+                workspace_id: ws,
+                project_id: proj,
+                path: PagePath::new(path).unwrap(),
+                frontmatter: serde_json::json!({"title": "Dated", "expires_at": expires_at}),
+                body: "dated body".to_string(),
+                tier: Tier::Semantic,
+                pinned: false,
+                title: Some("Dated".into()),
+                admission_ctx: None,
+                author_id: None,
+                actor: ai_memory_core::ActorContext::anonymous(),
+                evidence: Vec::new(),
+            })
+            .await
+            .unwrap();
+    }
+    // The DB fallback annotates too: an expired row with no file behind it.
+    let a_minute_ago = jiff::Timestamp::now().as_second() - 60;
+    store
+        .writer
+        .upsert_page(NewPage {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new("notes/db-only-dated.md").unwrap(),
+            title: "DB Only Dated".to_string(),
+            body: "fallback body".to_string(),
+            tier: Tier::Semantic,
+            frontmatter_json: serde_json::json!({"title": "DB Only Dated"}),
+            pinned: false,
+            links: Vec::new(),
+            author_id: None,
+            expires_at: Some(jiff::Timestamp::from_second(a_minute_ago).unwrap()),
+            entities: Vec::new(),
+            evidence: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+    for (path, expired) in [
+        ("notes%2Fdated.md", true),
+        ("notes%2Flater.md", false),
+        ("notes%2Fdb-only-dated.md", true),
+    ] {
+        let resp = get(
+            state.clone(),
+            &format!("/admin/read-page?workspace=default&project=scratch&path={path}"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "{path}");
+        let body = body_json(resp).await;
+        assert!(
+            body["body"].as_str().is_some_and(|text| !text.is_empty()),
+            "{body}"
+        );
+        assert_eq!(
+            body.get("expired").and_then(serde_json::Value::as_bool),
+            expired.then_some(true),
+            "{path}: {body}"
+        );
+    }
 }

@@ -1,7 +1,9 @@
-//! `ai-memory user` — manage compatibility tokens and human password login.
+//! `ai-memory user` — manage human users, password login and project grants.
 //!
-//! Thin HTTP client over `/admin/users*`. The caller's bearer token must
-//! authenticate as root. Single-token commands remain deprecated 1.x shims.
+//! Thin HTTP client over `/admin/users*` and `/admin/human-users`. The
+//! caller's bearer token must authenticate as root. API keys, including the
+//! `legacy-user-token` rows left by the removed 1.x token commands, are
+//! managed by `ai-memory api-key`.
 
 use std::io::{self, BufRead, Write};
 
@@ -9,9 +11,8 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::cli::{
-    UserAddArgs, UserAddHumanArgs, UserArgs, UserCommand, UserDisableArgs, UserEnableArgs,
-    UserExpireArgs, UserListArgs, UserPatchArgs, UserResetPasswordArgs, UserReviveArgs,
-    UserRotateTokenArgs,
+    UserAddHumanArgs, UserArgs, UserCommand, UserDisableArgs, UserEnableArgs, UserListArgs,
+    UserPatchArgs, UserResetPasswordArgs,
 };
 use crate::config::Config;
 use crate::http_client::{ServerEndpoint, get_json, patch_json, post_json};
@@ -28,8 +29,6 @@ struct UserRow {
     #[serde(default)]
     last_seen_at: Option<i64>,
     #[serde(default)]
-    token_expired_at: Option<i64>,
-    #[serde(default)]
     role: String,
     #[serde(default)]
     must_change_password: bool,
@@ -45,20 +44,10 @@ impl UserRow {
             "disabled"
         } else if self.has_password && self.must_change_password {
             "must-change"
-        } else if self.has_password {
-            "active"
-        } else if self.token_expired_at.is_some() {
-            "expired"
         } else {
             "active"
         }
     }
-}
-
-#[derive(Debug, Deserialize)]
-struct UserWithToken {
-    user: UserRow,
-    token: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -85,16 +74,15 @@ struct UserList {
 pub async fn run(config: &Config, args: UserArgs) -> Result<()> {
     let ep = ServerEndpoint::from_config_resolving_auth(config).await;
     match args.command {
-        UserCommand::Add(args) => add(&ep, args).await,
         UserCommand::AddHuman(args) => add_human(&ep, args).await,
         UserCommand::List(args) => list(&ep, args).await,
-        UserCommand::Expire(args) => expire(&ep, args).await,
-        UserCommand::Revive(args) => revive(&ep, args).await,
-        UserCommand::RotateToken(args) => rotate_token(&ep, args).await,
         UserCommand::ResetPassword(args) => reset_password(&ep, args).await,
         UserCommand::Disable(args) => disable(&ep, args).await,
         UserCommand::Enable(args) => enable(&ep, args).await,
         UserCommand::Patch(args) => patch(&ep, args).await,
+        UserCommand::Grant(args) => crate::commands::grant::grant(&ep, &args).await,
+        UserCommand::Revoke(args) => crate::commands::grant::revoke(&ep, &args).await,
+        UserCommand::Grants(args) => crate::commands::grant::list_for_user(&ep, &args).await,
     }
 }
 
@@ -107,27 +95,6 @@ struct CreateUserBody<'a> {
     email: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     role: Option<&'a str>,
-}
-
-async fn add(ep: &ServerEndpoint, args: UserAddArgs) -> Result<()> {
-    let body = CreateUserBody {
-        username: args.username.trim(),
-        name: args
-            .name
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty()),
-        email: args
-            .email
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty()),
-        role: None,
-    };
-    let resp: UserWithToken = post_json(ep, "/admin/users", &body)
-        .await
-        .context("creating compatibility user")?;
-    print_token(&resp, args.json, "created")
 }
 
 async fn add_human(ep: &ServerEndpoint, args: UserAddHumanArgs) -> Result<()> {
@@ -168,89 +135,56 @@ async fn list(ep: &ServerEndpoint, args: UserListArgs) -> Result<()> {
         println!("(no registered users)");
         return Ok(());
     }
-    let user_w = resp
-        .users
+    write_users(&resp.users, &mut io::stdout().lock())
+}
+
+/// Lay out the users table using terminal display-cell widths. Usernames and
+/// display names are free-form UTF-8, so a byte count over-pads an accented
+/// name and misplaces every cell after a double-width one.
+fn write_users(users: &[UserRow], out: &mut impl Write) -> Result<()> {
+    let user_w = users
         .iter()
-        .map(|u| u.username.len())
+        .map(|u| unicode_width::UnicodeWidthStr::width(u.username.as_str()))
         .max()
         .unwrap_or(8)
         .max(8);
-    let name_w = resp
-        .users
+    let name_w = users
         .iter()
-        .filter_map(|u| u.name.as_ref().map(String::len))
+        .filter_map(|u| u.name.as_deref())
+        .map(unicode_width::UnicodeWidthStr::width)
         .max()
         .unwrap_or(4)
         .max(4);
-    let role_w = resp
-        .users
+    let role_w = users
         .iter()
-        .map(|u| u.role.len())
+        .map(|u| unicode_width::UnicodeWidthStr::width(u.role.as_str()))
         .max()
         .unwrap_or(4)
         .max(4);
-
-    println!(
-        "{:<user_w$}  {:<name_w$}  {:<role_w$}  {:<12}",
-        "USERNAME",
-        "NAME",
-        "ROLE",
-        "STATUS",
-        user_w = user_w,
-        name_w = name_w,
-        role_w = role_w,
-    );
-    for u in &resp.users {
-        println!(
-            "{:<user_w$}  {:<name_w$}  {:<role_w$}  {:<12}",
-            u.username,
-            u.name.as_deref().unwrap_or("-"),
-            u.role,
-            u.status(),
-            user_w = user_w,
-            name_w = name_w,
-            role_w = role_w,
-        );
+    writeln!(
+        out,
+        "{}  {}  {}  {:<12}",
+        pad_cell("USERNAME", user_w),
+        pad_cell("NAME", name_w),
+        pad_cell("ROLE", role_w),
+        "STATUS"
+    )?;
+    for u in users {
+        writeln!(
+            out,
+            "{}  {}  {}  {:<12}",
+            pad_cell(&u.username, user_w),
+            pad_cell(u.name.as_deref().unwrap_or("-"), name_w),
+            pad_cell(&u.role, role_w),
+            u.status()
+        )?;
     }
     Ok(())
 }
 
-async fn expire(ep: &ServerEndpoint, args: UserExpireArgs) -> Result<()> {
-    if !args.yes {
-        confirm(&format!(
-            "Expire token for user '{}'? Their token stops authenticating immediately. (y/N) ",
-            args.username
-        ))?;
-    }
-    let path = format!("/admin/users/{}/expire", url_encode(&args.username));
-    let _: UserResponse = post_json(ep, &path, &serde_json::json!({}))
-        .await
-        .context("expiring user token")?;
-    println!("✓ expired token for user '{}'", args.username);
-    Ok(())
-}
-
-async fn revive(ep: &ServerEndpoint, args: UserReviveArgs) -> Result<()> {
-    let path = format!("/admin/users/{}/revive", url_encode(&args.username));
-    let _: UserResponse = post_json(ep, &path, &serde_json::json!({}))
-        .await
-        .context("reviving user token")?;
-    println!("✓ revived token for user '{}'", args.username);
-    Ok(())
-}
-
-async fn rotate_token(ep: &ServerEndpoint, args: UserRotateTokenArgs) -> Result<()> {
-    if !args.yes {
-        confirm(&format!(
-            "Rotate token for user '{}'? Existing clients will start getting 401 immediately. (y/N) ",
-            args.username
-        ))?;
-    }
-    let path = format!("/admin/users/{}/rotate-token", url_encode(&args.username));
-    let resp: UserWithToken = post_json(ep, &path, &serde_json::json!({}))
-        .await
-        .context("rotating user token")?;
-    print_token(&resp, args.json, "rotated token for")
+fn pad_cell(value: &str, width: usize) -> String {
+    let padding = width.saturating_sub(unicode_width::UnicodeWidthStr::width(value));
+    format!("{value}{}", " ".repeat(padding))
 }
 
 async fn reset_password(ep: &ServerEndpoint, args: UserResetPasswordArgs) -> Result<()> {
@@ -333,32 +267,21 @@ async fn patch(ep: &ServerEndpoint, args: UserPatchArgs) -> Result<()> {
     } else {
         println!(
             "✓ updated user '{}' ({})",
-            resp.user.username,
+            display_username(&resp.user.username),
             resp.user.status()
         );
     }
     Ok(())
 }
 
-fn print_token(resp: &UserWithToken, json: bool, verb: &str) -> Result<()> {
-    if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "user": &resp.user,
-                "token": &resp.token
-            }))?
-        );
-    } else {
-        let mut stderr = io::stderr().lock();
-        let _ = writeln!(
-            stderr,
-            "✓ {verb} user '{}'\n\nStore this token now — it will NOT be shown again.",
-            resp.user.username
-        );
-        println!("{}", resp.token);
-    }
-    Ok(())
+/// The one place a username reaches terminal output unchanged. CodeQL's
+/// sensitive-data heuristic reads any `username` as account information; a
+/// username is the operator-chosen login name, not a credential, and the
+/// `rust/cleartext-logging` barrier model
+/// (`.github/codeql/extensions/ai-memory-models/models/log-barriers.model.yml`)
+/// names this function so printing one here raises no alert.
+fn display_username(value: &str) -> &str {
+    value
 }
 
 fn print_temp_password(resp: &UserWithPassword, json: bool, verb: &str) -> Result<()> {
@@ -409,7 +332,7 @@ fn confirm(prompt: &str) -> Result<()> {
     Ok(())
 }
 
-fn url_encode(s: &str) -> String {
+pub(crate) fn url_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for &b in s.as_bytes() {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.') {
@@ -437,5 +360,66 @@ mod tests {
         assert_eq!(url_encode("alice@home"), "alice%40home");
         assert_eq!(url_encode("a/b"), "a%2Fb");
         assert_eq!(url_encode("a b"), "a%20b");
+    }
+
+    fn user(username: &str, name: Option<&str>) -> UserRow {
+        UserRow {
+            id: "u1".to_owned(),
+            username: username.to_owned(),
+            name: name.map(str::to_owned),
+            email: None,
+            created_at: 0,
+            last_seen_at: None,
+            role: "admin".to_owned(),
+            must_change_password: false,
+            disabled_at: None,
+            has_password: true,
+        }
+    }
+
+    /// The display-cell offset at which `line` carries `cell`, or `None`.
+    fn cell_column(line: &str, cell: &str) -> Option<usize> {
+        line.find(cell)
+            .map(|byte| unicode_width::UnicodeWidthStr::width(&line[..byte]))
+    }
+
+    fn render(users: &[UserRow]) -> String {
+        let mut buf = Vec::new();
+        write_users(users, &mut buf).expect("rendering to a buffer cannot fail");
+        String::from_utf8(buf).expect("the table is utf-8")
+    }
+
+    #[test]
+    fn users_table_columns_line_up_past_ascii() {
+        // Under a byte-measured width the double-width username is padded to
+        // its byte count in characters, which pushes its NAME, ROLE and
+        // STATUS cells right of the ASCII row's, and the accented name widens
+        // NAME by one column no row needs.
+        let rows = [user("利用者", Some("José")), user("bob", None)];
+        let table = render(&rows);
+        let header = table.lines().next().expect("a header row");
+        // USERNAME ends in NAME, so look for the NAME header past its separator.
+        let name_col = cell_column(header, "  NAME").expect("a NAME column") + 2;
+        let role_col = cell_column(header, "ROLE").expect("a ROLE column");
+        for line in table.lines().skip(1) {
+            assert_eq!(
+                cell_column(line, "admin"),
+                Some(role_col),
+                "ROLE column moved on {line:?}:\n{table}"
+            );
+        }
+        let cjk_row = table.lines().nth(1).expect("the CJK row");
+        assert_eq!(cell_column(cjk_row, "José"), Some(name_col), "{table}");
+        let widest_name = "José".chars().count();
+        assert_eq!(role_col, name_col + widest_name + 2, "{table}");
+
+        // Control: ASCII rows line up under either measure, so the rows above
+        // are what carry the assertions.
+        let ascii = render(&[user("alice", Some("Jose")), user("bob", None)]);
+        let ascii_header = ascii.lines().next().expect("a header row");
+        let ascii_role = cell_column(ascii_header, "ROLE").expect("a ROLE column");
+        for line in ascii.lines().skip(1) {
+            assert_eq!(cell_column(line, "admin"), Some(ascii_role), "{ascii}");
+        }
     }
 }

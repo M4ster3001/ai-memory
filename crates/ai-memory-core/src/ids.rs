@@ -80,6 +80,20 @@ macro_rules! id_newtype {
 id_newtype!(pub WorkspaceId, "Workspace identifier (top of the 3-tuple).");
 id_newtype!(pub ProjectId, "Project identifier (middle of the 3-tuple).");
 id_newtype!(pub SessionId, "Identifier for a single agent run.");
+
+impl SessionId {
+    /// Resolve a harness-native session id to the `SessionId` the store keys
+    /// on: a UUID native id is used as-is (canonicalized); any other string
+    /// (Codex, OpenCode, ...) is hashed to a deterministic UUID v5, so hook
+    /// POSTs and later lookups by native id share one key. The hook router and
+    /// any offline tool that matches transcripts by native id (e.g.
+    /// `ai-memory repair-backfill-timestamps`) must agree on this one rule.
+    #[must_use]
+    pub fn from_native(raw: &str) -> Self {
+        Self::from_str(raw)
+            .unwrap_or_else(|_| Self(Uuid::new_v5(&Uuid::NAMESPACE_OID, raw.as_bytes())))
+    }
+}
 id_newtype!(pub ObservationId, "Identifier for a single observation captured during a session.");
 id_newtype!(pub PageId, "Identifier for a single wiki page version.");
 id_newtype!(pub EntityId, "Identifier for one project-scoped entity.");
@@ -266,6 +280,40 @@ pub enum AgentKind {
     Pool,
     /// ZCode (z.ai) coding agent.
     Zcode,
+    /// GitHub Copilot CLI (`copilot`), configured with PascalCase hook event
+    /// names for a Claude Code/VS-Code-compatible payload shape (#1040).
+    CopilotCli,
+    /// GrizzyBot, a native macOS agent app that posts its own lifecycle events.
+    Grizzybot,
+    /// Factory Droid CLI (`droid`), whose hooks send Claude Code-shaped
+    /// payloads (#1240).
+    Droid,
+    /// Meta Muse Code (`muse`), whose hooks send Claude Code-shaped payloads
+    /// with Muse's own tool names.
+    Muse,
+    /// Tencent CodeBuddy Code (`codebuddy`). Hooks are Claude Code-shaped
+    /// (PascalCase events; `session_id`, `cwd`, `tool_name` and `tool_input`
+    /// on stdin). `SessionStart` stdout's `hookSpecificOutput.additionalContext`
+    /// is appended to the session (#1299).
+    #[serde(rename = "codebuddy", alias = "code-buddy")]
+    CodeBuddy,
+    /// IBM Bob IDE, whose lifecycle hooks send Claude Code-shaped payloads
+    /// but consume `SessionStart` stdout as plain context text.
+    #[serde(rename = "ibm-bob", alias = "bob")]
+    IbmBob,
+    /// DeepSeek Harness (DSH), whose Claude Code hooks bridge
+    /// (`@deepseek-ai/dsh-hooks-claude-code`) fires Claude Code-shaped
+    /// payloads for seven events (no `SessionEnd` or `PreCompact`).
+    Dsh,
+    /// Cline CLI, whose file hooks use `taskId` plus nested `tool_call` /
+    /// `tool_result` payloads. Run-start hooks are detached by default.
+    Cline,
+    /// Qwen Code (`qwen`), whose hooks send Claude Code-shaped payloads
+    /// (`session_id`, `cwd`, `tool_name`, `tool_input`, `tool_use_id`) and
+    /// whose MCP servers use Gemini CLI's `httpUrl` field in
+    /// `~/.qwen/settings.json`.
+    #[serde(rename = "qwen-code", alias = "qwen")]
+    QwenCode,
     /// Anything else (manual capture, future agents).
     Other,
 }
@@ -276,7 +324,7 @@ impl AgentKind {
     /// CHECK constraint accepts every kind (the Zero integration shipped
     /// with the enum variant but without the V26 migration and only a
     /// live test caught it). Extend together with the enum.
-    pub const ALL: [Self; 21] = [
+    pub const ALL: [Self; 30] = [
         Self::ClaudeCode,
         Self::Codex,
         Self::OpenCode,
@@ -297,6 +345,15 @@ impl AgentKind {
         Self::Hermes,
         Self::Pool,
         Self::Zcode,
+        Self::CopilotCli,
+        Self::Grizzybot,
+        Self::Droid,
+        Self::Muse,
+        Self::CodeBuddy,
+        Self::IbmBob,
+        Self::Dsh,
+        Self::Cline,
+        Self::QwenCode,
         Self::Other,
     ];
 
@@ -324,6 +381,15 @@ impl AgentKind {
             Self::Hermes => "hermes",
             Self::Pool => "pool",
             Self::Zcode => "zcode",
+            Self::CopilotCli => "copilot-cli",
+            Self::Grizzybot => "grizzybot",
+            Self::Droid => "droid",
+            Self::Muse => "muse",
+            Self::CodeBuddy => "codebuddy",
+            Self::IbmBob => "ibm-bob",
+            Self::Dsh => "dsh",
+            Self::Cline => "cline",
+            Self::QwenCode => "qwen-code",
             Self::Other => "other",
         }
     }
@@ -354,6 +420,15 @@ impl AgentKind {
             "hermes" | "hermes-agent" => Self::Hermes,
             "pool" | "poolside" => Self::Pool,
             "zcode" | "zai" => Self::Zcode,
+            "copilot-cli" | "copilot_cli" => Self::CopilotCli,
+            "grizzybot" | "grizzy-bot" => Self::Grizzybot,
+            "droid" | "factory-droid" | "factory_droid" => Self::Droid,
+            "muse" | "muse-code" | "musecode" => Self::Muse,
+            "codebuddy" | "code-buddy" => Self::CodeBuddy,
+            "ibm-bob" | "bob" => Self::IbmBob,
+            "dsh" | "deepseek-harness" | "deepseek_harness" => Self::Dsh,
+            "cline" | "cline-cli" => Self::Cline,
+            "qwen-code" | "qwen" | "qwencode" => Self::QwenCode,
             _ => Self::Other,
         }
     }
@@ -362,8 +437,10 @@ impl AgentKind {
     /// into the resuming session as context. Agents that consume it return
     /// `true` (Claude Code reads `hookSpecificOutput.additionalContext`).
     ///
-    /// Grok ignores hook stdout on `SessionStart` (per Grok's hooks docs:
-    /// "For events like SessionStart or PostToolUse, stdout is ignored"), and
+    /// Grok ignores hook stdout on `SessionStart` (per Grok's hooks guide:
+    /// stdout for that event is ignored). `PostToolUse` stdout is read and
+    /// `additionalContext` is shown to the model after the tool result. See
+    /// [`Self::post_tool_injects_handoff`].
     /// Zero's agent loop discards the sessionStart dispatch result entirely
     /// (`internal/agent/loop.go` ignores `Dispatch`'s return there), so
     /// the native hook must NOT fetch the handoff for it: the fetch is
@@ -391,6 +468,28 @@ impl AgentKind {
     /// `<system-reminder>` text block of the first user message sent to the
     /// model (verified live against the embedded engine v0.16.5, capture logs
     /// 2026-08-28), so its native hook fetches the handoff like Claude Code's.
+    ///
+    /// GitHub Copilot CLI injects `SessionStart` context from a top-level
+    /// `additionalContext` key (GitHub's hooks reference), not Claude Code's
+    /// `hookSpecificOutput` envelope, even in its PascalCase payload mode; the
+    /// native hook prints that top-level envelope for it.
+    ///
+    /// Factory Droid documents `SessionStart` stdout as session context and
+    /// parses a JSON stdout's `hookSpecificOutput.additionalContext`, the
+    /// envelope the native hook prints for Claude Code (#1240).
+    ///
+    /// Meta Muse Code injects a `SessionStart` stdout's
+    /// `hookSpecificOutput.additionalContext` as developer context (verified
+    /// offline against Muse Code 1.4.7), so it takes the same envelope.
+    ///
+    /// CodeBuddy Code appends that same envelope to the session (reported
+    /// against v2.164.0–v2.167.0, #1299), so the native hook fetches the
+    /// handoff for it. The fetch stays the built-in SessionStart path; a
+    /// separate `GET /handoff` client is not part of the installer.
+    ///
+    /// Qwen Code injects `hookSpecificOutput.additionalContext` from
+    /// `SessionStart` stdout into the session (Qwen Code hooks reference:
+    /// <https://qwenlm.github.io/qwen-code-docs/en/users/features/hooks/>).
     #[must_use]
     pub fn session_start_injects_handoff(self) -> bool {
         !matches!(
@@ -401,6 +500,12 @@ impl AgentKind {
                 | Self::KimiCode
                 | Self::Hermes
                 | Self::Pool
+                // DSH's bridge runs SessionStart detached, so its stdout
+                // cannot be relied on to deliver a fetched handoff.
+                | Self::Dsh
+                // Cline CLI runs TaskStart/TaskResume detached by default,
+                // so accepting a single-use handoff there would discard it.
+                | Self::Cline
                 | Self::Other
         )
     }
@@ -414,9 +519,77 @@ impl AgentKind {
     /// `session/hooks/user-prompt.ts`, verified in the v0.28.1 source).
     /// Empty stdout injects nothing, so the hook prints the raw handoff body
     /// or nothing at all — never a JSON envelope.
+    ///
+    /// Grok Build also ignores `SessionStart` stdout, and it is not in this
+    /// set. An allowing `UserPromptSubmit` discards stdout and has no
+    /// `additionalContext`. `GET /handoff` marks the handoff accepted, so
+    /// fetching on that event would burn the baton. Grok shows
+    /// `PostToolUse` `additionalContext` to the model; that is
+    /// [`Self::post_tool_injects_handoff`].
     #[must_use]
     pub fn user_prompt_injects_handoff(self) -> bool {
         matches!(self, Self::KimiCode)
+    }
+
+    /// Whether this agent adds a JSON `context` from the native `user-prompt`
+    /// hook's stdout to the upcoming turn.
+    ///
+    /// Hermes Agent ignores `on_session_start` stdout but adds a
+    /// `pre_llm_call` hook's `{"context": "..."}` to the user message, and
+    /// (`agent/turn_context.py`, `agent/shell_hooks.py`, v0.22.2). The hook
+    /// checks every primary-session prompt: a resumed Hermes session reports
+    /// `extra.is_first_turn = false`, but still needs to receive a handoff
+    /// produced while another harness was active.
+    #[must_use]
+    pub fn json_context_user_prompt_injects_handoff(self) -> bool {
+        matches!(self, Self::Hermes)
+    }
+
+    /// Whether this agent adds a `UserPromptSubmit` hook's
+    /// `hookSpecificOutput.additionalContext` to the turn it belongs to.
+    ///
+    /// Claude Code places it alongside the submitted prompt and Codex adds it
+    /// as developer context (both hook references). Qwen Code sends it as a
+    /// tagged text part
+    /// (<https://qwenlm.github.io/qwen-code-docs/en/users/features/hooks/>).
+    /// The compaction recap uses this channel. Grok discards an allowing
+    /// `UserPromptSubmit`'s output, and Kimi Code injects raw stdout rather
+    /// than this envelope, so neither is listed.
+    #[must_use]
+    pub fn user_prompt_injects_context(self) -> bool {
+        matches!(self, Self::ClaudeCode | Self::Codex | Self::QwenCode)
+    }
+
+    /// Whether `PostToolUse` stdout is model-visible context.
+    ///
+    /// Grok Build reads that stdout and delivers `hookSpecificOutput.additionalContext`
+    /// after the tool result (`10-hooks.md`, PostToolUse Output). The handoff
+    /// is accepted on the first such event of a session, not on `SessionStart`
+    /// or `UserPromptSubmit`, because those outputs never reach the model.
+    /// The model sees the handoff after the first tool, not before the first
+    /// prompt. A session that never calls a tool leaves the handoff open for
+    /// `memory_handoff_accept`.
+    #[must_use]
+    pub fn post_tool_injects_handoff(self) -> bool {
+        matches!(self, Self::Grok)
+    }
+
+    /// Whether this agent reuses one session id across a `SessionEnd` and a
+    /// later restart of the same conversation.
+    ///
+    /// Grok does: the same session id comes back after an end, so an already-
+    /// ended receiver row is a live restart, not a corpse, and
+    /// `accept_handoff` reopens it. Kimi Code does too: a resumed session
+    /// reuses the native session id after `SessionEnd` (same shape as Grok;
+    /// observed in production 2026-10). For every other agent an ended
+    /// session is
+    /// final — a late/out-of-order startup fetch must not rebind it to a new
+    /// handoff, so accepting into an ended session stays an error (this is what
+    /// keeps a lifecycle-only receiver from reclaiming after it released and
+    /// ended).
+    #[must_use]
+    pub fn reuses_session_id_after_end(self) -> bool {
+        matches!(self, Self::Grok | Self::KimiCode)
     }
 }
 
@@ -445,6 +618,28 @@ mod tests {
         assert!(PagePath::new("a/../b").is_err());
     }
 
+    /// A UUID native id round-trips as-is; a non-UUID native id (Codex,
+    /// OpenCode) hashes to a deterministic UUID v5, so hook capture and any
+    /// offline tool matching transcripts by native id agree on one key.
+    #[test]
+    fn session_id_from_native_hashes_non_uuid_ids_and_passes_uuids_through() {
+        let uuid_native = "11111111-2222-3333-4444-555555555555";
+        assert_eq!(SessionId::from_native(uuid_native).to_string(), uuid_native);
+
+        let non_uuid_native = "codex-native-id-123";
+        let expected = SessionId(Uuid::new_v5(
+            &Uuid::NAMESPACE_OID,
+            non_uuid_native.as_bytes(),
+        ));
+        assert_eq!(SessionId::from_native(non_uuid_native), expected);
+        // Deterministic: repeated calls (and hence repeated hook deliveries,
+        // or a repeated repair run) must resolve to the same id.
+        assert_eq!(
+            SessionId::from_native(non_uuid_native),
+            SessionId::from_native(non_uuid_native)
+        );
+    }
+
     #[test]
     fn agent_kind_grok_round_trips() {
         assert_eq!(AgentKind::Grok.as_str(), "grok");
@@ -457,9 +652,13 @@ mod tests {
         );
         // Unknown tags still degrade to Other.
         assert_eq!(AgentKind::from_wire("grok-2"), AgentKind::Other);
-        // Grok cannot inject the session-start handoff (ignores hook stdout);
-        // every other agent can.
+        // Grok cannot inject the session-start handoff (ignores hook stdout),
+        // and must not fetch on UserPromptSubmit either (that stdout is discarded).
         assert!(!AgentKind::Grok.session_start_injects_handoff());
+        assert!(!AgentKind::Grok.user_prompt_injects_handoff());
+        assert!(AgentKind::Grok.post_tool_injects_handoff());
+        assert!(!AgentKind::KimiCode.post_tool_injects_handoff());
+        assert!(!AgentKind::ClaudeCode.post_tool_injects_handoff());
         assert!(!AgentKind::Zero.session_start_injects_handoff());
         assert!(AgentKind::ClaudeCode.session_start_injects_handoff());
         assert!(AgentKind::Codex.session_start_injects_handoff());
@@ -505,10 +704,16 @@ mod tests {
         // source), so the handoff is delivered on UserPromptSubmit instead.
         assert!(!AgentKind::KimiCode.session_start_injects_handoff());
         assert!(AgentKind::KimiCode.user_prompt_injects_handoff());
+        // A resumed session reuses the native id after SessionEnd (observed
+        // in production 2026-10), the same shape as Grok's restart.
+        assert!(AgentKind::KimiCode.reuses_session_id_after_end());
+        assert!(AgentKind::Grok.reuses_session_id_after_end());
+        assert!(!AgentKind::ClaudeCode.reuses_session_id_after_end());
+        assert!(!AgentKind::Codex.reuses_session_id_after_end());
     }
 
     #[test]
-    fn agent_kind_hermes_round_trips_without_claiming_handoff_delivery() {
+    fn agent_kind_hermes_round_trips_and_claims_handoffs_on_user_prompts() {
         assert_eq!(AgentKind::Hermes.as_str(), "hermes");
         assert_eq!(AgentKind::from_wire("hermes"), AgentKind::Hermes);
         assert_eq!(AgentKind::from_wire("hermes-agent"), AgentKind::Hermes);
@@ -520,8 +725,19 @@ mod tests {
             serde_json::to_string(&AgentKind::Hermes).unwrap(),
             "\"hermes\""
         );
+        // `on_session_start` stdout is ignored, so the destructive fetch must
+        // not run there; a primary-session `pre_llm_call` carries it instead.
         assert!(!AgentKind::Hermes.session_start_injects_handoff());
         assert!(!AgentKind::Hermes.user_prompt_injects_handoff());
+        assert!(AgentKind::Hermes.json_context_user_prompt_injects_handoff());
+        for other in AgentKind::ALL {
+            if other != AgentKind::Hermes {
+                assert!(
+                    !other.json_context_user_prompt_injects_handoff(),
+                    "{other:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -539,6 +755,189 @@ mod tests {
         // destructive handoff fetch must not happen from its native hook.
         assert!(!AgentKind::Pool.session_start_injects_handoff());
         assert!(!AgentKind::Pool.user_prompt_injects_handoff());
+    }
+
+    #[test]
+    fn agent_kind_dsh_round_trips_without_claiming_handoff_delivery() {
+        assert_eq!(AgentKind::Dsh.as_str(), "dsh");
+        assert_eq!(AgentKind::from_wire("dsh"), AgentKind::Dsh);
+        assert_eq!(AgentKind::from_wire("deepseek-harness"), AgentKind::Dsh);
+        assert_eq!(AgentKind::from_wire("deepseek_harness"), AgentKind::Dsh);
+        // serde uses rename_all = "kebab-case" → "dsh".
+        assert_eq!(serde_json::to_string(&AgentKind::Dsh).unwrap(), "\"dsh\"");
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"dsh\"").unwrap(),
+            AgentKind::Dsh
+        );
+        // Unknown tags still degrade to Other.
+        assert_eq!(AgentKind::from_wire("dsh-2"), AgentKind::Other);
+        // DSH's Claude Code hooks bridge runs SessionStart detached, so the
+        // destructive handoff fetch must not happen from its hook bundle.
+        assert!(!AgentKind::Dsh.session_start_injects_handoff());
+        assert!(!AgentKind::Dsh.user_prompt_injects_handoff());
+    }
+
+    #[test]
+    fn agent_kind_copilot_cli_round_trips_without_claiming_handoff_delivery() {
+        assert_eq!(AgentKind::CopilotCli.as_str(), "copilot-cli");
+        assert_eq!(AgentKind::from_wire("copilot-cli"), AgentKind::CopilotCli);
+        assert_eq!(AgentKind::from_wire("copilot_cli"), AgentKind::CopilotCli);
+        assert_eq!(
+            serde_json::to_string(&AgentKind::CopilotCli).unwrap(),
+            "\"copilot-cli\""
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"copilot-cli\"").unwrap(),
+            AgentKind::CopilotCli
+        );
+        // The bare "copilot" word is deliberately NOT an alias here: it is
+        // already claimed by the unrelated `McpClient::VsCodeCopilot` client
+        // (#1040), and aliasing both to different things would be confusing.
+        assert_eq!(AgentKind::from_wire("copilot"), AgentKind::Other);
+        // Unknown tags still degrade to Other.
+        assert_eq!(AgentKind::from_wire("copilot-cli-2"), AgentKind::Other);
+        // Copilot CLI reads a top-level `additionalContext` at SessionStart,
+        // which the native hook prints for it.
+        assert!(AgentKind::CopilotCli.session_start_injects_handoff());
+        assert!(!AgentKind::CopilotCli.user_prompt_injects_handoff());
+    }
+
+    #[test]
+    fn agent_kind_droid_round_trips() {
+        assert_eq!(AgentKind::Droid.as_str(), "droid");
+        for alias in ["droid", "factory-droid", "factory_droid"] {
+            assert_eq!(AgentKind::from_wire(alias), AgentKind::Droid, "{alias}");
+        }
+        assert_eq!(
+            serde_json::to_string(&AgentKind::Droid).unwrap(),
+            "\"droid\""
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"droid\"").unwrap(),
+            AgentKind::Droid
+        );
+        // The bare vendor name is not an alias, and unknown tags still
+        // degrade to Other.
+        assert_eq!(AgentKind::from_wire("factory"), AgentKind::Other);
+        assert_eq!(AgentKind::from_wire("droid-2"), AgentKind::Other);
+        // Droid reads `hookSpecificOutput.additionalContext` from SessionStart
+        // stdout, so the native hook fetches the handoff there.
+        assert!(AgentKind::Droid.session_start_injects_handoff());
+        assert!(!AgentKind::Droid.user_prompt_injects_handoff());
+        assert!(!AgentKind::Droid.post_tool_injects_handoff());
+        assert!(!AgentKind::Droid.reuses_session_id_after_end());
+    }
+
+    #[test]
+    fn agent_kind_muse_round_trips() {
+        assert_eq!(AgentKind::Muse.as_str(), "muse");
+        for alias in ["muse", "muse-code", "musecode"] {
+            assert_eq!(AgentKind::from_wire(alias), AgentKind::Muse, "{alias}");
+        }
+        assert_eq!(serde_json::to_string(&AgentKind::Muse).unwrap(), "\"muse\"");
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"muse\"").unwrap(),
+            AgentKind::Muse
+        );
+        assert_eq!(AgentKind::from_wire("meta"), AgentKind::Other);
+        assert_eq!(AgentKind::from_wire("muse-2"), AgentKind::Other);
+        // Muse injects SessionStart's `hookSpecificOutput.additionalContext`,
+        // so the native hook fetches the handoff there.
+        assert!(AgentKind::Muse.session_start_injects_handoff());
+        assert!(!AgentKind::Muse.user_prompt_injects_handoff());
+        assert!(!AgentKind::Muse.post_tool_injects_handoff());
+        assert!(!AgentKind::Muse.reuses_session_id_after_end());
+    }
+
+    #[test]
+    fn agent_kind_codebuddy_round_trips_and_injects_session_start_handoff() {
+        assert_eq!(AgentKind::CodeBuddy.as_str(), "codebuddy");
+        for alias in ["codebuddy", "code-buddy"] {
+            assert_eq!(AgentKind::from_wire(alias), AgentKind::CodeBuddy, "{alias}");
+        }
+        assert_eq!(
+            serde_json::to_string(&AgentKind::CodeBuddy).unwrap(),
+            "\"codebuddy\""
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"codebuddy\"").unwrap(),
+            AgentKind::CodeBuddy
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"code-buddy\"").unwrap(),
+            AgentKind::CodeBuddy
+        );
+        assert_eq!(AgentKind::from_wire("codebuddy-2"), AgentKind::Other);
+        assert_eq!(AgentKind::from_wire("tencent"), AgentKind::Other);
+        // CodeBuddy appends SessionStart's hookSpecificOutput.additionalContext
+        // (#1299), so the built-in fetch is the delivery path.
+        assert!(AgentKind::CodeBuddy.session_start_injects_handoff());
+        assert!(!AgentKind::CodeBuddy.user_prompt_injects_handoff());
+        assert!(!AgentKind::CodeBuddy.post_tool_injects_handoff());
+        assert!(!AgentKind::CodeBuddy.reuses_session_id_after_end());
+    }
+
+    #[test]
+    fn agent_kind_ibm_bob_round_trips_and_injects_session_start_handoff() {
+        assert_eq!(AgentKind::IbmBob.as_str(), "ibm-bob");
+        for alias in ["ibm-bob", "bob"] {
+            assert_eq!(AgentKind::from_wire(alias), AgentKind::IbmBob, "{alias}");
+        }
+        assert_eq!(
+            serde_json::to_string(&AgentKind::IbmBob).unwrap(),
+            "\"ibm-bob\""
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"bob\"").unwrap(),
+            AgentKind::IbmBob
+        );
+        assert_eq!(AgentKind::from_wire("bob-shell-2"), AgentKind::Other);
+        assert!(AgentKind::IbmBob.session_start_injects_handoff());
+        assert!(!AgentKind::IbmBob.user_prompt_injects_handoff());
+        assert!(!AgentKind::IbmBob.post_tool_injects_handoff());
+        assert!(!AgentKind::IbmBob.reuses_session_id_after_end());
+    }
+
+    #[test]
+    fn agent_kind_qwen_code_round_trips_and_injects_session_start_handoff() {
+        assert_eq!(AgentKind::QwenCode.as_str(), "qwen-code");
+        for alias in ["qwen-code", "qwen", "qwencode"] {
+            assert_eq!(AgentKind::from_wire(alias), AgentKind::QwenCode, "{alias}");
+        }
+        assert_eq!(
+            serde_json::to_string(&AgentKind::QwenCode).unwrap(),
+            "\"qwen-code\""
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"qwen-code\"").unwrap(),
+            AgentKind::QwenCode
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"qwen\"").unwrap(),
+            AgentKind::QwenCode
+        );
+        assert_eq!(AgentKind::from_wire("qwen-code-2"), AgentKind::Other);
+        assert!(AgentKind::QwenCode.session_start_injects_handoff());
+        assert!(!AgentKind::QwenCode.user_prompt_injects_handoff());
+        assert!(AgentKind::QwenCode.user_prompt_injects_context());
+        assert!(!AgentKind::QwenCode.post_tool_injects_handoff());
+        assert!(!AgentKind::QwenCode.reuses_session_id_after_end());
+    }
+
+    #[test]
+    fn agent_kind_grizzybot_round_trips() {
+        assert_eq!(AgentKind::Grizzybot.as_str(), "grizzybot");
+        assert_eq!(AgentKind::from_wire("grizzybot"), AgentKind::Grizzybot);
+        assert_eq!(AgentKind::from_wire("grizzy-bot"), AgentKind::Grizzybot);
+        assert_eq!(
+            serde_json::to_string(&AgentKind::Grizzybot).unwrap(),
+            "\"grizzybot\""
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"grizzybot\"").unwrap(),
+            AgentKind::Grizzybot
+        );
+        assert_eq!(AgentKind::from_wire("grizzybot-2"), AgentKind::Other);
     }
 
     #[test]
@@ -628,6 +1027,21 @@ mod tests {
     }
 
     #[test]
+    fn user_prompt_context_injection_is_claude_code_codex_and_qwen_code() {
+        for agent in AgentKind::ALL {
+            assert_eq!(
+                agent.user_prompt_injects_context(),
+                matches!(
+                    agent,
+                    AgentKind::ClaudeCode | AgentKind::Codex | AgentKind::QwenCode
+                ),
+                "{}",
+                agent.as_str()
+            );
+        }
+    }
+
+    #[test]
     fn page_path_rejects_backslashes_and_windows_prefixes() {
         assert!(PagePath::new(r"notes\secret.md").is_err());
         assert!(PagePath::new(r"C:\Users\me\secret.md").is_err());
@@ -707,19 +1121,53 @@ mod tests {
             AgentKind::Devin
         );
     }
+
+    #[test]
+    fn session_id_from_native_keeps_uuids_and_hashes_other_ids() {
+        let uuid = SessionId::new();
+        assert_eq!(SessionId::from_native(&uuid.to_string()), uuid);
+        let hashed = SessionId::from_native("agy-session-1");
+        assert_eq!(
+            hashed,
+            SessionId::from_native("agy-session-1"),
+            "deterministic"
+        );
+        assert_eq!(
+            hashed.0,
+            Uuid::new_v5(&Uuid::NAMESPACE_OID, b"agy-session-1"),
+            "the key hook POSTs have always used"
+        );
+    }
 }
 
 /// Names Windows reserves regardless of extension: `CON.md` is still the
-/// console device.
+/// console device. Windows also treats the superscript digits `¹ ² ³` as
+/// port numbers, so `COM¹` is a serial port too.
 const DOS_DEVICE_NAMES: &[&str] = &[
     "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
-    "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+    "com9", "com¹", "com²", "com³", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8",
+    "lpt9", "lpt¹", "lpt²", "lpt³",
 ];
+
+/// Whether `stem` (a file name without its extension) is a DOS device name
+/// Windows resolves to a device instead of a file, compared case-insensitively.
+/// Spaces between the name and its extension are ignored, as Windows ignores
+/// them: `CON .md` is still the console.
+#[must_use]
+pub fn is_dos_device_name(stem: &str) -> bool {
+    DOS_DEVICE_NAMES.contains(&stem.trim_end_matches(' ').to_ascii_lowercase().as_str())
+}
 
 /// Characters Windows refuses in a filename. `/` is the separator and is
 /// handled by the caller; `\\` and a drive prefix are already rejected by
 /// [`PagePath::new`].
 const WINDOWS_RESERVED_CHARS: &[char] = &['<', '>', ':', '"', '|', '?', '*'];
+
+/// Longest file name, in UTF-8 bytes, that every supported filesystem stores.
+/// ext4 and most Linux filesystems cap a name at 255 bytes, NTFS at 255 UTF-16
+/// units; the byte count is never smaller than the UTF-16 count, so it is the
+/// bound both agree on.
+const MAX_PORTABLE_COMPONENT_BYTES: usize = 255;
 
 /// Returns true if a path component is reserved by Git (`.git` case-insensitively,
 /// or an 8.3 short-name alias like `git~1`..`git~4`).
@@ -739,6 +1187,16 @@ fn ensure_portable_component(component: &str, full: &str) -> Result<(), MemoryEr
             "page path {full:?}: component {component:?} {reason}"
         )))
     };
+
+    // NTFS accepts a 100-character CJK name (103 UTF-16 units, 303 bytes)
+    // that ext4 refuses, so a page written on Windows would vanish from a
+    // Linux checkout of the same wiki.
+    if component.len() > MAX_PORTABLE_COMPONENT_BYTES {
+        return invalid(&format!(
+            "is {} bytes long; Linux filesystems refuse a name over {MAX_PORTABLE_COMPONENT_BYTES} bytes",
+            component.len()
+        ));
+    }
 
     if let Some(bad) = component
         .chars()
@@ -762,7 +1220,7 @@ fn ensure_portable_component(component: &str, full: &str) -> Result<(), MemoryEr
     // Device names match on the stem, so `CON`, `CON.md` and `con.markdown`
     // are all the console.
     let stem = component.split('.').next().unwrap_or(component);
-    if DOS_DEVICE_NAMES.contains(&stem.to_ascii_lowercase().as_str()) {
+    if is_dos_device_name(stem) {
         return invalid(&format!(
             "uses the reserved DOS device name {stem:?}; Windows resolves it to a device, not a file"
         ));
@@ -792,6 +1250,10 @@ mod portable_page_path_tests {
             "notes/NUL.md",
             "notes/com1.md",
             "notes/LPT9.txt",
+            "notes/con .md",
+            "notes/NUL  .txt",
+            "notes/COM¹.md",
+            "notes/lpt³.md",
             "notes/trailing./x.md",
             "notes/trailing /x.md",
             "notes/end.md.",
@@ -847,6 +1309,8 @@ mod portable_page_path_tests {
             "sessions/2026-08-22.md",
             "notes/icon.md",
             "notes/console.md",
+            "notes/con x.md",
+            "notes/com10.md",
             "prn-notes/aux-iliary.md",
             "a/b/c/deep.md",
             "notes/dot.in.middle.md",
@@ -885,6 +1349,34 @@ mod portable_page_path_tests {
             assert!(
                 path.ensure_portable().is_ok(),
                 "{raw:?} is portable and must stay writable"
+            );
+        }
+    }
+
+    /// The name limit is counted in UTF-8 bytes, not characters: 85 CJK
+    /// characters plus `.md` is 258 bytes, which Windows stores and Linux
+    /// refuses.
+    #[test]
+    fn components_over_255_bytes_are_rejected() {
+        let ascii_max = format!("notes/{}.md", "a".repeat(252));
+        let cjk_max = format!("notes/{}.md", "日".repeat(84));
+        for raw in [&ascii_max, &cjk_max] {
+            let path = PagePath::new(raw.as_str()).expect("valid path");
+            assert!(
+                path.ensure_portable().is_ok(),
+                "a 255-byte component is portable and must stay writable"
+            );
+        }
+
+        let ascii_over = format!("notes/{}.md", "a".repeat(253));
+        let cjk_over = format!("notes/{}.md", "日".repeat(85));
+        let dir_over = format!("{}/x.md", "é".repeat(128));
+        for raw in [&ascii_over, &cjk_over, &dir_over] {
+            let path =
+                PagePath::new(raw.as_str()).expect("still constructible: reads must keep working");
+            assert!(
+                path.ensure_portable().is_err(),
+                "{raw:?} has a component over 255 bytes and must be refused at write time"
             );
         }
     }
@@ -935,5 +1427,19 @@ mod portable_page_path_tests {
         ] {
             assert_ne!(portable_page_key(a), portable_page_key(b));
         }
+    }
+
+    #[test]
+    fn cline_wire_identity_fails_safe_for_detached_start_hooks() {
+        assert_eq!(
+            super::AgentKind::from_wire("cline"),
+            super::AgentKind::Cline
+        );
+        assert_eq!(
+            super::AgentKind::from_wire("cline-cli"),
+            super::AgentKind::Cline
+        );
+        assert_eq!(super::AgentKind::Cline.as_str(), "cline");
+        assert!(!super::AgentKind::Cline.session_start_injects_handoff());
     }
 }

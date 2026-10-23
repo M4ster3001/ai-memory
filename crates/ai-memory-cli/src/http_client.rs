@@ -12,9 +12,8 @@
 
 use std::fmt;
 use std::io::{BufWriter, Write as _};
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -22,6 +21,9 @@ use serde::de::DeserializeOwned;
 
 use crate::config::{Config, DEFAULT_SERVER_URL};
 use ai_memory_web::normalize_prefix;
+
+/// [`ai_memory_hooks::CLIENT_MARKER_HEADER`] value for CLI subcommands.
+const CLI_CLIENT_KIND: &str = "cli";
 
 /// Non-success response returned by the configured ai-memory server.
 #[derive(Debug)]
@@ -65,6 +67,22 @@ fn server_response_error(
     ServerResponseError {
         method,
         path: url.path().to_owned(),
+        status,
+        body,
+    }
+    .into()
+}
+
+#[cfg(test)]
+pub(crate) fn server_response_error_for_test(
+    method: reqwest::Method,
+    path: &str,
+    status: reqwest::StatusCode,
+    body: String,
+) -> anyhow::Error {
+    ServerResponseError {
+        method,
+        path: path.to_owned(),
         status,
         body,
     }
@@ -136,6 +154,14 @@ impl ServerEndpoint {
             config.server_url_configured(),
             Some(config.base_path.clone()).filter(|s| !s.is_empty()),
         )
+    }
+
+    /// Build for a target the spawning hook already resolved: its URL
+    /// (including any mount path, as `install-hooks` rendered it) and the
+    /// bearer it authenticates with. No config or environment is consulted.
+    #[must_use]
+    pub(crate) fn for_hook_target(url: String, token: Option<String>) -> Self {
+        Self::build(Some(url), token, true, None)
     }
 
     /// Build from an explicit URL + token pair (useful for tests that
@@ -213,8 +239,11 @@ impl ServerEndpoint {
         parsed.as_str().trim_end_matches('/').to_owned()
     }
 
-    /// Apply auth header to a `reqwest::RequestBuilder` if a token is set.
+    /// Mark a request to this server as first-party
+    /// ([`ai_memory_hooks::CLIENT_MARKER_HEADER`]) and attach the bearer when a
+    /// token is set.
     pub(crate) fn authenticate(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let req = req.header(ai_memory_hooks::CLIENT_MARKER_HEADER, CLI_CLIENT_KIND);
         match &self.auth_token {
             Some(t) => req.bearer_auth(t),
             None => req,
@@ -240,6 +269,39 @@ pub(crate) fn split_origin_and_path(raw: &str) -> (String, String) {
         }
     }
     (trimmed.to_string(), String::new())
+}
+
+/// Whether `url` names a server on this machine: an `http`/`https` URL whose
+/// host is `localhost`, an address in `127.0.0.0/8`, or `[::1]`, carrying no
+/// user information.
+///
+/// Parsed the way the HTTP client parses it, so the host checked here is the
+/// host a request would reach. Text before an `@` is user information, not
+/// the host, and a URL that has any is refused outright rather than
+/// interpreted. `localhost.` (trailing dot) is refused too: a fully qualified
+/// name can be answered by a DNS server instead of the local resolver. This
+/// gates the install's own root token (`config.rs`, `mcp-bridge`), so an
+/// unparsable or ambiguous URL is never treated as local.
+pub(crate) fn is_loopback_url(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    if !matches!(parsed.scheme(), "http" | "https")
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return false;
+    }
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    if let Some(v6) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        return v6
+            .parse::<std::net::Ipv6Addr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    }
+    host.parse::<std::net::Ipv4Addr>()
+        .map_or(host == "localhost", |ip| ip.is_loopback())
 }
 
 /// GET `<endpoint>{path}` with optional query params, deserialise JSON.
@@ -370,47 +432,32 @@ fn build_url_with_query(
 }
 
 /// Turn a low-level reqwest connect/timeout error into a friendlier
-/// message that surfaces the resolved server URL. The common case is
-/// "Connection refused" — typically because the CLI defaulted to
-/// loopback on a host that has no local server running.
-fn augment_connect_error(
+/// message that surfaces the resolved server URL. The common cases are
+/// "Connection refused", a connect that never completes, and a peer that
+/// closes before sending an HTTP response. They all mean the same operator
+/// problem: the CLI was pointed at an endpoint where no server answered.
+pub(crate) fn augment_connect_error(
     err: reqwest::Error,
     endpoint: &ServerEndpoint,
     url: &str,
 ) -> anyhow::Error {
-    // Walk the source chain to see if there's a Connection-refused
-    // io::Error buried somewhere. reqwest wraps its errors deeply.
-    let chain_contains_refused = {
-        let mut src: Option<&dyn std::error::Error> = Some(&err);
-        let mut found = false;
-        while let Some(e) = src {
-            if e.to_string().contains("Connection refused")
-                || e.to_string().contains("connection refused")
-            {
-                found = true;
-                break;
-            }
-            src = e.source();
-        }
-        found
-    };
-
-    if chain_contains_refused {
+    if error_chain_indicates_no_answer(&err) {
         let hint = if endpoint.url_configured {
             format!(
-                "\nAI_MEMORY_SERVER_URL is set to {} but nothing answered. \
-                 Check the server is running, the port is reachable from \
-                 this host, and (if remote) any firewall + bearer-token \
-                 config matches.",
+                "\nAI_MEMORY_SERVER_URL is set to {} but nothing answered \
+                 (refused or timed out). Check the server is running, the \
+                 port is reachable from this host, and (if remote) any \
+                 firewall + bearer-token config matches.",
                 endpoint.url
             )
         } else {
             format!(
                 "\nAI_MEMORY_SERVER_URL is NOT set; the CLI defaulted to \
-                 {} and nothing answered. If your server lives on another \
-                 machine (e.g. a homelab), `export AI_MEMORY_SERVER_URL=\
-                 http://<server>:49374` and (if auth is on) \
-                 `export AI_MEMORY_AUTH_TOKEN=<token>` before re-running.",
+                 {} and nothing answered (refused or timed out). If your \
+                 server lives on another machine (e.g. a homelab), `export \
+                 AI_MEMORY_SERVER_URL=http://<server>:49374` and (if auth \
+                 is on) `export AI_MEMORY_AUTH_TOKEN=<token>` before \
+                 re-running.",
                 endpoint.url
             )
         };
@@ -420,11 +467,105 @@ fn augment_connect_error(
     }
 }
 
+/// Whether a request failed because nothing answered — a refused connection
+/// or a timeout — rather than because the server answered with an error.
+pub(crate) fn server_unreachable(err: &anyhow::Error) -> bool {
+    let answered = err
+        .chain()
+        .any(|cause| cause.downcast_ref::<ServerResponseError>().is_some());
+    !answered && err.chain().any(error_chain_indicates_no_answer)
+}
+
+/// Whether an error chain means "nothing answered at the transport layer".
+/// reqwest may classify this as a connect/timeout failure or wrap the socket
+/// error deeply. A peer can also accept and close before the HTTP response,
+/// which is equally unreachable from the caller's perspective.
+fn error_chain_indicates_no_answer(err: &(dyn std::error::Error + 'static)) -> bool {
+    if let Some(req) = err.downcast_ref::<reqwest::Error>()
+        && (req.is_connect() || req.is_timeout())
+    {
+        return true;
+    }
+    let mut src: Option<&dyn std::error::Error> = Some(err);
+    while let Some(e) = src {
+        if let Some(io) = e.downcast_ref::<std::io::Error>()
+            && matches!(
+                io.kind(),
+                std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::TimedOut
+            )
+        {
+            return true;
+        }
+        let wording = e.to_string().to_ascii_lowercase();
+        if wording.contains("connection refused")
+            || wording.contains("connection reset")
+            || wording.contains("connection aborted")
+            || wording.contains("connection closed before message completed")
+            || wording.contains("unexpected eof")
+            || wording.contains("broken pipe")
+            || wording.contains("timed out")
+        {
+            return true;
+        }
+        src = e.source();
+    }
+    false
+}
+
+/// Outcome of a server reachability probe: did anything answer on the
+/// configured endpoint?
+#[derive(Debug)]
+pub(crate) enum ServerProbe {
+    /// The server answered. Any HTTP status counts — a build older than
+    /// `/healthz` still answers 404/405, and what the probe needs to know is
+    /// that something is listening, not that it is healthy.
+    Reachable,
+    /// Nothing answered (connect error or timeout). Carries the underlying
+    /// reqwest error so callers can reuse [`augment_connect_error`]'s
+    /// diagnosis verbatim.
+    Unreachable(reqwest::Error),
+}
+
+/// How long a reachability probe waits for an answer. Short on purpose: the
+/// probe sits on the launch hot path, so an unresponsive host (a homelab down
+/// for maintenance) must be classified in ~2s rather than the OS-level TCP
+/// timeout a plain request would pay.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// GET `{origin}{base}/healthz` with a short timeout to decide whether a
+/// managed launch may proceed without the server.
+///
+/// Any HTTP response — 200 or 404/405 from a pre-`/healthz` server — means
+/// `Reachable`; only connect errors and timeouts mean `Unreachable`. The
+/// probe never inspects the body, so it cannot be wrong about health vs
+/// absence, only about presence.
+pub(crate) async fn probe_server(endpoint: &ServerEndpoint) -> ServerProbe {
+    probe_server_with_timeout(endpoint, PROBE_TIMEOUT).await
+}
+
+async fn probe_server_with_timeout(endpoint: &ServerEndpoint, timeout: Duration) -> ServerProbe {
+    let client = reqwest::Client::new();
+    let url = endpoint.build_url("/healthz");
+    match client.get(&url).timeout(timeout).send().await {
+        Ok(_) => ServerProbe::Reachable,
+        Err(error) => ServerProbe::Unreachable(error),
+    }
+}
+
 /// POST an empty body to `<endpoint>{path}`, streaming the response to `dest`.
 ///
 /// Intended for routes whose response is binary (e.g. `POST /admin/backup`
 /// returns an `application/gzip` tarball). On non-2xx the response body is
-/// consumed and returned as an error string. Returns bytes written.
+/// consumed and returned as an error string. Returns bytes written. A completed
+/// download atomically replaces the destination path; a destination symlink is
+/// replaced rather than modifying the file it points to. Replacement symlinks
+/// and new destinations use private permissions; only existing regular files
+/// retain their permissions.
 ///
 /// # Errors
 /// Returns an error when the connection fails, the response is non-2xx,
@@ -438,9 +579,10 @@ pub async fn post_to_file(endpoint: &ServerEndpoint, path: &str, dest: &Path) ->
         .await
         .map_err(|e| augment_connect_error(e, endpoint, &url))?;
     let mut resp = require_success(reqwest::Method::POST, resp).await?;
-    let file = private_output_file(dest)
-        .with_context(|| format!("creating output file {}", dest.display()))?;
-    let mut writer = BufWriter::new(file);
+    let permissions = checked_output_permissions(dest)?;
+    let mut temporary = private_output_file(dest)
+        .with_context(|| format!("creating temporary output beside {}", dest.display()))?;
+    let mut writer = BufWriter::new(temporary.as_file_mut());
     let mut written = 0_u64;
     while let Some(chunk) = resp
         .chunk()
@@ -455,23 +597,149 @@ pub async fn post_to_file(endpoint: &ServerEndpoint, path: &str, dest: &Path) ->
     writer
         .flush()
         .with_context(|| format!("flushing {}", dest.display()))?;
+    drop(writer);
+    // A failed response must leave the previous archive usable. The temporary
+    // file stays private until the entire response has arrived.
+    if let Some(permissions) = permissions {
+        temporary
+            .as_file()
+            .set_permissions(permissions)
+            .with_context(|| format!("preserving permissions for {}", dest.display()))?;
+    }
+    temporary
+        .as_file()
+        .sync_all()
+        .with_context(|| format!("syncing temporary output beside {}", dest.display()))?;
+    let persisted = temporary
+        .persist(dest)
+        .map_err(|error| error.error)
+        .with_context(|| format!("replacing output file {}", dest.display()))?;
+    persisted
+        .sync_all()
+        .with_context(|| format!("syncing output file {}", dest.display()))?;
+    if let Ok(directory) = std::fs::File::open(output_parent(dest)) {
+        let _ = directory.sync_all();
+    }
     Ok(written)
 }
 
-/// Open a downloaded backup output file with private permissions before the
-/// first response bytes are written. Existing user-selected output files keep
-/// their existing permissions when overwritten.
-fn private_output_file(path: &Path) -> std::io::Result<std::fs::File> {
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    options.open(path)
+/// Atomic replacement still requires permission to write an existing regular
+/// file. Opening without create or truncate checks OS permissions and ACLs
+/// without changing the archive before the response is complete.
+fn checked_output_permissions(dest: &Path) -> Result<Option<std::fs::Permissions>> {
+    match std::fs::symlink_metadata(dest) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Ok(None),
+        Ok(metadata) if metadata.is_file() => {
+            let probe = std::fs::OpenOptions::new()
+                .write(true)
+                .open(dest)
+                .with_context(|| {
+                    format!(
+                        "checking output file write permission for {}",
+                        dest.display()
+                    )
+                })?;
+            drop(probe);
+            Ok(Some(metadata.permissions()))
+        }
+        Ok(metadata) if metadata.is_dir() => {
+            anyhow::bail!("output path is a directory: {}", dest.display());
+        }
+        Ok(_) => anyhow::bail!("output path is not a regular file: {}", dest.display()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).context("reading output file permissions"),
+    }
+}
+
+/// Download beside the destination so publication is an atomic rename on the
+/// same filesystem. NamedTempFile removes an incomplete response on every exit.
+fn private_output_file(path: &Path) -> std::io::Result<tempfile::NamedTempFile> {
+    tempfile::Builder::new()
+        .prefix(".ai-memory-download.")
+        .tempfile_in(output_parent(path))
+}
+
+fn output_parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use super::*;
+
+    /// The host checked must be the host a request reaches: user
+    /// information before an `@` is refused, never read as the host.
+    #[test]
+    fn loopback_url_is_decided_by_the_parsed_host() {
+        for url in [
+            "http://127.0.0.1:49374",
+            "http://localhost:49374/mcp",
+            "http://LOCALHOST:1",
+            "https://localhost",
+            "http://[::1]:49374",
+            "http://[::1]",
+            "http://127.0.0.2:1",
+            "http://127.255.255.254/",
+        ] {
+            assert!(is_loopback_url(url), "{url} is loopback");
+        }
+        for url in [
+            "http://localhost:80@attacker.example/",
+            "http://127.0.0.1:1@evil.example/",
+            "http://u:p@[::1]:49374@evil.example/",
+            "http://user@localhost:49374",
+            "http://user:pw@127.0.0.1:49374",
+            "http://evil.example#@localhost:1",
+            "http://evil.example/?@localhost:1",
+            "http://localhost.evil.example",
+            "http://127.0.0.1.evil.example",
+            "http://localhost.:49374",
+            "http://0.0.0.0:49374",
+            "http://192.168.1.10:49374",
+            "http://[::ffff:127.0.0.1]:49374",
+            "ftp://localhost/",
+            "localhost:49374",
+            "not a url",
+            "",
+        ] {
+            assert!(!is_loopback_url(url), "{url} is not loopback");
+        }
+    }
+
+    #[test]
+    fn only_an_unanswered_request_is_unreachable() {
+        let refused =
+            anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))
+                .context("HTTP request to http://127.0.0.1:1/admin/status failed");
+        assert!(server_unreachable(&refused));
+        let answered = server_response_error_for_test(
+            reqwest::Method::GET,
+            "/admin/status",
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            "down for maintenance".to_owned(),
+        );
+        assert!(!server_unreachable(&answered));
+        assert!(!server_unreachable(&anyhow::anyhow!(
+            "malformed response body"
+        )));
+    }
+
+    #[test]
+    fn output_write_permission_probe_never_truncates_existing_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("backup.tar.gz");
+        std::fs::write(&output, b"previous usable archive").unwrap();
+        assert!(
+            super::checked_output_permissions(&output)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(std::fs::read(&output).unwrap(), b"previous usable archive");
+    }
 
     #[cfg(unix)]
     #[test]
@@ -480,9 +748,13 @@ mod tests {
 
         let temp = tempfile::tempdir().unwrap();
         let output = temp.path().join("backup.tar.gz");
-        private_output_file(&output).unwrap();
+        let temporary = private_output_file(&output).unwrap();
+        assert!(
+            !output.exists(),
+            "download is not published before completion"
+        );
         assert_eq!(
-            std::fs::metadata(output).unwrap().permissions().mode() & 0o777,
+            temporary.as_file().metadata().unwrap().permissions().mode() & 0o777,
             0o600
         );
     }
@@ -736,7 +1008,7 @@ mod tests {
     // ----------------------------------------------------------------
 
     #[test]
-    fn authenticate_no_token_leaves_request_unchanged() {
+    fn authenticate_no_token_sets_only_the_client_marker() {
         let ep = ServerEndpoint::from_pair(None, None);
         let client = reqwest::Client::new();
         // Build a request, authenticate it, then build to inspect.
@@ -748,6 +1020,14 @@ mod tests {
         assert!(
             req.headers().get("authorization").is_none(),
             "no Authorization header expected"
+        );
+        // An unauthenticated server reached by a LAN name refuses a handoff
+        // fetch without the marker, so every CLI request carries it.
+        assert_eq!(
+            req.headers()
+                .get(ai_memory_hooks::CLIENT_MARKER_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("cli")
         );
     }
 
@@ -766,6 +1046,180 @@ mod tests {
             .to_str()
             .unwrap();
         assert_eq!(auth, "Bearer tok123");
+    }
+
+    // ----------------------------------------------------------------
+    // Server reachability probe
+    // ----------------------------------------------------------------
+
+    /// Keep a listener bound and close every accepted connection so parallel
+    /// tests cannot reuse an allegedly closed ephemeral port.
+    fn no_answer_endpoint() -> ServerEndpoint {
+        ServerEndpoint::from_pair(Some(ai_memory_test_support::dead_http_endpoint()), None)
+    }
+
+    #[tokio::test]
+    async fn probe_reports_an_accept_then_close_peer_as_unreachable_with_the_diagnosis() {
+        let endpoint = no_answer_endpoint();
+        let ServerProbe::Unreachable(error) = probe_server(&endpoint).await else {
+            panic!("a peer that closes before responding must be Unreachable");
+        };
+        let url = endpoint.build_url("/workstream/runs");
+        let augmented = augment_connect_error(error, &endpoint, &url);
+        let message = format!("{augmented:#}");
+        assert!(
+            message.contains("could not reach"),
+            "the probe error must feed augment_connect_error: {message}"
+        );
+        assert!(
+            message.contains(&endpoint.url),
+            "the diagnosis names the resolved server URL: {message}"
+        );
+    }
+
+    /// A connect that is accepted but never answered ends as a reqwest
+    /// timeout — the variant windows-latest produces when its firewall
+    /// drops a loopback connect instead of refusing it. The operator
+    /// problem ("nothing at this URL") is identical to a refusal, so the
+    /// diagnosis must be too.
+    #[tokio::test]
+    async fn probe_timeout_error_carries_the_same_reachability_diagnosis() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            // Accept connections and hold them open without answering: the
+            // client's only way out is its own timeout.
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        let endpoint = ServerEndpoint::from_pair(Some(format!("http://{address}")), None);
+
+        let ServerProbe::Unreachable(error) =
+            probe_server_with_timeout(&endpoint, Duration::from_millis(150)).await
+        else {
+            panic!("an accept-and-hold socket must end Unreachable via the probe timeout");
+        };
+        assert!(
+            error.is_timeout(),
+            "accept-and-hold must produce the timeout variant, got: {error}"
+        );
+        let url = endpoint.build_url("/workstream/runs");
+        let augmented = augment_connect_error(error, &endpoint, &url);
+        let message = format!("{augmented:#}");
+        assert!(
+            message.contains("could not reach"),
+            "the timeout variant must keep the reachability diagnosis: {message}"
+        );
+        assert!(
+            message.contains(&endpoint.url),
+            "the diagnosis names the resolved server URL: {message}"
+        );
+    }
+
+    /// The no-answer detection must recognize every platform's wording of
+    /// "nothing answered": the typed io kinds, and the free-text variants
+    /// hyper buries below reqwest on each OS. windows-latest says
+    /// "operation timed out (os error 10060)" where Linux says
+    /// "Connection refused (os error 111)".
+    #[test]
+    fn no_answer_detection_covers_refused_and_timeout_wording() {
+        #[derive(Debug)]
+        struct Wrapped(&'static str);
+        impl std::fmt::Display for Wrapped {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.0)
+            }
+        }
+        impl std::error::Error for Wrapped {}
+
+        assert!(error_chain_indicates_no_answer(&std::io::Error::from(
+            std::io::ErrorKind::ConnectionRefused
+        )));
+        assert!(error_chain_indicates_no_answer(&std::io::Error::from(
+            std::io::ErrorKind::TimedOut
+        )));
+        assert!(error_chain_indicates_no_answer(&Wrapped(
+            "error sending request for url (http://127.0.0.1:49374/healthz): operation timed \
+             out (os error 10060)"
+        )));
+        assert!(error_chain_indicates_no_answer(&Wrapped(
+            "error sending request for url (http://127.0.0.1:49374/healthz): Connection refused \
+             (os error 111)"
+        )));
+        // Unrelated transport failures keep the generic HTTP-failure
+        // message: a decode error answered, it did not go unanswered.
+        assert!(!error_chain_indicates_no_answer(&Wrapped(
+            "error decoding response body"
+        )));
+    }
+
+    /// A server that answers 404 for `/healthz` (older than the route) is
+    /// still reachable: presence, not health, is what the probe decides.
+    #[tokio::test]
+    async fn probe_reports_any_http_answer_as_reachable() {
+        for status in [
+            axum::http::StatusCode::OK,
+            axum::http::StatusCode::NOT_FOUND,
+            axum::http::StatusCode::METHOD_NOT_ALLOWED,
+        ] {
+            let app =
+                axum::Router::new().fallback(axum::routing::get(move || async move { status }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let endpoint = ServerEndpoint::from_pair(Some(format!("http://{address}")), None);
+
+            assert!(matches!(
+                probe_server(&endpoint).await,
+                ServerProbe::Reachable
+            ));
+
+            server.abort();
+        }
+    }
+
+    /// A listener that accepts but never answers must be given up on within
+    /// the probe timeout, not a TCP or default-client timeout.
+    #[tokio::test]
+    async fn probe_gives_up_within_its_own_timeout() {
+        async fn accept_and_hold() -> std::net::SocketAddr {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                // Accept connections, hold them open, and answer nothing —
+                // the streams must outlive the accept so the client's only
+                // way out is its own timeout.
+                let mut held = Vec::new();
+                while let Ok((stream, _)) = listener.accept().await {
+                    held.push(stream);
+                }
+            });
+            address
+        }
+        let address = accept_and_hold().await;
+        let endpoint = ServerEndpoint::from_pair(Some(format!("http://{address}")), None);
+
+        let started = Instant::now();
+        assert!(matches!(
+            probe_server_with_timeout(&endpoint, Duration::from_millis(150)).await,
+            ServerProbe::Unreachable(_)
+        ));
+        let elapsed = started.elapsed();
+        assert!(elapsed >= Duration::from_millis(150), "gave up too early");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the probe timeout, not a transport default, bounds the wait ({elapsed:?})"
+        );
+    }
+
+    /// The production probe stays bounded by design: a homelab down for
+    /// maintenance must be classified in ~2s, never by an OS TCP timeout.
+    #[test]
+    fn probe_timeout_is_bounded_to_about_two_seconds() {
+        assert!(PROBE_TIMEOUT <= Duration::from_secs(2));
+        assert!(!PROBE_TIMEOUT.is_zero());
     }
 
     #[tokio::test]

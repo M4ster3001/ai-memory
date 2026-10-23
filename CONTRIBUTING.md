@@ -53,7 +53,8 @@ cargo deny check                    # dependency policy
 ```
 
 `cargo tf` needs nextest (`cargo install cargo-nextest --locked`); without it,
-`cargo test --workspace --all-targets` is the equivalent and is what CI runs.
+`cargo test --workspace --all-targets` is the equivalent. Linux and macOS CI run the
+same tests with `cargo nextest run --workspace --all-targets --profile ci`.
 If `cargo-deny` or `cargo-audit` are not installed:
 
 ```bash
@@ -77,9 +78,26 @@ Skipped tests still count as "skipped" in the summary, never hidden, and two
 independent things run them anyway: the pre-push hook and CI.
 
 Install the hook once per clone with `scripts/install-git-hooks.sh` (from Git
-Bash on Windows). It appends or updates only ai-memory's managed block in
-`.git/hooks/pre-push`, preserving any existing hook body. Bypass it on a
-work-in-progress branch with `git push --no-verify`.
+Bash on Windows). It can run from the main checkout or a linked worktree;
+both use the shared repository hook directory. Reinstallation replaces
+ai-memory's managed block in place, preserving surrounding user commands and
+their order. If `core.hooksPath` is set, the installer stops before writing;
+integrate the block through your existing hook manager instead. Incomplete or
+duplicate managed markers also stop installation and leave the hook unchanged.
+Bypass it on a work-in-progress branch with `git push --no-verify`.
+
+The managed test block clears Git's repository environment and disables global
+and system Git configuration for Cargo and its children. Fixture commands can
+then use their own repositories without inheriting the checkout being pushed.
+The publishing Git process and other hook code retain their configuration, and
+the block's shell options stay inside it; a failing test run still fails the
+hook even when your own commands follow the block without `set -e`.
+Run the installer again to update an existing installation.
+
+Companions have separate Cargo workspaces. Check each changed companion with
+`cargo fmt`, `cargo clippy --all-targets -- -D warnings`, and `cargo test`, passing
+its `--manifest-path`. Changes to the lifecycle relay also need the real-server
+test documented in [its README](companions/ai-memory-relay/README.md#validation).
 
 Integration tests live in `tests/suite/` per crate and compile into the
 crate's own test harness (declare a new file with `mod name;` in
@@ -96,41 +114,53 @@ subcommand, env var, HTTP/admin endpoint, MCP tool or tool-response field,
 observable bug fix. Internal refactors, dead-code removal, and test-only
 churn are exempt.
 
-This has been the single most-forgotten obligation across review batches,
-so reviewers treat a missing entry as **blocking** — the PR template has a
+This has been the most often forgotten obligation across review batches,
+so reviewers treat a missing entry as **blocking**, and the PR template has a
 checkbox for it. Follow the existing entry style (past-tense summary,
 trailing `([#NNN])` PR/issue reference) and place it under the right
 `### Added` / `### Changed` / `### Fixed` heading.
 
+`CHANGELOG.md` holds the current major line only. Older lines are archived per
+major version in [`docs/changelog/`](docs/changelog/); `bin/release` moves the
+previous major there when it cuts an X.0.0. Released sections are frozen in
+both places, and CI rejects an edit to any of them.
+
 ## Workflow rules (condensed from AGENTS.md)
 
-The full authoritative rules are in [`AGENTS.md`](AGENTS.md) — the single
+The full rules are in [`AGENTS.md`](AGENTS.md), the single
 canonical agent/contributor rules file (`CLAUDE.md` is just a pointer to
 it). Short version:
 
-1. Work milestone by milestone. Do not start M(n+1) until every "Done when"
-   bullet in M(n) passes (see `docs/design-decisions.md`).
-2. No dead code, no half-built features. Stubs are documented with
-   `// M<n> TODO` in the module doc-comment.
+1. Keep changes small and scoped to the task; avoid adjacent feature work.
+2. No dead code or half-built features. Document future work in `docs/`
+   design notes rather than shipping unreachable stubs.
 3. Write tests before claiming done. Parsers, ID derivation, and
    retention/decay math especially.
-4. Do not refactor outside the milestone. Only touch what the current
-   milestone requires.
+4. Avoid opportunistic refactors or speculative abstractions.
 5. Comments explain *why*, never *what*. No comments that restate the line
    above them.
+6. The core stays Rust-only. The server, its built-in web UI and everything
+   it ships build with Cargo alone: no Node, npm, bundler or JavaScript
+   framework. The web UI is server-rendered from askama templates, with at
+   most a small inline vanilla script for progressive enhancement. A UI that
+   needs a JavaScript toolchain, or a client library for another ecosystem
+   (the TypeScript SDK, the Swift macOS app), belongs under `companions/`.
 
 ## Cross-cutting invariants
 
 Never violate any of the invariants in [`AGENTS.md`](AGENTS.md) (see the
-"Rust Engineering Rules" and "Project Maintenance Rules" sections).
+"Cross-cutting invariants" and "Project maintenance rules" sections).
 Highlights for contributors:
 
 - All SQLite writes go through the single writer actor (`WriterHandle`).
-- Config is read once at startup; never call `std::env::var` outside `Config::load`.
+- ai-memory settings are read once by `Config::load()` and passed down.
+  Process and third-party harness environment reads use injectable lookups.
 - Atomic file writes only: tmp + rename + fsync; never write in-place.
-- Every wiki page is namespaced by `(workspace_id, project_id)`.
-- The CLI is always a thin HTTP client to the running server — it never
-  opens the SQLite file or the wiki directory directly.
+- Every wiki page is identified by `(workspace_id, project_id, path)`.
+- Keep server-facing CLI commands thin HTTP clients. Offline lifecycle
+  operations (`reset`, `restore`, `reindex`, and `uninstall --purge-data`)
+  access disk directly and must retain their live-process guards. `backup`
+  uses the running server's online SQLite backup API.
 
 ## Versioning and deprecation policy
 
@@ -151,7 +181,7 @@ than the following major release.
 ### How this affects your PR
 
 - Put your CHANGELOG entry under the heading that matches its semver
-  impact — `### Fixed` for bug fixes, `### Added` for new capabilities,
+  impact: `### Fixed` for bug fixes, `### Added` for new capabilities,
   `### Changed` for altered behaviour. The maintainer reads the
   `[Unreleased]` section to pick the next version number, so a fix filed
   under `Added` (or vice versa) can bump the wrong release.
@@ -159,7 +189,16 @@ than the following major release.
   surface, changed MCP schema), say so explicitly in the PR description
   so it gets the `breaking-change` label and is scheduled for the next
   major instead of blocking patch/minor releases.
-- Bug fixes ship in the next **patch** release, usually promptly —
-  they are not held for feature releases. Small additive features (a new
+- Bug fixes ship in the next **patch** release, usually promptly, and
+  are not held for feature releases. Small additive features (a new
   agent harness, LLM provider, install client) ship in the next
   **minor**.
+- **Pick the base branch from that impact.** A fix targets `main`. A new
+  capability (flag, subcommand, MCP tool, config key, agent harness,
+  provider, companion) targets the standing feature branch, currently
+  `release/3.2`. A fix to code that exists only on the feature branch
+  targets that branch too.
+- **Check what already landed first.** Before opening a PR, look for the
+  issue's closing commit and search `git log origin/main origin/release/3.2`
+  for the feature or fix. A closed issue usually means the work shipped;
+  a PR that redoes it gets closed, however good it is.

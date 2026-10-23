@@ -11,6 +11,15 @@
 //! safety net, decided in `take_staging`. The repository stays open
 //! between commits: reopening it dropped libgit2's index tree cache, so
 //! every commit rebuilt every directory tree.
+//!
+//! The raw hook event ledgers (`log.md`, `log-YYYY-MM.md`) are never staged.
+//! They are append-only logs that reach hundreds of megabytes, git stores each
+//! new version as a whole blob, and nothing reads them back from git; see
+//! [`is_ledger_file`].
+//!
+//! Every repository handle turns on libgit2's fsync for `.git` through a
+//! config file only libgit2 reads, so a crash cannot leave a ref naming an
+//! object whose bytes never reached disk; see [`attach_libgit2_config`].
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -18,7 +27,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use git2::{ErrorCode, IndexAddOption, ObjectType, Repository, Signature};
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use crate::error::{WikiError, WikiResult};
 
@@ -46,15 +55,10 @@ pub struct GitAdapter {
 /// (tree cache included) survives them. `Index` itself is not `Send`.
 struct Open {
     repo: Repository,
-    commits_since_index_write: u32,
     /// HEAD as this adapter last left it; moved by another writer, the
     /// kept index is re-read and the next commit walks.
     head: Option<git2::Oid>,
 }
-
-/// The index file is written after a walk and every this many
-/// path-scoped commits.
-const INDEX_WRITE_EVERY: u32 = 50;
 
 #[derive(Debug, Default)]
 struct Written {
@@ -79,9 +83,18 @@ const UNREPORTED_SAMPLE: usize = 5;
 const RACY_READ_ATTEMPTS: u32 = 4;
 const RACY_READ_BACKOFF: Duration = Duration::from_millis(25);
 
-/// libgit2's "file changed before we could read it": a writer was mid-write.
+/// A staging read that raced a writer outside the commit lock: libgit2's
+/// "file changed before we could read it" (mid-write), or a file that was
+/// listed by the walk but gone by the time libgit2 streamed it in (an `Os`
+/// "failed to read file into stream" — e.g. an atomic writer's temp file
+/// renamed away between the scan and the read). Both settle within
+/// milliseconds; a rescan no longer sees a vanished file.
 fn is_racy_read(e: &git2::Error) -> bool {
-    e.class() == git2::ErrorClass::Filesystem && e.message().contains("changed before")
+    match e.class() {
+        git2::ErrorClass::Filesystem => e.message().contains("changed before"),
+        git2::ErrorClass::Os => e.message().contains("failed to read file into stream"),
+        _ => false,
+    }
 }
 
 /// Writes that reached the tree without a report: a writer bypassed the wiki.
@@ -112,6 +125,281 @@ pub struct Checkpoint {
 enum CommitGit2Error {
     Open(git2::Error),
     Other(git2::Error),
+    Wiki(WikiError),
+}
+
+enum OpenRepositoryError {
+    Git(git2::Error),
+    Wiki(WikiError),
+}
+
+fn open_validated_repository(root: &Path) -> Result<Repository, OpenRepositoryError> {
+    let expected_git_dir =
+        crate::confinement::inspect_git_directory(root).map_err(OpenRepositoryError::Wiki)?;
+    let repo = Repository::open(root).map_err(OpenRepositoryError::Git)?;
+    let workdir = repo.workdir().ok_or_else(|| {
+        OpenRepositoryError::Wiki(WikiError::Confinement {
+            path: root.to_path_buf(),
+            reason: "wiki repository must have a working tree",
+        })
+    })?;
+    let canonical_root = root
+        .canonicalize()
+        .map_err(WikiError::from)
+        .map_err(OpenRepositoryError::Wiki)?;
+    let canonical_workdir = workdir
+        .canonicalize()
+        .map_err(WikiError::from)
+        .map_err(OpenRepositoryError::Wiki)?;
+    let canonical_git_dir = repo
+        .path()
+        .canonicalize()
+        .map_err(WikiError::from)
+        .map_err(OpenRepositoryError::Wiki)?;
+    let canonical_common_dir = repo
+        .commondir()
+        .canonicalize()
+        .map_err(WikiError::from)
+        .map_err(OpenRepositoryError::Wiki)?;
+    let canonical_expected_git_dir = expected_git_dir
+        .canonicalize()
+        .map_err(WikiError::from)
+        .map_err(OpenRepositoryError::Wiki)?;
+    if canonical_workdir != canonical_root {
+        return Err(OpenRepositoryError::Wiki(WikiError::Confinement {
+            path: workdir.to_path_buf(),
+            reason: "wiki repository working directory escapes the wiki root",
+        }));
+    }
+    if canonical_git_dir != canonical_expected_git_dir
+        || canonical_common_dir != canonical_expected_git_dir
+    {
+        return Err(OpenRepositoryError::Wiki(WikiError::Confinement {
+            path: repo.path().to_path_buf(),
+            reason: "wiki repository metadata escapes the in-root .git directory",
+        }));
+    }
+    attach_libgit2_config(&repo).map_err(OpenRepositoryError::Git)?;
+    Ok(repo)
+}
+
+fn map_open_error(error: OpenRepositoryError) -> WikiError {
+    match error {
+        OpenRepositoryError::Git(error) => map_git_err(error),
+        OpenRepositoryError::Wiki(error) => error,
+    }
+}
+
+/// The validated repository, or `None` when libgit2 cannot open it and the
+/// Windows git CLI fallback will serve it instead.
+fn validate_repository_or_allow_cli_fallback(root: &Path) -> WikiResult<Option<Repository>> {
+    match open_validated_repository(root) {
+        Ok(repo) => Ok(Some(repo)),
+        Err(OpenRepositoryError::Git(error))
+            if cfg!(windows) && should_try_commit_cli_fallback(&error) =>
+        {
+            validate_cli_fallback_root(root).map(|()| None)
+        }
+        Err(error) => Err(map_open_error(error)),
+    }
+}
+
+/// The config key that makes libgit2 fsync each loose object, ref and reflog
+/// (and the directory it lands in) before renaming it into place.
+const FSYNC_OBJECT_FILES: &str = "core.fsyncObjectFiles";
+
+/// Config file in the wiki's `.git` that only libgit2 reads: git looks for
+/// `config` (and `config.worktree`) there, never for this name.
+const LIBGIT2_CONFIG_FILE: &str = "ai-memory.gitconfig";
+
+const LIBGIT2_CONFIG: &str = "\
+# Written by ai-memory and read only by its libgit2 handles (#1511).
+[core]
+\tfsyncObjectFiles = true
+";
+
+/// Write [`LIBGIT2_CONFIG_FILE`] into the wiki's `.git` unless it already
+/// holds [`LIBGIT2_CONFIG`]. Runs once per adapter, at startup.
+fn write_libgit2_config(git_dir: &Path) -> WikiResult<()> {
+    let path = git_dir.join(LIBGIT2_CONFIG_FILE);
+    if std::fs::read(&path).is_ok_and(|bytes| bytes == LIBGIT2_CONFIG.as_bytes()) {
+        return Ok(());
+    }
+    // Inside `.git`, which a commit never stages, so there is nothing to report.
+    #[allow(clippy::disallowed_methods)]
+    crate::atomic::write_atomic(&path, LIBGIT2_CONFIG.as_bytes())?;
+    Ok(())
+}
+
+/// Give this handle libgit2's fsync for `.git`, unless the repository's own
+/// config turns it off.
+///
+/// libgit2 writes objects and refs to a temp file and renames it, without
+/// fsync by default. After a crash the rename, and the ref update that names
+/// the new commit, can survive while the object's bytes never reached disk:
+/// zero-length loose objects and a HEAD that no longer reads, so every later
+/// checkpoint fails (#1511). The process-wide `GIT_OPT_ENABLE_FSYNC_GITDIR`
+/// covers the same writes, but git2 has no safe wrapper for it and the
+/// workspace forbids `unsafe`. Writing the key to `.git/config` would make the
+/// git CLI warn that it is deprecated on every command an operator runs in the
+/// wiki, so it goes in [`LIBGIT2_CONFIG_FILE`], added to this handle's live
+/// config at the app level.
+///
+/// Why this reaches the fsync decision (vendored libgit2 1.9.3):
+/// `Repository::config` returns the handle's own config object, not a
+/// snapshot, and libgit2 reads `core.fsyncObjectFiles` from that object
+/// through the configmap cache when it first loads the object database
+/// (`git_odb__set_caps`) and the refdb (`refdb_fs` backend). Opening a
+/// repository loads neither, so the cached value is still unset here; this
+/// runs before any caller touches the handle.
+///
+/// The app level outranks every file git itself reads, so an explicit
+/// `false` in `.git/config` is checked first and kept. The app backend also
+/// becomes the handle's preferred writer; ai-memory never writes config
+/// through a handle.
+fn attach_libgit2_config(repo: &Repository) -> Result<(), git2::Error> {
+    let mut config = repo.config()?;
+    let local = match config.open_level(git2::ConfigLevel::Local) {
+        Ok(local) => local.get_bool(FSYNC_OBJECT_FILES).ok(),
+        Err(error) if error.code() == ErrorCode::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    if local == Some(false) {
+        return Ok(());
+    }
+    config.add_file(
+        &repo.path().join(LIBGIT2_CONFIG_FILE),
+        git2::ConfigLevel::App,
+        false,
+    )
+}
+
+/// `Ok` when HEAD is unborn (a fresh repository) or resolves to a commit
+/// whose tree reads back; the error otherwise, such as libgit2's
+/// "failed to parse loose object" for an object a crash left empty.
+fn readable_head(repo: &Repository) -> Result<(), git2::Error> {
+    let head = match repo.head() {
+        Ok(head) => head,
+        Err(error) if matches!(error.code(), ErrorCode::UnbornBranch | ErrorCode::NotFound) => {
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    head.peel_to_commit()?.tree()?;
+    Ok(())
+}
+
+/// Startup checks on the wiki repository. Neither fails the server: the
+/// markdown on disk is the source of truth and keeps being served, but a
+/// history that cannot take a commit is reported once, loudly, instead of
+/// only as a warning from each checkpoint that fails.
+fn check_repository_durability(root: &Path, repo: &Repository) {
+    match repo
+        .config()
+        .and_then(|config| config.get_bool(FSYNC_OBJECT_FILES))
+    {
+        Ok(true) => {}
+        Ok(false) => warn!(
+            root = %root.display(),
+            "{FSYNC_OBJECT_FILES} is false in the wiki repository's config; a crash can leave \
+             its history with empty objects"
+        ),
+        Err(error) => warn!(
+            root = %root.display(),
+            %error,
+            "could not read the wiki repository's fsync setting; a crash can leave its history \
+             with empty objects"
+        ),
+    }
+    if let Err(error) = readable_head(repo) {
+        error!(
+            root = %root.display(),
+            %error,
+            "wiki git history is unreadable: HEAD does not resolve to a readable commit, so \
+             every checkpoint will fail until it is repaired. Pages on disk are not affected. \
+             See \"Wiki git history unreadable after a crash\" in docs/lifecycle-ops.md"
+        );
+    }
+}
+
+fn validate_cli_fallback_root(root: &Path) -> WikiResult<()> {
+    let git_dir = crate::confinement::inspect_git_directory(root)?;
+    crate::confinement::inspect_tree_except(root, &[git_dir.as_path()])?;
+    let worktree = git_resolved_path(root, "--show-toplevel")?;
+    let resolved_git_dir = git_resolved_path(root, "--absolute-git-dir")?;
+    let common_dir = git_resolved_path(root, "--git-common-dir")?;
+    validate_resolved_repository_paths(root, &git_dir, &worktree, &resolved_git_dir, &common_dir)
+}
+
+fn git_resolved_path(root: &Path, argument: &str) -> WikiResult<PathBuf> {
+    let output = git_command(root)
+        .args(["rev-parse", "--path-format=absolute", argument])
+        .output()?;
+    if !output.status.success() {
+        return Err(WikiError::Io(std::io::Error::other(format!(
+            "git repository validation exited with status {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ))));
+    }
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let path = PathBuf::from(raw.trim());
+    if path.as_os_str().is_empty() {
+        return Err(WikiError::Confinement {
+            path: root.to_path_buf(),
+            reason: "git CLI returned an empty repository path",
+        });
+    }
+    if !path.is_absolute() {
+        return Err(WikiError::Confinement {
+            path,
+            reason: "git CLI returned a non-absolute repository path",
+        });
+    }
+    Ok(path)
+}
+
+fn validate_resolved_repository_paths(
+    root: &Path,
+    expected_git_dir: &Path,
+    worktree: &Path,
+    git_dir: &Path,
+    common_dir: &Path,
+) -> WikiResult<()> {
+    let canonical_root = root.canonicalize()?;
+    let canonical_expected_git_dir = expected_git_dir.canonicalize()?;
+    let canonical_worktree = worktree.canonicalize()?;
+    let canonical_git_dir = git_dir.canonicalize()?;
+    let canonical_common_dir = common_dir.canonicalize()?;
+    if canonical_worktree != canonical_root {
+        return Err(WikiError::Confinement {
+            path: worktree.to_path_buf(),
+            reason: "git CLI resolved a working directory outside the wiki root",
+        });
+    }
+    if canonical_git_dir != canonical_expected_git_dir
+        || canonical_common_dir != canonical_expected_git_dir
+    {
+        return Err(WikiError::Confinement {
+            path: git_dir.to_path_buf(),
+            reason: "git CLI resolved metadata outside the in-root .git directory",
+        });
+    }
+    Ok(())
+}
+
+fn git_command(root: &Path) -> std::process::Command {
+    let mut command = std::process::Command::new("git");
+    command
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        .arg("-C")
+        .arg(root); // lgtm [rust/command-line-injection]
+    command
 }
 
 impl GitAdapter {
@@ -121,13 +409,18 @@ impl GitAdapter {
     /// # Errors
     /// Propagates any underlying libgit2 error.
     pub fn open_or_init(root: &Path) -> WikiResult<Self> {
-        std::fs::create_dir_all(root)?;
-        match Repository::open(root) {
+        crate::confinement::initialize_root(root)?;
+        match std::fs::symlink_metadata(root.join(".git")) {
             Ok(_) => debug!(root = %root.display(), "wiki repo already initialised"),
-            Err(_) => {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 debug!(root = %root.display(), "initialising wiki repo");
                 init_repo(root)?;
             }
+            Err(error) => return Err(error.into()),
+        }
+        write_libgit2_config(&crate::confinement::inspect_git_directory(root)?)?;
+        if let Some(repo) = validate_repository_or_allow_cli_fallback(root)? {
+            check_repository_durability(root, &repo);
         }
         Ok(Self {
             root: root.to_path_buf(),
@@ -217,25 +510,55 @@ impl GitAdapter {
     /// # Errors
     /// Propagates any underlying libgit2 error.
     pub fn commit_all(&self, message: &str) -> WikiResult<Option<git2::Oid>> {
-        match self.commit_all_git2(message) {
+        self.commit_all_with_fallback(message, commit_all_fallback)
+    }
+
+    fn commit_all_with_fallback<F>(
+        &self,
+        message: &str,
+        fallback: F,
+    ) -> WikiResult<Option<git2::Oid>>
+    where
+        F: FnOnce(&Path, &str, git2::Error) -> WikiResult<Option<git2::Oid>>,
+    {
+        // One hold of the commit lock spans the confinement walk and the
+        // commit. Our own commit activity churns `.git` lock and temp
+        // files and atomic temp names in the tree; a walk beside it saw
+        // entries that vanished between read_dir and stat. Writers we do
+        // not serialize (the git CLI, a second adapter) remain covered by
+        // the walk's own vanish tolerance.
+        let mut slot = self.writing();
+        let git_dir = crate::confinement::inspect_git_directory(&self.root)?;
+        crate::confinement::inspect_tree_except(&self.root, &[git_dir.as_path()])?;
+        match self.commit_all_git2(&mut slot, message) {
             Ok(result) => Ok(result),
-            Err(CommitGit2Error::Open(e)) if should_try_commit_cli_fallback(&e) => {
-                commit_all_fallback(&self.root, message, e)
-            }
-            Err(CommitGit2Error::Open(e) | CommitGit2Error::Other(e)) => Err(map_git_err(e)),
+            Err(CommitGit2Error::Open(error)) => commit_open_error_with_fallback_on(
+                cfg!(windows),
+                &self.root,
+                message,
+                error,
+                fallback,
+            ),
+            Err(CommitGit2Error::Other(error)) => Err(map_git_err(error)),
+            Err(CommitGit2Error::Wiki(error)) => Err(error),
         }
     }
 
-    fn commit_all_git2(&self, message: &str) -> Result<Option<git2::Oid>, CommitGit2Error> {
-        let mut slot = self.commit_lock.lock().unwrap_or_else(|e| e.into_inner());
+    /// Called with the commit lock already held by
+    /// [`commit_all_with_fallback`]; `slot` is that lock's payload.
+    fn commit_all_git2(
+        &self,
+        slot: &mut Option<Open>,
+        message: &str,
+    ) -> Result<Option<git2::Oid>, CommitGit2Error> {
         if slot.is_none() {
-            let repo = Repository::open(&self.root).map_err(CommitGit2Error::Open)?;
-            *slot = Some(Open {
-                repo,
-                commits_since_index_write: 0,
-                head: None,
-            });
+            let repo = open_validated_repository(&self.root).map_err(|error| match error {
+                OpenRepositoryError::Git(error) => CommitGit2Error::Open(error),
+                OpenRepositoryError::Wiki(error) => CommitGit2Error::Wiki(error),
+            })?;
+            *slot = Some(Open { repo, head: None });
         }
+        crate::confinement::inspect_git_directory(&self.root).map_err(CommitGit2Error::Wiki)?;
         let open = slot.as_mut().expect("opened above");
         let head_now = open.repo.head().ok().and_then(|h| h.target());
         if open.head.is_some() && open.head != head_now {
@@ -328,15 +651,11 @@ impl GitAdapter {
 
     fn commit_staged(
         &self,
-        open: &mut Open,
+        open: &Open,
         message: &str,
         staging: &Staging,
     ) -> Result<Option<git2::Oid>, CommitGit2Error> {
-        let Open {
-            repo,
-            commits_since_index_write,
-            ..
-        } = open;
+        let repo = &open.repo;
         let mut index = repo.index().map_err(CommitGit2Error::Other)?;
         // Stage through libgit2's stat cache: an entry whose size and mtime
         // are unchanged keeps its cached blob OID and is not re-read, so a
@@ -348,7 +667,12 @@ impl GitAdapter {
         // and hash every file again, once.
         let touched = match staging {
             Staging::Everything => {
-                let walked = stage_working_tree(&mut index).map_err(CommitGit2Error::Other)?;
+                let walked =
+                    stage_working_tree(&self.root, &mut index).map_err(CommitGit2Error::Other)?;
+                // The walk only skips ledgers it would add or update; one a
+                // past version already tracks, and that has not changed, is
+                // not offered to it at all.
+                untrack_ledgers(&self.root, &mut index, None).map_err(CommitGit2Error::Other)?;
                 self.record_walk(&walked);
                 walked.len()
             }
@@ -356,19 +680,6 @@ impl GitAdapter {
                 stage_paths(&self.root, &mut index, paths).map_err(CommitGit2Error::Other)?
             }
         };
-        // The index file is the stat cache across restarts; serializing it
-        // costs the size of the tree, so not per commit.
-        let write_index = match staging {
-            Staging::Everything => true,
-            Staging::Paths(_) => {
-                *commits_since_index_write += 1;
-                *commits_since_index_write >= INDEX_WRITE_EVERY
-            }
-        };
-        if write_index {
-            index.write().map_err(CommitGit2Error::Other)?;
-            *commits_since_index_write = 0;
-        }
         debug!(
             touched,
             walked = matches!(staging, Staging::Everything),
@@ -382,11 +693,17 @@ impl GitAdapter {
                     "index could not be written as a tree; re-hashing the working tree (#594)"
                 );
                 index.clear().map_err(CommitGit2Error::Other)?;
-                stage_working_tree(&mut index).map_err(CommitGit2Error::Other)?;
+                stage_working_tree(&self.root, &mut index).map_err(CommitGit2Error::Other)?;
                 index.write().map_err(CommitGit2Error::Other)?;
                 index.write_tree().map_err(CommitGit2Error::Other)?
             }
         };
+        // Every commit, including the one with nothing to commit, leaves the
+        // index file matching the tree: another process (the git CLI, an
+        // editor, a backup) reads the file, and a stale one shows the
+        // checkpointed pages as both staged and unstaged (#983). Written
+        // after `write_tree`, it also carries the tree cache.
+        index.write().map_err(CommitGit2Error::Other)?;
 
         // If the index matches HEAD, there is nothing to commit.
         if let Ok(head) = repo.head()
@@ -424,20 +741,32 @@ impl GitAdapter {
         Ok(Some(oid))
     }
 
-    /// Count commits reachable from HEAD. Returns 0 for an empty repo.
+    /// Count commits reachable from HEAD. Returns 0 for an empty or unreadable repo.
     /// Useful for the test suite + for `ai-memory status`.
     #[must_use]
     pub fn commit_count(&self) -> usize {
-        let Ok(repo) = Repository::open(&self.root) else {
-            return commit_count_fallback(&self.root);
+        self.commit_count_checked().unwrap_or(0)
+    }
+
+    pub(crate) fn commit_count_checked(&self) -> WikiResult<usize> {
+        let repo = match open_validated_repository(&self.root) {
+            Ok(repo) => repo,
+            Err(OpenRepositoryError::Git(error)) => {
+                #[cfg(windows)]
+                if should_try_commit_cli_fallback(&error) {
+                    return commit_count_fallback_checked(&self.root);
+                }
+                return Err(map_git_err(error));
+            }
+            Err(OpenRepositoryError::Wiki(error)) => return Err(error),
         };
         let Ok(mut walk) = repo.revwalk() else {
-            return 0;
+            return Ok(0);
         };
         if walk.push_head().is_err() {
-            return 0;
+            return Ok(0);
         }
-        walk.count()
+        Ok(walk.count())
     }
 
     /// Return the most recent commits reachable from HEAD.
@@ -447,13 +776,20 @@ impl GitAdapter {
     /// # Errors
     /// Propagates any underlying libgit2 error.
     pub fn recent_checkpoints(&self, limit: usize) -> WikiResult<Vec<Checkpoint>> {
+        let repo = match open_validated_repository(&self.root) {
+            Ok(repo) => repo,
+            Err(OpenRepositoryError::Git(error)) => {
+                #[cfg(windows)]
+                if should_try_commit_cli_fallback(&error) {
+                    return recent_checkpoints_fallback(&self.root, limit, error);
+                }
+                return Err(map_git_err(error));
+            }
+            Err(OpenRepositoryError::Wiki(error)) => return Err(error),
+        };
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let repo = match Repository::open(&self.root) {
-            Ok(repo) => repo,
-            Err(e) => return recent_checkpoints_fallback(&self.root, limit, map_git_err(e)),
-        };
         let mut walk = repo.revwalk().map_err(map_git_err)?;
         if walk.push_head().is_err() {
             return Ok(Vec::new());
@@ -476,6 +812,62 @@ impl GitAdapter {
         Ok(out)
     }
 
+    /// Return up to `limit` commits, newest first, that changed the file at
+    /// `path` (relative to the repo root), including the commit that deleted
+    /// it. At most `max_walk` commits are inspected, so a page untouched for a
+    /// long history costs a bounded walk rather than the whole repository.
+    ///
+    /// # Errors
+    /// Propagates any underlying libgit2 error.
+    pub fn path_checkpoints(
+        &self,
+        path: &Path,
+        limit: usize,
+        max_walk: usize,
+    ) -> WikiResult<Vec<Checkpoint>> {
+        let repo = open_validated_repository(&self.root).map_err(|error| match error {
+            OpenRepositoryError::Git(error) => map_git_err(error),
+            OpenRepositoryError::Wiki(error) => error,
+        })?;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut walk = repo.revwalk().map_err(map_git_err)?;
+        if walk.push_head().is_err() {
+            return Ok(Vec::new());
+        }
+        let blob_at = |commit: &git2::Commit<'_>| {
+            commit
+                .tree()
+                .ok()
+                .and_then(|tree| tree.get_path(path).ok())
+                .map(|entry| entry.id())
+        };
+        let mut out = Vec::new();
+        for oid in walk.take(max_walk) {
+            let oid = oid.map_err(map_git_err)?;
+            let commit = repo.find_commit(oid).map_err(map_git_err)?;
+            let parent_blob = commit.parent(0).ok().and_then(|p| blob_at(&p));
+            if blob_at(&commit) == parent_blob {
+                continue;
+            }
+            out.push(Checkpoint {
+                oid: oid.to_string(),
+                summary: commit
+                    .summary()
+                    .ok()
+                    .flatten()
+                    .unwrap_or("(no summary)")
+                    .to_string(),
+                time: commit.time().seconds(),
+            });
+            if out.len() >= limit {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
     /// Read `path` as it existed at `rev`.
     ///
     /// `path` is relative to the wiki repo root. The returned bytes are the
@@ -484,9 +876,16 @@ impl GitAdapter {
     /// # Errors
     /// Returns [`WikiError`] when the revision, path, or blob cannot be read.
     pub fn file_at_rev(&self, rev: &str, path: &Path) -> WikiResult<Vec<u8>> {
-        let repo = match Repository::open(&self.root) {
+        let repo = match open_validated_repository(&self.root) {
             Ok(repo) => repo,
-            Err(e) => return file_at_rev_fallback(&self.root, rev, path, map_git_err(e)),
+            Err(OpenRepositoryError::Git(error)) => {
+                #[cfg(windows)]
+                if should_try_commit_cli_fallback(&error) {
+                    return file_at_rev_fallback(&self.root, rev, path, map_git_err(error));
+                }
+                return Err(map_git_err(error));
+            }
+            Err(OpenRepositoryError::Wiki(error)) => return Err(error),
         };
         let object = repo.revparse_single(rev).map_err(map_git_err)?;
         let commit = object.peel_to_commit().map_err(map_git_err)?;
@@ -513,6 +912,16 @@ impl GitAdapter {
 /// read it" would drop the commit).
 #[allow(clippy::disallowed_methods)]
 impl GitAdapter {
+    fn confined(&self, path: &Path, prepare: crate::confinement::Prepare) -> WikiResult<PathBuf> {
+        let relative = path
+            .strip_prefix(&self.root)
+            .map_err(|_| WikiError::Confinement {
+                path: path.to_path_buf(),
+                reason: "path is outside the wiki root",
+            })?;
+        crate::confinement::tree_path(&self.root, relative, prepare)
+    }
+
     fn writing(&self) -> MutexGuard<'_, Option<Open>> {
         self.commit_lock.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -523,8 +932,9 @@ impl GitAdapter {
     /// Propagates the filesystem error.
     pub fn write_atomic(&self, path: &Path, bytes: &[u8]) -> WikiResult<()> {
         let _writing = self.writing();
-        crate::atomic::write_atomic(path, bytes)?;
-        self.mark_written(path);
+        let path = self.confined(path, crate::confinement::Prepare::Parents)?;
+        crate::atomic::write_atomic(&path, bytes)?;
+        self.mark_written(&path);
         Ok(())
     }
 
@@ -533,10 +943,11 @@ impl GitAdapter {
         &self,
         tmp: tempfile::NamedTempFile,
         path: &Path,
-    ) -> Result<std::fs::File, tempfile::PersistError> {
+    ) -> WikiResult<std::fs::File> {
         let _writing = self.writing();
-        let file = crate::atomic::persist_with_retry(tmp, path)?;
-        self.mark_written(path);
+        let path = self.confined(path, crate::confinement::Prepare::Parents)?;
+        let file = crate::atomic::persist_with_retry(tmp, &path)?;
+        self.mark_written(&path);
         Ok(file)
     }
 
@@ -545,20 +956,21 @@ impl GitAdapter {
     /// # Errors
     /// Propagates the filesystem error.
     pub fn append(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        self.append_checked(path, bytes)
+            .map_err(crate::error::into_io_error)
+    }
+
+    pub(crate) fn append_checked(&self, path: &Path, bytes: &[u8]) -> WikiResult<()> {
         let _writing = self.writing();
         use std::io::Write as _;
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent)?;
-        }
+        let path = self.confined(path, crate::confinement::Prepare::Parents)?;
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(path)?;
+            .open(&path)?; // lgtm [rust/path-injection]
         file.write_all(bytes)?;
         file.sync_data()?;
-        self.mark_written(path);
+        self.mark_written(&path);
         Ok(())
     }
 
@@ -567,10 +979,17 @@ impl GitAdapter {
     /// # Errors
     /// Propagates the filesystem error.
     pub fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+        self.rename_checked(from, to)
+            .map_err(crate::error::into_io_error)
+    }
+
+    pub(crate) fn rename_checked(&self, from: &Path, to: &Path) -> WikiResult<()> {
         let _writing = self.writing();
-        std::fs::rename(from, to)?;
-        self.mark_written(from);
-        self.mark_written(to);
+        let from = self.confined(from, crate::confinement::Prepare::Inspect)?;
+        let to = self.confined(to, crate::confinement::Prepare::Parents)?;
+        std::fs::rename(&from, &to)?;
+        self.mark_written(&from);
+        self.mark_written(&to);
         Ok(())
     }
 
@@ -579,9 +998,15 @@ impl GitAdapter {
     /// # Errors
     /// Propagates the filesystem error.
     pub fn remove_file(&self, path: &Path) -> std::io::Result<()> {
+        self.remove_file_checked(path)
+            .map_err(crate::error::into_io_error)
+    }
+
+    pub(crate) fn remove_file_checked(&self, path: &Path) -> WikiResult<()> {
         let _writing = self.writing();
-        std::fs::remove_file(path)?;
-        self.mark_written(path);
+        let path = self.confined(path, crate::confinement::Prepare::Inspect)?;
+        std::fs::remove_file(&path)?; // lgtm [rust/path-injection]
+        self.mark_written(&path);
         Ok(())
     }
 
@@ -590,9 +1015,15 @@ impl GitAdapter {
     /// # Errors
     /// Propagates the filesystem error.
     pub fn remove_dir_all(&self, path: &Path) -> std::io::Result<()> {
+        self.remove_dir_all_checked(path)
+            .map_err(crate::error::into_io_error)
+    }
+
+    pub(crate) fn remove_dir_all_checked(&self, path: &Path) -> WikiResult<()> {
         let _writing = self.writing();
-        std::fs::remove_dir_all(path)?;
-        self.mark_written(path);
+        let path = self.confined(path, crate::confinement::Prepare::Inspect)?;
+        std::fs::remove_dir_all(&path)?;
+        self.mark_written(&path);
         Ok(())
     }
 }
@@ -606,17 +1037,100 @@ pub(crate) fn slash_path(rel: &Path) -> String {
 /// entries, drop deleted ones, add untracked files. libgit2 does all three
 /// from one index-to-workdir diff. Returns the paths touched; does not
 /// write the index file.
-fn stage_working_tree(index: &mut git2::Index) -> Result<Vec<PathBuf>, git2::Error> {
+///
+/// Ledgers are skipped: a positive return from the callback leaves that path
+/// alone, neither added nor refreshed.
+fn stage_working_tree(root: &Path, index: &mut git2::Index) -> Result<Vec<PathBuf>, git2::Error> {
     let mut touched = Vec::new();
     index.add_all(
         ["*"].iter(),
         IndexAddOption::DEFAULT,
         Some(&mut |path: &Path, _: &[u8]| {
+            if is_ledger_file(root, path) || is_in_flight_write(path) {
+                return 1;
+            }
             touched.push(path.to_path_buf());
             0
         }),
     )?;
     Ok(touched)
+}
+
+/// True when `rel`'s basename belongs to a write still in flight: a
+/// `.ai-memory-tmp.` staging file or a `.ai-memory-delete.` parked page.
+///
+/// These exist only between a write starting and its rename, so committing one
+/// records a page body that may never be installed. `Wiki::apply_batch` holds
+/// one staging file per page across an `await`, and `commit_all` takes only the
+/// commit lock, never the mutation lock, so a checkpoint can land in that
+/// window. A parked page is also reported by name: `rename_checked` marks the
+/// `.ai-memory-delete.` quarantine and the `.ai-memory-tmp.move-session.` name
+/// written, so the reported-file branch of [`stage_paths`] checks this too.
+/// The watcher drops both for its own reasons: `is_tempfile` matches the
+/// `.ai-memory-tmp.` prefix, and a quarantine name carries no `.md` suffix.
+fn is_in_flight_write(rel: &Path) -> bool {
+    rel.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name.starts_with(".ai-memory-tmp.") || name.starts_with(".ai-memory-delete.")
+        })
+}
+
+/// True when `rel` (relative to the wiki root) is a raw hook event ledger:
+/// a `log.md` / `log-YYYY-MM.md` file whose content also opens with a hook log
+/// entry.
+///
+/// Both halves are needed, as everywhere else a ledger is recognized
+/// ([`crate::ledger`]): an ordinary page may be named `log-2026-09.md`, and it
+/// must stay versioned. The content half reads at most
+/// `GATE_PREFIX_BYTES` from the file, so a ledger of any size costs one small
+/// read per commit.
+///
+/// Why this is not a `.gitignore` or `info/exclude` entry: those match names,
+/// so one entry would also hide an ordinary page that wears a ledger's name,
+/// and the entry would outlive the file's being a ledger.
+fn is_ledger_file(root: &Path, rel: &Path) -> bool {
+    rel.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(ai_memory_core::log_ledger::is_log_ledger_path)
+        && crate::ledger::opens_with_log_ledger(&root.join(rel))
+}
+
+/// Drop ledgers that earlier versions committed from the index, under the
+/// directory `under` (a `/`-separated path) or everywhere when it is `None`.
+/// The files stay on disk: only the index entry goes, so the next commit's tree
+/// no longer names them and they stop growing the repository. Their old blobs
+/// remain in history. Returns how many entries were dropped.
+fn untrack_ledgers(
+    root: &Path,
+    index: &mut git2::Index,
+    under: Option<&str>,
+) -> Result<usize, git2::Error> {
+    let prefix = under.map(|dir| format!("{}/", dir.trim_end_matches('/')));
+    let tracked: Vec<PathBuf> = index
+        .iter()
+        .filter_map(|entry| String::from_utf8(entry.path).ok())
+        .filter(|path| prefix.as_ref().is_none_or(|p| path.starts_with(p)))
+        .filter(|path| {
+            // The shape test is a string compare; only a shape match pays for
+            // the file read.
+            path.rsplit('/')
+                .next()
+                .is_some_and(ai_memory_core::log_ledger::is_log_ledger_path)
+        })
+        .map(PathBuf::from)
+        .filter(|path| is_ledger_file(root, path))
+        .collect();
+    for path in &tracked {
+        index.remove_path(path)?;
+    }
+    if !tracked.is_empty() {
+        debug!(
+            count = tracked.len(),
+            "hook event ledgers dropped from the index; the files stay on disk"
+        );
+    }
+    Ok(tracked.len())
 }
 /// Stage only `paths`: a file by path, a directory with its subtree, a
 /// gone path by removing its entries. Does not write the index file.
@@ -639,10 +1153,19 @@ fn stage_paths(
             index.add_all(
                 [spec.as_str()].iter(),
                 IndexAddOption::DISABLE_PATHSPEC_MATCH,
-                None,
+                Some(&mut |path: &Path, _: &[u8]| {
+                    i32::from(is_ledger_file(root, path) || is_in_flight_write(path))
+                }),
             )?;
+            untrack_ledgers(root, index, Some(&spec))?;
         } else if abs.is_file() {
-            index.add_path(rel)?;
+            if is_ledger_file(root, rel) {
+                if index.get_path(rel, 0).is_some() {
+                    index.remove_path(rel)?;
+                }
+            } else if !is_in_flight_write(rel) {
+                index.add_path(rel)?;
+            }
         } else if index.get_path(rel, 0).is_some() {
             index.remove_path(rel)?;
         } else {
@@ -653,22 +1176,51 @@ fn stage_paths(
     Ok(paths.len())
 }
 
+fn commit_open_error_with_fallback_on<F>(
+    windows: bool,
+    root: &Path,
+    message: &str,
+    error: git2::Error,
+    fallback: F,
+) -> WikiResult<Option<git2::Oid>>
+where
+    F: FnOnce(&Path, &str, git2::Error) -> WikiResult<Option<git2::Oid>>,
+{
+    if should_try_commit_cli_fallback_on(windows, &error) {
+        validate_cli_fallback_root(root)?;
+        fallback(root, message, error)
+    } else {
+        Err(map_git_err(error))
+    }
+}
+
+fn should_try_commit_cli_fallback(error: &git2::Error) -> bool {
+    should_try_commit_cli_fallback_on(cfg!(windows), error)
+}
+
+fn should_try_commit_cli_fallback_on(windows: bool, error: &git2::Error) -> bool {
+    !matches!(error.code(), ErrorCode::Owner)
+        && (matches!(error.code(), ErrorCode::NotFound)
+            || windows
+                && matches!(error.class(), git2::ErrorClass::Os)
+                && error.message().contains("failed to resolve path"))
+}
+
 #[cfg(windows)]
 fn commit_all_fallback(
     root: &Path,
     message: &str,
     original: git2::Error,
 ) -> WikiResult<Option<git2::Oid>> {
+    validate_cli_fallback_root(root)?;
     warn!(error = %original, root = %root.display(), "libgit2 commit failed; trying git CLI fallback");
-    run_git(root, ["add", "-A"])?;
-    let diff = std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
+    stage_all_except_ledgers_cli(root)?;
+    let diff = git_command(root)
         .args(["diff", "--cached", "--quiet", "--exit-code"])
         .status()
-        .map_err(|e| {
+        .map_err(|error| {
             WikiError::Io(std::io::Error::other(format!(
-                "{original}; git diff fallback failed to start: {e}"
+                "{original}; git diff fallback failed to start: {error}"
             )))
         })?;
     if diff.success() {
@@ -703,50 +1255,27 @@ fn commit_all_fallback(
     Err(map_git_err(original))
 }
 
-fn should_try_commit_cli_fallback(error: &git2::Error) -> bool {
-    if matches!(error.code(), ErrorCode::NotFound) {
-        return true;
-    }
-
-    #[cfg(windows)]
-    {
-        // On native Windows, libgit2 can fail to reopen a freshly initialised
-        // wiki repo under dot-prefixed temp dirs with an OS path-resolution
-        // error. The fallback still runs only for Repository::open failures;
-        // real permission or repo corruption errors must also pass through the
-        // Git CLI before they are treated as recoverable.
-        if matches!(error.class(), git2::ErrorClass::Os)
-            && error.message().contains("failed to resolve path")
-        {
-            return true;
-        }
-    }
-
-    false
-}
-
 #[cfg(windows)]
-fn commit_count_fallback(root: &Path) -> usize {
-    let Ok(out) = git_output(root, ["rev-list", "--count", "HEAD"]) else {
-        return 0;
-    };
+fn commit_count_fallback_checked(root: &Path) -> WikiResult<usize> {
+    validate_cli_fallback_root(root)?;
+    let out = git_output(root, ["rev-list", "--count", "HEAD"])?;
     String::from_utf8_lossy(&out.stdout)
         .trim()
         .parse()
-        .unwrap_or(0)
-}
-
-#[cfg(not(windows))]
-fn commit_count_fallback(_root: &Path) -> usize {
-    0
+        .map_err(|error| {
+            WikiError::Io(std::io::Error::other(format!(
+                "git fallback returned an invalid commit count: {error}"
+            )))
+        })
 }
 
 #[cfg(windows)]
 fn recent_checkpoints_fallback(
     root: &Path,
     limit: usize,
-    original: WikiError,
+    original: git2::Error,
 ) -> WikiResult<Vec<Checkpoint>> {
+    validate_cli_fallback_root(root)?;
     warn!(error = %original, root = %root.display(), "libgit2 log failed; trying git CLI fallback");
     let limit = limit.to_string();
     let out = git_output(root, ["log", "-n", &limit, "--format=%H%x1f%s%x1f%ct"])?;
@@ -771,15 +1300,6 @@ fn recent_checkpoints_fallback(
     Ok(checkpoints)
 }
 
-#[cfg(not(windows))]
-fn recent_checkpoints_fallback(
-    _root: &Path,
-    _limit: usize,
-    original: WikiError,
-) -> WikiResult<Vec<Checkpoint>> {
-    Err(original)
-}
-
 #[cfg(windows)]
 fn file_at_rev_fallback(
     root: &Path,
@@ -787,6 +1307,7 @@ fn file_at_rev_fallback(
     path: &Path,
     original: WikiError,
 ) -> WikiResult<Vec<u8>> {
+    validate_cli_fallback_root(root)?;
     warn!(error = %original, root = %root.display(), "libgit2 show failed; trying git CLI fallback");
     let rel = slash_path(path);
     let spec = format!("{rev}:{rel}");
@@ -794,41 +1315,44 @@ fn file_at_rev_fallback(
     Ok(out.stdout)
 }
 
-#[cfg(not(windows))]
-fn file_at_rev_fallback(
-    _root: &Path,
-    _rev: &str,
-    _path: &Path,
-    original: WikiError,
-) -> WikiResult<Vec<u8>> {
-    Err(original)
-}
-
 fn init_repo(root: &Path) -> WikiResult<()> {
     match Repository::init(root) {
         Ok(_) => Ok(()),
-        Err(e) => init_repo_fallback(root, e),
+        Err(error) => init_error_with_fallback_on(cfg!(windows), root, error, init_repo_fallback),
+    }
+}
+
+fn init_error_with_fallback_on<F>(
+    windows: bool,
+    root: &Path,
+    error: git2::Error,
+    fallback: F,
+) -> WikiResult<()>
+where
+    F: FnOnce(&Path, git2::Error) -> WikiResult<()>,
+{
+    if !windows {
+        return Err(map_git_err(error));
+    }
+    validate_init_fallback_root(root)?;
+    fallback(root, error)
+}
+
+fn validate_init_fallback_root(root: &Path) -> WikiResult<()> {
+    crate::confinement::initialize_root(root)?;
+    match std::fs::symlink_metadata(root.join(".git")) {
+        Ok(_) => validate_cli_fallback_root(root),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
     }
 }
 
 #[cfg(windows)]
 fn init_repo_fallback(root: &Path, original: git2::Error) -> WikiResult<()> {
+    validate_init_fallback_root(root)?;
     warn!(error = %original, root = %root.display(), "libgit2 init failed; trying git CLI fallback");
-    let status = std::process::Command::new("git")
-        .arg("init")
-        .arg("-q")
-        .arg(root)
-        .status()
-        .map_err(|io| {
-            WikiError::Io(std::io::Error::other(format!(
-                "{original}; git init fallback failed to start: {io}"
-            )))
-        })?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(map_git_err(original))
-    }
+    run_git(root, ["init", "-q"])?;
+    validate_cli_fallback_root(root)
 }
 
 #[cfg(not(windows))]
@@ -838,12 +1362,107 @@ fn init_repo_fallback(_root: &Path, original: git2::Error) -> WikiResult<()> {
 
 #[cfg(windows)]
 fn run_git<const N: usize>(root: &Path, args: [&str; N]) -> WikiResult<()> {
-    let status = std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
+    let status = git_command(root)
         .args(args)
         .status()
-        .map_err(|e| WikiError::Io(std::io::Error::other(e.to_string())))?;
+        .map_err(|error| WikiError::Io(std::io::Error::other(error.to_string())))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(WikiError::Io(std::io::Error::other(format!(
+            "git fallback exited with status {status}"
+        ))))
+    }
+}
+
+/// `git add -A` for the CLI fallback, leaving the hook event ledgers out the
+/// way [`stage_working_tree`] does for libgit2.
+///
+/// Ledgers a past version committed are dropped from the index first, then
+/// everything else is added with the ledgers as `exclude` pathspecs, so git
+/// never reads a ledger into a blob. Pathspecs go through stdin because a
+/// project with a ledger per month can name more files than a Windows command
+/// line holds.
+#[cfg(windows)]
+fn stage_all_except_ledgers_cli(root: &Path) -> WikiResult<()> {
+    let mut ledgers = Vec::new();
+    collect_ledger_files(root, root, &mut ledgers)?;
+    if ledgers.is_empty() {
+        return run_git(root, ["add", "-A"]);
+    }
+    let pathspecs = |prefix: &str, first: &str| -> Vec<u8> {
+        let mut input = first.as_bytes().to_vec();
+        for ledger in &ledgers {
+            input.extend_from_slice(prefix.as_bytes());
+            input.extend_from_slice(slash_path(ledger).as_bytes());
+            input.push(0);
+        }
+        input
+    };
+    run_git_with_stdin(
+        root,
+        [
+            "rm",
+            "--cached",
+            // Without `--force` git refuses an entry whose staged content
+            // matches neither HEAD nor the file (an old version staged an
+            // append and never committed it), and that refusal would abort
+            // the whole checkpoint. Only paths already validated as ledgers
+            // are listed, and only their index entries go.
+            "--force",
+            "-q",
+            "--ignore-unmatch",
+            "--pathspec-from-file=-",
+            "--pathspec-file-nul",
+        ],
+        &pathspecs(":(literal)", ""),
+    )?;
+    run_git_with_stdin(
+        root,
+        ["add", "-A", "--pathspec-from-file=-", "--pathspec-file-nul"],
+        &pathspecs(":(exclude,literal)", ".\0"),
+    )
+}
+
+/// Every ledger file under `dir`, relative to `root`, skipping `.git` and
+/// symlinks.
+#[cfg(windows)]
+fn collect_ledger_files(root: &Path, dir: &Path, found: &mut Vec<PathBuf>) -> WikiResult<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let path = entry.path();
+        if file_type.is_dir() {
+            if entry.file_name() != ".git" {
+                collect_ledger_files(root, &path, found)?;
+            }
+        } else if file_type.is_file()
+            && let Ok(rel) = path.strip_prefix(root)
+            && is_ledger_file(root, rel)
+        {
+            found.push(rel.to_path_buf());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn run_git_with_stdin<const N: usize>(
+    root: &Path,
+    args: [&str; N],
+    input: &[u8],
+) -> WikiResult<()> {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = git_command(root)
+        .args(args)
+        .stdin(Stdio::piped())
+        .spawn()
+        .map_err(|error| WikiError::Io(std::io::Error::other(error.to_string())))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(input)?;
+    }
+    let status = child.wait()?;
     if status.success() {
         Ok(())
     } else {
@@ -855,24 +1474,30 @@ fn run_git<const N: usize>(root: &Path, args: [&str; N]) -> WikiResult<()> {
 
 #[cfg(windows)]
 fn git_output<const N: usize>(root: &Path, args: [&str; N]) -> WikiResult<std::process::Output> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
+    let output = git_command(root)
         .args(args)
         .output()
-        .map_err(|e| WikiError::Io(std::io::Error::other(e.to_string())))?;
-    if out.status.success() {
-        Ok(out)
+        .map_err(|error| WikiError::Io(std::io::Error::other(error.to_string())))?;
+    if output.status.success() {
+        Ok(output)
     } else {
         Err(WikiError::Io(std::io::Error::other(format!(
             "git fallback exited with status {}: {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr)
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
         ))))
     }
 }
 
 fn map_git_err(e: git2::Error) -> WikiError {
+    // An owner-check failure (`code=Owner`, CVE-2022-24765 dubious-ownership
+    // guard) is kept as a distinct variant so startup can log it at ERROR with
+    // an actionable fix instead of burying it in a generic WARN. Everything
+    // else stays an opaque I/O error, matching prior behaviour.
+    if matches!(e.code(), ErrorCode::Owner) {
+        warn!(error = %e, "libgit2 wiki owner-validation error");
+        return WikiError::GitOwner(e.to_string());
+    }
     warn!(error = %e, "libgit2 error");
     WikiError::Io(std::io::Error::other(e.to_string()))
 }
@@ -891,13 +1516,469 @@ mod tests {
     }
 
     #[test]
+    fn commit_count_public_api_remains_a_plain_usize() {
+        let tmp = tempdir();
+        let root = tmp.path().join("wiki");
+        let adapter = GitAdapter::open_or_init(&root).unwrap();
+        let count: usize = adapter.commit_count();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn windows_commit_fallback_accepts_established_eligible_errors() {
+        let eligible = git2::Error::new(
+            ErrorCode::GenericError,
+            git2::ErrorClass::Os,
+            "failed to resolve path 'C:\\wiki\\.git'",
+        );
+        assert!(should_try_commit_cli_fallback_on(true, &eligible));
+        assert!(!should_try_commit_cli_fallback_on(false, &eligible));
+
+        let wrong_class = git2::Error::new(
+            ErrorCode::GenericError,
+            git2::ErrorClass::Repository,
+            "failed to resolve path 'C:\\wiki\\.git'",
+        );
+        assert!(!should_try_commit_cli_fallback_on(true, &wrong_class));
+        let not_found = git2::Error::new(
+            ErrorCode::NotFound,
+            git2::ErrorClass::Repository,
+            "not found",
+        );
+        assert!(should_try_commit_cli_fallback_on(true, &not_found));
+        assert!(should_try_commit_cli_fallback_on(false, &not_found));
+
+        let owner = git2::Error::new(
+            ErrorCode::Owner,
+            git2::ErrorClass::Os,
+            "failed to resolve path 'C:\\wiki\\.git'",
+        );
+        assert!(!should_try_commit_cli_fallback_on(true, &owner));
+        let wrong_message = git2::Error::new(
+            ErrorCode::GenericError,
+            git2::ErrorClass::Os,
+            "repository is corrupt",
+        );
+        assert!(!should_try_commit_cli_fallback_on(true, &wrong_message));
+    }
+
+    #[test]
+    fn public_filesystem_wrappers_preserve_io_signatures_and_non_not_found_confinement() {
+        fn assert_signatures(
+            append: fn(&GitAdapter, &Path, &[u8]) -> std::io::Result<()>,
+            rename: fn(&GitAdapter, &Path, &Path) -> std::io::Result<()>,
+            remove_file: fn(&GitAdapter, &Path) -> std::io::Result<()>,
+            remove_dir_all: fn(&GitAdapter, &Path) -> std::io::Result<()>,
+        ) {
+            let _ = (append, rename, remove_file, remove_dir_all);
+        }
+        assert_signatures(
+            GitAdapter::append,
+            GitAdapter::rename,
+            GitAdapter::remove_file,
+            GitAdapter::remove_dir_all,
+        );
+
+        let tmp = tempdir();
+        let root = tmp.path().join("wiki");
+        let adapter = GitAdapter::open_or_init(&root).unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let linked = root.join("linked");
+        if !link_directory(&outside, &linked) {
+            return;
+        }
+        let error = adapter.append(&linked.join("log.md"), b"x").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn windows_init_error_dispatches_fallback_after_root_preflight() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let tmp = tempdir();
+        let root = tmp.path().join("wiki");
+        std::fs::create_dir(&root).unwrap();
+        let called = AtomicBool::new(false);
+        let error = git2::Error::new(
+            ErrorCode::GenericError,
+            git2::ErrorClass::Os,
+            "failed to initialize repository",
+        );
+
+        init_error_with_fallback_on(true, &root, error, |validated, _| {
+            assert_eq!(validated, root);
+            called.store(true, Ordering::Relaxed);
+            Ok(())
+        })
+        .unwrap();
+        assert!(called.load(Ordering::Relaxed));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn invalid_root_never_reaches_init_fallback() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let tmp = tempdir();
+        let outside = tmp.path().join("outside");
+        let root = tmp.path().join("wiki");
+        std::fs::create_dir(&outside).unwrap();
+        if !link_directory(&outside, &root) {
+            return;
+        }
+        let called = AtomicBool::new(false);
+        let error = git2::Error::new(
+            ErrorCode::GenericError,
+            git2::ErrorClass::Os,
+            "failed to initialize repository",
+        );
+
+        assert!(matches!(
+            init_error_with_fallback_on(true, &root, error, |_, _| {
+                called.store(true, Ordering::Relaxed);
+                Ok(())
+            }),
+            Err(WikiError::Confinement { .. })
+        ));
+        assert!(!called.load(Ordering::Relaxed));
+    }
+
+    #[test]
     fn init_is_idempotent_and_creates_dotgit() {
         let tmp = tempdir();
         let root = tmp.path().join("wiki");
-        let _adapter = GitAdapter::open_or_init(&root).unwrap();
+        let adapter = GitAdapter::open_or_init(&root).unwrap();
         assert!(root.join(".git").is_dir());
-        // Second open is a no-op.
-        let _adapter2 = GitAdapter::open_or_init(&root).unwrap();
+        let adapter2 = GitAdapter::open_or_init(&root).unwrap();
+        assert_eq!(adapter.commit_count(), 0);
+        assert!(adapter2.recent_checkpoints(1).unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    fn link_directory(target: &Path, link: &Path) -> bool {
+        std::os::unix::fs::symlink(target, link).unwrap();
+        true
+    }
+
+    #[cfg(windows)]
+    fn link_directory(target: &Path, link: &Path) -> bool {
+        match std::os::windows::fs::symlink_dir(target, link) {
+            Ok(()) => true,
+            Err(error) if error.raw_os_error() == Some(1314) => {
+                eprintln!("skipping .git reparse assertion: Windows privilege unavailable");
+                false
+            }
+            Err(error) => panic!("failed to create .git directory link: {error}"),
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn git_metadata_link_is_refused_without_touching_external_repository() {
+        let tmp = tempdir();
+        let root = tmp.path().join("wiki");
+        std::fs::create_dir(&root).unwrap();
+        let external = tmp.path().join("external-git");
+        Repository::init_bare(&external).unwrap();
+        let before = std::fs::read(external.join("HEAD")).unwrap();
+        if !link_directory(&external, &root.join(".git")) {
+            return;
+        }
+
+        assert!(matches!(
+            GitAdapter::open_or_init(&root),
+            Err(WikiError::Confinement { .. })
+        ));
+        assert_eq!(std::fs::read(external.join("HEAD")).unwrap(), before);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn eligible_windows_open_error_dispatches_the_fallback_after_validation() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let tmp = tempdir();
+        let root = tmp.path().join("wiki");
+        let adapter = GitAdapter::open_or_init(&root).unwrap();
+        let called = AtomicBool::new(false);
+        let error = git2::Error::new(
+            ErrorCode::GenericError,
+            git2::ErrorClass::Os,
+            "failed to resolve path 'C:\\wiki\\.git'",
+        );
+
+        assert!(
+            commit_open_error_with_fallback_on(
+                true,
+                &adapter.root,
+                "fallback",
+                error,
+                |root, message, _| {
+                    assert_eq!(root, adapter.root);
+                    assert_eq!(message, "fallback");
+                    called.store(true, Ordering::Relaxed);
+                    Ok(None)
+                },
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(called.load(Ordering::Relaxed));
+    }
+
+    fn assert_eligible_fallback_is_refused(root: &Path) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let called = AtomicBool::new(false);
+        let error = git2::Error::new(
+            ErrorCode::GenericError,
+            git2::ErrorClass::Os,
+            "failed to resolve path 'C:\\wiki\\.git'",
+        );
+        assert!(
+            commit_open_error_with_fallback_on(true, root, "refused", error, |_, _, _| {
+                called.store(true, Ordering::Relaxed);
+                Ok(None)
+            },)
+            .is_err()
+        );
+        assert!(!called.load(Ordering::Relaxed));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn linked_git_metadata_never_reaches_commit_fallback() {
+        let tmp = tempdir();
+        let root = tmp.path().join("wiki");
+        let adapter = GitAdapter::open_or_init(&root).unwrap();
+        adapter.close();
+        let original = root.join(".git-original");
+        std::fs::rename(root.join(".git"), &original).unwrap();
+        if !link_directory(&original, &root.join(".git")) {
+            return;
+        }
+
+        assert_eligible_fallback_is_refused(&adapter.root);
+    }
+
+    #[test]
+    fn gitfile_metadata_never_reaches_commit_fallback() {
+        let tmp = tempdir();
+        let root = tmp.path().join("wiki");
+        let adapter = GitAdapter::open_or_init(&root).unwrap();
+        adapter.close();
+        let original = root.join(".git-original");
+        std::fs::rename(root.join(".git"), &original).unwrap();
+        std::fs::write(
+            root.join(".git"),
+            format!("gitdir: {}\n", original.display()),
+        )
+        .unwrap();
+
+        assert_eligible_fallback_is_refused(&adapter.root);
+    }
+
+    #[test]
+    fn out_of_root_worktree_never_reaches_commit_fallback() {
+        let tmp = tempdir();
+        let root = tmp.path().join("wiki");
+        let adapter = GitAdapter::open_or_init(&root).unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        Repository::open(&root)
+            .unwrap()
+            .config()
+            .unwrap()
+            .set_str("core.worktree", outside.to_str().unwrap())
+            .unwrap();
+
+        assert_eligible_fallback_is_refused(&adapter.root);
+    }
+
+    #[test]
+    fn fallback_preflight_refuses_invalid_git_metadata() {
+        let tmp = tempdir();
+        let root = tmp.path().join("wiki");
+        let adapter = GitAdapter::open_or_init(&root).unwrap();
+        std::fs::write(root.join(".git/commondir"), "../outside\n").unwrap();
+
+        assert!(matches!(
+            validate_cli_fallback_root(&adapter.root),
+            Err(WikiError::Confinement { .. })
+        ));
+    }
+
+    #[test]
+    fn fallback_resolved_paths_must_match_the_validated_repository() {
+        let tmp = tempdir();
+        let root = tmp.path().join("wiki");
+        let adapter = GitAdapter::open_or_init(&root).unwrap();
+        let git_dir = root.join(".git");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+
+        assert!(
+            validate_resolved_repository_paths(&root, &git_dir, &root, &git_dir, &git_dir,).is_ok()
+        );
+        for (worktree, resolved_git_dir, common_dir) in [
+            (outside.as_path(), git_dir.as_path(), git_dir.as_path()),
+            (root.as_path(), outside.as_path(), git_dir.as_path()),
+            (root.as_path(), git_dir.as_path(), outside.as_path()),
+        ] {
+            assert!(matches!(
+                validate_resolved_repository_paths(
+                    &root,
+                    &git_dir,
+                    worktree,
+                    resolved_git_dir,
+                    common_dir,
+                ),
+                Err(WikiError::Confinement { .. })
+            ));
+        }
+        assert_eq!(adapter.root(), root);
+    }
+
+    #[test]
+    fn gitfile_redirect_outside_is_refused_without_touching_target() {
+        let tmp = tempdir();
+        let root = tmp.path().join("wiki");
+        std::fs::create_dir(&root).unwrap();
+        let external = tmp.path().join("external-git");
+        Repository::init_bare(&external).unwrap();
+        let before = std::fs::read(external.join("HEAD")).unwrap();
+        std::fs::write(
+            root.join(".git"),
+            format!("gitdir: {}\n", external.display()),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            GitAdapter::open_or_init(&root),
+            Err(WikiError::Confinement { .. })
+        ));
+        assert_eq!(std::fs::read(external.join("HEAD")).unwrap(), before);
+    }
+
+    #[test]
+    fn git_metadata_redirect_files_are_refused_before_repository_open() {
+        for relative in [
+            "commondir",
+            "objects/info/alternates",
+            "objects/info/http-alternates",
+        ] {
+            let tmp = tempdir();
+            let root = tmp.path().join("wiki");
+            let adapter = GitAdapter::open_or_init(&root).unwrap();
+            let redirect = root.join(".git").join(relative);
+            std::fs::create_dir_all(redirect.parent().unwrap()).unwrap();
+            std::fs::write(&redirect, "../outside\n").unwrap();
+
+            assert!(matches!(
+                adapter.recent_checkpoints(0),
+                Err(WikiError::Confinement { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn configured_worktree_outside_the_wiki_root_is_refused() {
+        let tmp = tempdir();
+        let root = tmp.path().join("wiki");
+        let external = tmp.path().join("external-worktree");
+        std::fs::create_dir(&external).unwrap();
+        std::fs::write(external.join("canary"), "outside canary").unwrap();
+        let repo = Repository::init(&root).unwrap();
+        repo.config()
+            .unwrap()
+            .set_str("core.worktree", external.to_str().unwrap())
+            .unwrap();
+        drop(repo);
+
+        assert!(matches!(
+            GitAdapter::open_or_init(&root),
+            Err(WikiError::Confinement { .. })
+        ));
+        assert_eq!(
+            std::fs::read_to_string(external.join("canary")).unwrap(),
+            "outside canary"
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn checkpoint_and_revision_reads_refuse_a_replaced_git_directory() {
+        let (_tmp, root, adapter) = committed(&[("a.md", "one")]);
+        adapter.close();
+        let original = root.join(".git-original");
+        std::fs::rename(root.join(".git"), &original).unwrap();
+        let external = root.parent().unwrap().join("external-git");
+        Repository::init_bare(&external).unwrap();
+        let before = std::fs::read(external.join("HEAD")).unwrap();
+        if !link_directory(&external, &root.join(".git")) {
+            return;
+        }
+
+        assert!(matches!(
+            adapter.commit_all("refused"),
+            Err(WikiError::Confinement { .. })
+        ));
+        assert!(matches!(
+            adapter.recent_checkpoints(1),
+            Err(WikiError::Confinement { .. })
+        ));
+        assert!(matches!(
+            adapter.file_at_rev("HEAD", Path::new("a.md")),
+            Err(WikiError::Confinement { .. })
+        ));
+        assert!(matches!(
+            adapter.commit_count_checked(),
+            Err(WikiError::Confinement { .. })
+        ));
+        assert_eq!(adapter.commit_count(), 0);
+        assert_eq!(std::fs::read(external.join("HEAD")).unwrap(), before);
+    }
+
+    #[test]
+    fn path_checkpoints_lists_changes_and_deletion_and_stops_at_the_walk_cap() {
+        let tmp = tempdir();
+        let root = tmp.path().join("wiki");
+        let adapter = GitAdapter::open_or_init(&root).unwrap();
+        std::fs::write(root.join("page.md"), "v1").unwrap();
+        adapter.commit_all("write v1").unwrap();
+        std::fs::write(root.join("page.md"), "v2").unwrap();
+        adapter.commit_all("write v2").unwrap();
+        std::fs::remove_file(root.join("page.md")).unwrap();
+        adapter.commit_all("delete").unwrap();
+        for i in 0..3 {
+            std::fs::write(root.join("other.md"), format!("o{i}")).unwrap();
+            adapter.commit_all("unrelated").unwrap();
+        }
+        let summaries = |hits: Vec<Checkpoint>| -> Vec<String> {
+            hits.into_iter().map(|c| c.summary).collect()
+        };
+
+        let all = adapter
+            .path_checkpoints(Path::new("page.md"), 10, 100)
+            .unwrap();
+        assert_eq!(summaries(all), ["delete", "write v2", "write v1"]);
+        let limited = adapter
+            .path_checkpoints(Path::new("page.md"), 1, 100)
+            .unwrap();
+        assert_eq!(summaries(limited), ["delete"]);
+        // Three unrelated commits sit on top: a walk of four sees only the
+        // delete, a walk of three sees nothing.
+        let capped = adapter
+            .path_checkpoints(Path::new("page.md"), 10, 4)
+            .unwrap();
+        assert_eq!(summaries(capped), ["delete"]);
+        assert!(
+            adapter
+                .path_checkpoints(Path::new("page.md"), 10, 3)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -972,7 +2053,7 @@ mod tests {
         let staged = |root: &Path| {
             let repo = Repository::open(root).unwrap();
             let mut index = repo.index().unwrap();
-            let touched = stage_working_tree(&mut index).unwrap().len();
+            let touched = stage_working_tree(root, &mut index).unwrap().len();
             index.write().unwrap();
             touched
         };
@@ -1009,6 +2090,80 @@ mod tests {
         }
         adapter.commit_all("initial").unwrap();
         (tmp, root, adapter)
+    }
+
+    /// `apply_batch` keeps one `.ai-memory-tmp.*` staging file per page on disk
+    /// across an await, and `commit_all` takes only the commit lock — so a
+    /// sweep landing in that window must not capture a write in flight.
+    #[test]
+    fn a_sweep_never_stages_an_in_flight_atomic_write() {
+        let (_tmp, root, adapter) = committed(&[("ws/proj/a.md", "a")]);
+        write(&root, "ws/proj/b.md", "b");
+        write(
+            &root,
+            "ws/proj/.ai-memory-tmp.aB3x9Q",
+            "a body still being written",
+        );
+        write(
+            &root,
+            "ws/proj/.ai-memory-delete.b.md",
+            "a page parked for deletion",
+        );
+
+        assert!(
+            adapter
+                .commit_all("sweep with writes in flight")
+                .unwrap()
+                .is_some()
+        );
+
+        assert_eq!(head_blob(&adapter, "ws/proj/b.md").as_deref(), Some("b"));
+        assert_eq!(head_blob(&adapter, "ws/proj/.ai-memory-tmp.aB3x9Q"), None);
+        assert_eq!(head_blob(&adapter, "ws/proj/.ai-memory-delete.b.md"), None);
+    }
+
+    /// The same for a path-scoped commit, whose directory pathspec reaches
+    /// `stage_paths`' own `add_all` rather than the sweep's.
+    #[test]
+    fn a_path_scoped_commit_never_stages_an_in_flight_atomic_write() {
+        let (_tmp, root, adapter) = committed(&[("ws/proj/a.md", "a")]);
+        write(&root, "ws/proj/c.md", "c");
+        write(
+            &root,
+            "ws/proj/.ai-memory-tmp.cD4y0R",
+            "a body still being written",
+        );
+        adapter.mark_written(&root.join("ws/proj"));
+
+        adapter.commit_all("scoped with a write in flight").unwrap();
+
+        assert_eq!(head_blob(&adapter, "ws/proj/c.md").as_deref(), Some("c"));
+        assert_eq!(head_blob(&adapter, "ws/proj/.ai-memory-tmp.cD4y0R"), None);
+    }
+
+    /// `quarantine_file` and `move_session_page` park a page under a staging
+    /// name with `rename_checked`, which reports that exact path, so the
+    /// reported-file branch of `stage_paths` must skip it as well.
+    #[test]
+    fn a_reported_staging_file_is_never_staged() {
+        let (_tmp, root, adapter) = committed(&[("ws/proj/a.md", "a")]);
+        let parked = [
+            "ws/proj/.ai-memory-delete.Xy12Ab",
+            "ws/proj/.ai-memory-tmp.move-session.s1.md",
+        ];
+        for rel in parked {
+            write(&root, rel, "a page between two renames");
+            adapter.mark_written(&root.join(rel));
+        }
+        write(&root, "ws/proj/c.md", "c");
+        adapter.mark_written(&root.join("ws/proj/c.md"));
+
+        adapter.commit_all("scoped with pages parked").unwrap();
+
+        assert_eq!(head_blob(&adapter, "ws/proj/c.md").as_deref(), Some("c"));
+        for rel in parked {
+            assert_eq!(head_blob(&adapter, rel), None, "{rel} was committed");
+        }
     }
 
     #[test]
@@ -1064,6 +2219,221 @@ mod tests {
         adapter.mark_written(&root.join("ws/proj/.git/hooks/pre-commit"));
         adapter.mark_written(Path::new("ws/proj/git~1/config"));
         assert!(adapter.written_paths().is_empty());
+    }
+
+    const LEDGER_BODY: &str = "## [2026-09-05T00:00:00Z] tool Bash: cargo test\n";
+    const PROSE_BODY: &str = "# Log\n\nAn ordinary page named like a ledger.\n";
+
+    /// Whether the index names `rel`, from a fresh read of the index file.
+    fn indexed(root: &Path, rel: &str) -> bool {
+        let repo = Repository::open(root).unwrap();
+        let index = repo.index().unwrap();
+        index.get_path(Path::new(rel), 0).is_some()
+    }
+
+    /// Path-scoped staging (the commit after the first walk): a ledger a past
+    /// version tracked is dropped from the index when it is reported, by file
+    /// or through its directory, and the file stays on disk. Ordinary files in
+    /// the same call, including a page wearing a ledger's name, are staged.
+    #[test]
+    fn path_staging_untracks_a_ledger_and_keeps_a_page_wearing_its_name() {
+        let tmp = tempdir();
+        let root = tmp.path().join("wiki");
+        let adapter = GitAdapter::open_or_init(&root).unwrap();
+        write(&root, "p/log-2026-09.md", LEDGER_BODY);
+        write(&root, "q/log-2026-09.md", LEDGER_BODY);
+        write(&root, "r/log-2026-09.md", PROSE_BODY);
+        let repo = Repository::open(&root).unwrap();
+        let mut index = repo.index().unwrap();
+        for rel in ["p/log-2026-09.md", "q/log-2026-09.md", "r/log-2026-09.md"] {
+            index.add_path(Path::new(rel)).unwrap();
+        }
+        index.write().unwrap();
+        drop(adapter);
+
+        write(
+            &root,
+            "p/log-2026-09.md",
+            &format!("{LEDGER_BODY}{LEDGER_BODY}"),
+        );
+        write(&root, "r/log-2026-09.md", &format!("{PROSE_BODY}edited\n"));
+        write(&root, "q/other.md", "page\n");
+        // Never tracked, reported through its directory: it must not even be
+        // read into a blob.
+        let fresh = format!("{LEDGER_BODY}## [2026-09-06T00:00:00Z] stop\n");
+        write(&root, "s/log-2026-08.md", &fresh);
+        let mut index = repo.index().unwrap();
+        // `p` is reported by file, `q` and `s` through their directories.
+        let paths: BTreeSet<PathBuf> = ["p/log-2026-09.md", "q", "r/log-2026-09.md", "s"]
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+        stage_paths(&root, &mut index, &paths).unwrap();
+        index.write().unwrap();
+
+        assert!(!indexed(&root, "p/log-2026-09.md"), "file report");
+        assert!(!indexed(&root, "q/log-2026-09.md"), "directory report");
+        assert!(
+            !indexed(&root, "s/log-2026-08.md"),
+            "untracked, by directory"
+        );
+        assert!(
+            !repo
+                .odb()
+                .unwrap()
+                .exists(git2::Oid::hash_object(ObjectType::Blob, fresh.as_bytes()).unwrap()),
+            "a ledger under a reported directory was hashed into git"
+        );
+        assert!(indexed(&root, "q/other.md"), "control: the page beside it");
+        assert!(indexed(&root, "r/log-2026-09.md"), "control: a page");
+        assert_eq!(
+            std::fs::read_to_string(root.join("p/log-2026-09.md")).unwrap(),
+            format!("{LEDGER_BODY}{LEDGER_BODY}"),
+            "the file on disk is untouched"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("q/log-2026-09.md")).unwrap(),
+            LEDGER_BODY
+        );
+    }
+
+    /// The CLI fallback (Windows only, when libgit2 cannot open the repo)
+    /// must leave ledgers out as well, and must never read one into a blob.
+    #[cfg(windows)]
+    #[test]
+    fn cli_fallback_commit_leaves_ledgers_out_and_untracks_a_tracked_one() {
+        let tmp = tempdir();
+        let root = tmp.path().join("wiki");
+        let adapter = GitAdapter::open_or_init(&root).unwrap();
+        // A repo-local setting beats a contributor's global `commit.gpgsign`.
+        Repository::open(&root)
+            .unwrap()
+            .config()
+            .unwrap()
+            .set_bool("commit.gpgsign", false)
+            .unwrap();
+        write(&root, "p/log-2026-07.md", LEDGER_BODY);
+        run_git(&root, ["add", "p/log-2026-07.md"]).unwrap();
+        run_git(
+            &root,
+            [
+                "-c",
+                "user.name=fixture",
+                "-c",
+                "user.email=fixture@local",
+                "commit",
+                "-q",
+                "--no-gpg-sign",
+                "-m",
+                "fixture: tracked by an earlier version",
+            ],
+        )
+        .unwrap();
+        // Content no other file or commit holds, so a blob for it can only come
+        // from staging this file.
+        let new_ledger = format!("{LEDGER_BODY}## [2026-09-06T00:00:00Z] stop\n");
+        write(&root, "p/log-2026-09.md", &new_ledger);
+        write(&root, "p/log.md", PROSE_BODY);
+        write(&root, "p/page.md", "page\n");
+
+        let oid = commit_all_fallback(&root, "fallback", git2::Error::from_str("forced"))
+            .unwrap()
+            .expect("the page is new");
+
+        let repo = Repository::open(&root).unwrap();
+        let tree = repo.find_commit(oid).unwrap().tree().unwrap();
+        assert!(tree.get_path(Path::new("p/page.md")).is_ok());
+        assert!(tree.get_path(Path::new("p/log.md")).is_ok(), "a page");
+        assert!(tree.get_path(Path::new("p/log-2026-09.md")).is_err());
+        assert!(
+            tree.get_path(Path::new("p/log-2026-07.md")).is_err(),
+            "the tracked ledger was untracked"
+        );
+        assert!(root.join("p/log-2026-07.md").is_file(), "and kept on disk");
+        let unseen = git2::Oid::hash_object(ObjectType::Blob, new_ledger.as_bytes()).unwrap();
+        assert!(
+            !repo.odb().unwrap().exists(unseen),
+            "git read the new ledger into a blob"
+        );
+        drop(adapter);
+    }
+
+    /// The state an older version could leave behind: it staged an append to a
+    /// ledger and never committed it, and the hook appended again after that.
+    /// HEAD, the index and the file then hold three different contents, which
+    /// plain `git rm --cached` refuses; that refusal must not abort the
+    /// checkpoint, which still has ordinary pages to save.
+    #[cfg(windows)]
+    #[test]
+    fn cli_fallback_untracks_a_ledger_whose_index_matches_neither_head_nor_disk() {
+        let tmp = tempdir();
+        let root = tmp.path().join("wiki");
+        let adapter = GitAdapter::open_or_init(&root).unwrap();
+        Repository::open(&root)
+            .unwrap()
+            .config()
+            .unwrap()
+            .set_bool("commit.gpgsign", false)
+            .unwrap();
+        let ledger = "p/log-2026-09.md";
+        let version_a = LEDGER_BODY.to_string();
+        let version_b = format!(
+            "{version_a}## [2026-09-06T00:00:00Z] stop
+"
+        );
+        let version_c = format!(
+            "{version_b}## [2026-09-07T00:00:00Z] start
+"
+        );
+
+        write(&root, ledger, &version_a);
+        run_git(&root, ["add", ledger]).unwrap();
+        run_git(
+            &root,
+            [
+                "-c",
+                "user.name=fixture",
+                "-c",
+                "user.email=fixture@local",
+                "commit",
+                "-q",
+                "--no-gpg-sign",
+                "-m",
+                "fixture: HEAD holds version A",
+            ],
+        )
+        .unwrap();
+        write(&root, ledger, &version_b);
+        run_git(&root, ["add", ledger]).unwrap();
+        write(&root, ledger, &version_c);
+        write(
+            &root,
+            "p/page.md",
+            "page
+",
+        );
+
+        let oid = commit_all_fallback(&root, "fallback", git2::Error::from_str("forced"))
+            .expect("the unforced removal aborted the whole checkpoint")
+            .expect("the page is new");
+
+        let repo = Repository::open(&root).unwrap();
+        let tree = repo.find_commit(oid).unwrap().tree().unwrap();
+        assert!(
+            tree.get_path(Path::new("p/page.md")).is_ok(),
+            "the ordinary page was not committed"
+        );
+        assert!(
+            tree.get_path(Path::new(ledger)).is_err(),
+            "the ledger is still in the commit"
+        );
+        assert!(!indexed(&root, ledger), "the ledger is still in the index");
+        assert_eq!(
+            std::fs::read_to_string(root.join(ledger)).unwrap(),
+            version_c,
+            "the file on disk was changed"
+        );
+        drop(adapter);
     }
 
     #[test]
@@ -1270,6 +2640,22 @@ mod tests {
         assert!(!is_racy_read(&other_message));
     }
 
+    #[test]
+    fn owner_error_is_surfaced_distinctly() {
+        let owner = git2::Error::new(
+            ErrorCode::Owner,
+            git2::ErrorClass::Config,
+            "repository path is not owned by current user",
+        );
+        assert!(matches!(map_git_err(owner), WikiError::GitOwner(_)));
+        let generic = git2::Error::new(
+            ErrorCode::GenericError,
+            git2::ErrorClass::Os,
+            "some other failure",
+        );
+        assert!(matches!(map_git_err(generic), WikiError::Io(_)));
+    }
+
     /// A racy read keeps the commit path-scoped; any other failure walks.
     #[test]
     fn a_racy_read_failure_does_not_escalate_to_a_walk() {
@@ -1304,30 +2690,60 @@ mod tests {
         assert!(head_blob(&adapter, "d/y.md").is_none());
     }
 
+    /// What another process sees: a repository opened fresh reads the
+    /// index file, not the adapter's kept index.
+    fn assert_clean_from_outside(root: &Path, context: &str) {
+        let repo = Repository::open(root).unwrap();
+        let dirty: Vec<(String, git2::Status)> = repo
+            .statuses(None)
+            .unwrap()
+            .iter()
+            .map(|entry| (entry.path().unwrap_or_default().to_owned(), entry.status()))
+            .collect();
+        assert!(dirty.is_empty(), "{context}: {dirty:?}");
+        // The git CLI too, where there is one.
+        if let Ok(out) = std::process::Command::new("git")
+            .args(["status", "--porcelain=v2"])
+            .current_dir(root)
+            .output()
+            && out.status.success()
+        {
+            let porcelain = String::from_utf8_lossy(&out.stdout);
+            assert!(porcelain.is_empty(), "{context}: git status: {porcelain}");
+        }
+    }
+
     #[test]
-    fn the_index_file_is_written_after_a_walk_and_every_fifty_commits() {
+    fn every_commit_leaves_the_index_file_matching_head() {
+        let (_tmp, root, adapter) = committed(&[("a.md", "a"), ("b.md", "b")]);
+        assert_clean_from_outside(&root, "after the walk");
+        for i in 1..=3 {
+            write(&root, "a.md", &format!("a{i}"));
+            adapter.mark_written(Path::new("a.md"));
+            assert!(
+                adapter
+                    .commit_all(&format!("scoped {i}"))
+                    .unwrap()
+                    .is_some()
+            );
+            assert_clean_from_outside(&root, &format!("after scoped commit {i}"));
+        }
+        assert_eq!(head_blob(&adapter, "a.md").as_deref(), Some("a3"));
+    }
+
+    #[test]
+    fn a_commit_with_nothing_to_commit_still_writes_the_index_file() {
         let (_tmp, root, adapter) = committed(&[("a.md", "a")]);
         let index_file = root.join(".git/index");
-        let after_walk = std::fs::read(&index_file).unwrap();
-        for i in 1..=INDEX_WRITE_EVERY {
-            let rel = format!("n-{i}.md");
-            write(&root, &rel, "n");
-            adapter.mark_written(Path::new(&rel));
-            assert!(adapter.commit_all(&rel).unwrap().is_some());
-            let now = std::fs::read(&index_file).unwrap();
-            if i < INDEX_WRITE_EVERY {
-                assert_eq!(now, after_walk, "commit {i} wrote the index file");
-            } else {
-                assert_ne!(now, after_walk, "commit {i} did not write the index file");
-            }
-        }
-        let before_walk = std::fs::read(&index_file).unwrap();
-        write(&root, "b.md", "b");
-        adapter.mark_written(Path::new("b.md"));
-        adapter.age_last_walk();
-        assert!(adapter.commit_all("sweep").unwrap().is_some());
-        assert_ne!(std::fs::read(&index_file).unwrap(), before_walk);
-        assert_eq!(head_blob(&adapter, "b.md").as_deref(), Some("b"));
+        let stale = std::fs::read(&index_file).unwrap();
+        write(&root, "a.md", "a2");
+        adapter.mark_written(Path::new("a.md"));
+        assert!(adapter.commit_all("a2").unwrap().is_some());
+        // The index file falls behind HEAD, as a missed write left it.
+        std::fs::write(&index_file, &stale).unwrap();
+        adapter.mark_written(Path::new("a.md"));
+        assert!(adapter.commit_all("unchanged").unwrap().is_none());
+        assert_clean_from_outside(&root, "after the no-op commit");
     }
 
     #[test]
@@ -1383,6 +2799,33 @@ mod tests {
 
     /// Two session ends at once used to collide on libgit2's index lock and
     /// one of them lost its snapshot; now they queue.
+    /// The CI flake behind `concurrent_commits_queue_instead_of_failing`: a
+    /// walk listed a file that was gone when libgit2 read it, and libgit2
+    /// reports that as an `Os`-class "failed to read file into stream" — not
+    /// the "changed before" the retry recognized — so the commit failed
+    /// instead of retrying. Unrelated errors must still fail fast.
+    #[test]
+    fn a_file_vanishing_mid_walk_is_a_racy_read_but_other_errors_are_not() {
+        let err =
+            |class, message: &str| git2::Error::new(git2::ErrorCode::GenericError, class, message);
+        assert!(is_racy_read(&err(
+            git2::ErrorClass::Os,
+            "failed to read file into stream: "
+        )));
+        assert!(is_racy_read(&err(
+            git2::ErrorClass::Filesystem,
+            "file changed before we could read it"
+        )));
+        assert!(!is_racy_read(&err(
+            git2::ErrorClass::Os,
+            "failed to open file"
+        )));
+        assert!(!is_racy_read(&err(
+            git2::ErrorClass::Index,
+            "failed to read file into stream: "
+        )));
+    }
+
     #[test]
     fn concurrent_commits_queue_instead_of_failing() {
         let tmp = tempdir();
@@ -1471,5 +2914,113 @@ mod tests {
             .file_at_rev(&first.to_string(), Path::new("a.md"))
             .unwrap();
         assert_eq!(String::from_utf8(bytes).unwrap(), "one");
+    }
+
+    fn local_fsync_setting(root: &Path) -> Option<bool> {
+        Repository::open(root)
+            .unwrap()
+            .config()
+            .unwrap()
+            .open_level(git2::ConfigLevel::Local)
+            .unwrap()
+            .get_bool(FSYNC_OBJECT_FILES)
+            .ok()
+    }
+
+    fn fsync_setting(repo: &Repository) -> Option<bool> {
+        repo.config().unwrap().get_bool(FSYNC_OBJECT_FILES).ok()
+    }
+
+    /// What the git CLI prints for `status`, or `None` without git on PATH.
+    fn git_status_stderr(root: &Path) -> Option<String> {
+        let output = git_command(root).arg("status").output().ok()?;
+        assert!(output.status.success(), "git status failed: {output:?}");
+        Some(String::from_utf8_lossy(&output.stderr).into_owned())
+    }
+
+    /// #1511: without it libgit2 renames objects and refs into place unsynced,
+    /// and a crash left a ref naming an empty commit object. The setting lives
+    /// on ai-memory's handles only, never in `.git/config`, where git warns
+    /// that the key is deprecated on every command.
+    #[test]
+    fn every_wiki_handle_turns_on_git_object_fsync_without_touching_git_config() {
+        let tmp = tempdir();
+        let fresh = tmp.path().join("fresh");
+        let existing = tmp.path().join("existing");
+        // A repository an older version created gets it on the next open.
+        Repository::init(&existing).unwrap();
+
+        for root in [&fresh, &existing] {
+            let adapter = GitAdapter::open_or_init(root).unwrap();
+            write(root, "page.md", "page");
+            adapter.commit_all("checkpoint").unwrap().unwrap();
+
+            let slot = adapter.writing();
+            let kept = &slot.as_ref().expect("the commit keeps its handle").repo;
+            assert_eq!(fsync_setting(kept), Some(true));
+            drop(slot);
+            let validated = open_validated_repository(root).ok().unwrap();
+            assert_eq!(fsync_setting(&validated), Some(true));
+
+            assert_eq!(local_fsync_setting(root), None);
+            assert_eq!(fsync_setting(&Repository::open(root).unwrap()), None);
+            let git_config = std::fs::read_to_string(root.join(".git/config")).unwrap();
+            assert!(!git_config.to_ascii_lowercase().contains("fsyncobjectfiles"));
+            if let Some(stderr) = git_status_stderr(root) {
+                assert!(
+                    !stderr.contains("deprecated"),
+                    "git status warned: {stderr}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_explicit_fsync_opt_out_in_git_config_is_kept() {
+        let tmp = tempdir();
+        let root = tmp.path().join("wiki");
+        Repository::init(&root)
+            .unwrap()
+            .config()
+            .unwrap()
+            .set_bool(FSYNC_OBJECT_FILES, false)
+            .unwrap();
+
+        GitAdapter::open_or_init(&root).unwrap();
+
+        let validated = open_validated_repository(&root).ok().unwrap();
+        assert_eq!(fsync_setting(&validated), Some(false));
+        assert_eq!(local_fsync_setting(&root), Some(false));
+    }
+
+    /// The crash shape from #1511: HEAD names a commit whose loose object is
+    /// empty. Startup still opens the wiki, the check reports it, and a
+    /// checkpoint returns the error instead of passing for a clean tree.
+    #[test]
+    fn an_empty_head_commit_object_is_reported_not_swallowed() {
+        let (_tmp, root, _adapter) = committed(&[("page.md", "page")]);
+        let repo = Repository::open(&root).unwrap();
+        readable_head(&repo).unwrap();
+        let head = repo.head().unwrap().target().unwrap().to_string();
+        let object = root.join(".git/objects").join(&head[..2]).join(&head[2..]);
+        let mut permissions = std::fs::metadata(&object).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&object, permissions).unwrap();
+        std::fs::write(&object, b"").unwrap();
+        drop(repo);
+
+        let reopened = GitAdapter::open_or_init(&root).unwrap();
+        assert!(readable_head(&Repository::open(&root).unwrap()).is_err());
+        write(&root, "page.md", "page, edited after the crash");
+        assert!(reopened.commit_all("after the crash").is_err());
+    }
+
+    #[test]
+    fn a_fresh_repository_has_a_readable_head() {
+        let tmp = tempdir();
+        let root = tmp.path().join("wiki");
+        GitAdapter::open_or_init(&root).unwrap();
+        readable_head(&Repository::open(&root).unwrap()).unwrap();
     }
 }

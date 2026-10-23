@@ -15,17 +15,17 @@ Antigravity CLI, or another agent.
 - Do not mix the Windows wrapper with WSL2-launched agents unless you
   deliberately override every config and hook path.
 - To keep the server running across logoff and reboot on native
-  Windows, use a service wrapper — see [Scenario
-  E](#scenario-e-keep-the-server-running-native-windows-service). Do not
-  launch it from a Scheduled Task via `Start-Process`; that looks like it
-  works and is silently killed at the next reboot.
+  Windows, use a service wrapper (see [Scenario
+  E](#scenario-e-keep-the-server-running-native-windows-service)). Do not
+  launch it from a Scheduled Task via `Start-Process`: the server appears to
+  start and is silently killed at the next reboot.
 
 The difference matters because hook configs contain executable paths.
 WSL2 agents need Linux paths and POSIX `.sh` hooks. Native Windows
 agents need Windows paths, but the hook runner is agent-specific: local
 supported profiles default to host-native commands. Claude Code may use
 its supported direct exec form (`command: "…ai-memory.exe"`, `args: ["hook",
-"--event", …]`) with no shell — see [Native Hook
+"--event", …]`) with no shell; see [Native Hook
 Command](#native-hook-command-claude-code-on-windows). Other agents use native
 single command strings matching their hook schema. PowerShell/Git Bash script
 bundles are compatibility fallbacks and do not enforce capture-policy v1.
@@ -109,13 +109,20 @@ foreach ($Entry in $WrapperAssets.GetEnumerator()) {
 }
 Get-ChildItem "$UserBin\ai-memory.*" | Unblock-File
 
-# Put the wrapper directory on your user PATH for future terminals.
-$UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
-if (($UserPath -split ';') -notcontains $UserBin) {
+# Put the wrapper directory on your user PATH for future terminals. Read and
+# write the registry value as is: [Environment]::GetEnvironmentVariable expands
+# its %VAR% entries, and SetEnvironmentVariable would save them expanded, as
+# REG_SZ.
+$EnvKey = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey("Environment")
+$UserPath = $EnvKey.GetValue("Path", "", "DoNotExpandEnvironmentNames")
+if (($UserPath -split ';' | ForEach-Object { [Environment]::ExpandEnvironmentVariables($_) }) -notcontains $UserBin) {
     $NewUserPath = (($UserPath, $UserBin) | Where-Object { $_ }) -join ";"
-    [Environment]::SetEnvironmentVariable("Path", $NewUserPath, "User")
+    $EnvKey.SetValue("Path", $NewUserPath, "ExpandString")
+    # Removing a variable that does not exist broadcasts the change to Explorer.
+    [Environment]::SetEnvironmentVariable("ai-memory-path-notify", [NullString]::Value, "User")
     $env:Path = "$env:Path;$UserBin"
 }
+$EnvKey.Dispose()
 
 # Start the server with Docker Desktop. The image default allowlist includes
 # host.docker.internal so wrapper thin-client commands (status, search, …) are
@@ -155,6 +162,51 @@ After upgrading the wrapper/image, rerun `install-hooks --agent <agent> --apply`
 for each native Windows agent so existing hook entries receive the current
 command form.
 
+### Managed launches (`run`, `continue`, `show`, …) use the native client
+
+`ai-memory run <harness>`, `continue`, `resume`, `show`, `workstreams` and
+`rename-workstream` execute on the host: the helper container cannot see your
+checkouts, your `claude` or `codex` CLIs, or their native session stores. The
+wrapper intercepts those subcommands and runs the native Windows client
+instead of the container (the same interception the Linux/macOS wrapper
+performs), so managed launches work while the server stays in Docker.
+
+The Docker image and the wrapper do not install that client. Install it once
+from the release zip
+([Scenario C](#scenario-c-prebuilt-release-binary-no-toolchain)):
+
+```powershell
+irm https://github.com/akitaonrails/ai-memory/releases/latest/download/install.ps1 | iex
+```
+
+`install.ps1` unpacks `ai-memory.exe` to `%LOCALAPPDATA%\Programs\ai-memory`
+and puts that directory on your `PATH`; the wrapper finds it there, or
+wherever `AI_MEMORY_NATIVE_BIN` points. Without it the intercepted commands
+stop with a message naming that installer. They never fall back into the
+container, which has no host CLIs.
+
+- The native client inherits `AI_MEMORY_SERVER_URL`. Leave it unset and it
+  talks to `http://127.0.0.1:49374`, the port the container publishes on the
+  host; a remote-server URL wins, as with every other wrapper command.
+- When the container server has auth enabled (a fresh install mints a root
+  bearer into the volume), run `install-hooks --agent <agent> --apply` once.
+  The wrapper refreshes a host copy at
+  `%LOCALAPPDATA%\ai-memory\server-token`; later managed launches reuse it
+  without starting a helper container. An explicit `AI_MEMORY_AUTH_TOKEN`,
+  `AI_MEMORY_AUTH__BEARER_TOKEN_FILE`, or bind-mounted `AI_MEMORY_DATA_DIR`
+  still wins. Rerun `install-hooks` after rotating the volume token.
+- A managed launch does not rewire hooks or MCP: what `install-hooks` and
+  `install-mcp` rendered through the container stays in place (the wrapper
+  sets `AI_MEMORY_RUN_AUTOWIRE=false` for the intercepted commands unless you
+  set the variable yourself). Export `AI_MEMORY_RUN_AUTOWIRE=true` to let
+  `run` rewire a harness around the native client instead.
+- Upgrading in this scenario: `ai-memory upgrade` pulls the image only. It
+  does not refresh the wrapper or install a native client. Refresh the
+  wrapper scripts by re-running the install block at the top of this
+  scenario, and the native client with its own `ai-memory.exe upgrade`
+  ([Scenario C](#scenario-c-prebuilt-release-binary-no-toolchain)). Then
+  rerun `install-hooks --agent <agent> --apply` as noted above.
+
 Use the matching `--client` / `--agent` values for other clients, for
 example `codex`, `command-code`, `devin`, `kimi-code`, `kiro-cli`, `cursor`, or `gemini-cli`.
 
@@ -180,10 +232,31 @@ the fast native hook path **without** installing a Rust toolchain or
 Docker. Each tagged release publishes
 `ai-memory-windows-x86_64.zip` (see the repo's Releases page).
 
+The quickest path is two commands in PowerShell, neither needing
+administrator rights:
+
 ```powershell
-# Download + extract into your user data dir (any stable path works; the
-# native hook exec-form command is rendered from wherever ai-memory.exe lives).
-$Dest = "$env:LOCALAPPDATA\ai-memory"
+irm https://github.com/akitaonrails/ai-memory/releases/latest/download/install.ps1 | iex
+ai-memory setup
+```
+
+`install.ps1` downloads the zip and its `.sha256` from the release, refuses a
+missing or mismatched checksum and any archive entry that is absolute or holds
+`..`, unpacks the release to `%LOCALAPPDATA%\Programs\ai-memory` and adds that
+directory to your user `PATH` (set `AI_MEMORY_NO_MODIFY_PATH=1` to skip that).
+`ai-memory setup` then initialises the data dir (`%LOCALAPPDATA%\ai-memory`),
+registers the server to start at logon (see
+[Scenario E](#scenario-e-keep-the-server-running-native-windows-service)),
+wires the agents it finds, and checks the result. Inside WSL2 the Linux
+`install.sh` and `setup` path works unchanged.
+
+To do the same by hand:
+
+```powershell
+# First-time install: download + extract into a stable per-user directory
+# (any stable path works; the native hook exec-form command is rendered from
+# wherever ai-memory.exe lives).
+$Dest = "$env:LOCALAPPDATA\Programs\ai-memory"
 New-Item -ItemType Directory -Force $Dest | Out-Null
 Invoke-WebRequest `
     -Uri "https://github.com/akitaonrails/ai-memory/releases/latest/download/ai-memory-windows-x86_64.zip" `
@@ -191,18 +264,41 @@ Invoke-WebRequest `
 Expand-Archive "$env:TEMP\ai-memory.zip" -DestinationPath $Dest -Force
 Get-ChildItem "$Dest\ai-memory.exe" | Unblock-File
 
-# Put it on PATH for future terminals (optional but convenient).
-$UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
-if (($UserPath -split ';') -notcontains $Dest) {
-    [Environment]::SetEnvironmentVariable("Path", "$UserPath;$Dest", "User")
+# Put it on PATH for future terminals (optional but convenient). The registry
+# value is read and written as is, so its %VAR% entries stay unexpanded.
+$EnvKey = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey("Environment")
+$UserPath = $EnvKey.GetValue("Path", "", "DoNotExpandEnvironmentNames")
+if (($UserPath -split ';' | ForEach-Object { [Environment]::ExpandEnvironmentVariables($_) }) -notcontains $Dest) {
+    $EnvKey.SetValue("Path", "$UserPath;$Dest", "ExpandString")
+    # Removing a variable that does not exist broadcasts the change to Explorer.
+    [Environment]::SetEnvironmentVariable("ai-memory-path-notify", [NullString]::Value, "User")
     $env:Path = "$env:Path;$Dest"
 }
+$EnvKey.Dispose()
 
 # Wire MCP + lifecycle hooks against your server.
 & "$Dest\ai-memory.exe" install-mcp --client claude-code --apply
 & "$Dest\ai-memory.exe" install-hooks --agent claude-code --apply `
     --server-url "https://memory.example.com" --auth-token "<token>"
 ```
+
+Later updates for this install use the same command as Linux/macOS release
+binaries. From a writable prefix (for example `%LOCALAPPDATA%\ai-memory`),
+run:
+
+```powershell
+ai-memory upgrade
+# optional: pin a tag, or force a re-download of the current tag
+ai-memory upgrade --version v2.3.2
+ai-memory upgrade --force
+```
+
+That downloads `ai-memory-windows-x86_64.zip` + `.sha256`, verifies the
+checksum, replaces `ai-memory.exe` via rename-aside (Windows cannot overwrite
+a running image), refreshes a sibling `hooks/` tree when present, then
+re-stages hooks for agents already under the data-dir hooks tree. Keep the
+manual zip download above as a fallback if the install directory is not
+writable (for example under Program Files).
 
 The zip mirrors the Linux release tarball, minus the Linux-only service
 assets: it contains `ai-memory.exe`, the full `hooks/` bundle (`.ps1` +
@@ -211,8 +307,8 @@ assets: it contains `ai-memory.exe`, the full `hooks/` bundle (`.ps1` +
 the `ai-memory.exe` path from the running binary, keep the extracted `.exe`
 at a stable location (re-run `install-hooks` if you move it).
 
-This leaves the server running only while a terminal is open. To keep it
-up across logoff and reboot, continue to [Scenario
+Without `ai-memory setup`, the server runs only while a terminal is open. To
+keep it up, run `setup` or continue to [Scenario
 E](#scenario-e-keep-the-server-running-native-windows-service).
 
 ## Scenario D: Native Windows Source Build
@@ -243,8 +339,7 @@ error: failed to run custom build command for `proc-macro2`
   An Application Control policy has blocked this file. (os error 4551)
 ```
 
-This is not a toolchain problem and re-installing Rust will not fix it.
-Cargo compiles each crate's `build.rs` into an unsigned executable under
+Re-installing Rust will not fix it, because the toolchain is fine. Cargo compiles each crate's `build.rs` into an unsigned executable under
 `target\debug\build\`, and those policies block unsigned binaries from
 running out of user-writable directories. `proc-macro2` and
 `icu_properties_data` are usually the first to hit it because they build
@@ -299,13 +394,112 @@ whether enforcement is active. See [Capture exclusions](marker-file.md#capture-e
 ## Scenario E: Keep The Server Running (Native Windows Service)
 
 Scenarios C and D both end at `ai-memory serve` in a foreground terminal.
-That is fine for a trial and wrong for daily use: close the window, log
-off, or reboot, and the server is gone.
+That works for a trial but not for daily use: when you close the window,
+log off, or reboot, the server stops.
 
-On Linux the packaged units in `packaging/systemd/` supply
-`Restart=on-failure` and `RestartSec=5s`. Note where that resiliency
-lives — systemd performs the restarts, not ai-memory. Native Windows
-gets the same bargain through a **service wrapper**. ai-memory does not
+### The logon entry `ai-memory setup` installs
+
+`ai-memory setup` keeps the server running for as long as you are signed in,
+with no administrator rights and no password stored anywhere:
+
+1. It writes an `ai-memory` value under
+   `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, the per-user key
+   Windows runs at every logon:
+   `"<path>\ai-memory.exe" --data-dir "<data dir>" --config "<config>" service-host`.
+2. It starts that command once right away, so the server answers before your
+   next logon.
+3. `service-host` starts a copy of itself detached from any console and exits,
+   so the logon console closes at once. The copy runs
+   `serve --transport http --enable-web` with a hidden console, which the Git
+   CLI fallback and any provider CLI the server starts inherit instead of
+   opening windows of their own.
+4. When the server exits with an error, the host starts it again after five
+   seconds, the way the Linux unit's `Restart=on-failure` does. After five
+   failures within ten seconds of starting (another server already on the
+   port, a broken config) it stops trying; run
+   `ai-memory serve --transport http` in a terminal to see the error.
+
+The host records its own process id and the server's in
+`<data dir>\service-host.json`. A second `setup` leaves a current entry with a
+running host alone; a changed entry is rewritten and the host restarted.
+`ai-memory uninstall --apply` stops the host and deletes the value, but only
+when the value still has the shape `setup` writes (a quoted `ai-memory.exe`
+ending in `service-host`) and its `--data-dir` is the data dir being
+uninstalled; a value someone else put under the same name, or the entry of
+another install, is left in place.
+
+`setup` and `uninstall` read and write the value through the registry API
+rather than running `reg.exe`. Endpoint protection that watches for
+persistence (Bitdefender's Advanced Threat Control, for one) treats an
+unsigned program running `reg.exe add` on the `Run` key as malicious and
+quarantines it (#1280).
+
+Stopping the host avoids `taskkill` for the same reason. `setup` and
+`uninstall` write `<data dir>\service-host.stop`; the host checks for it
+four times a second, kills the server through the process handle it already
+holds, and exits. Only when the host has not exited after ten seconds (a host
+started by an older binary, or a hung one), or when the server outlived its
+host, do they fall back to `taskkill /T /F` on the recorded process ids,
+after checking that each id still belongs to the same ai-memory process.
+The cooperative stop (`Child::kill`) terminates only the server process
+itself, not its process tree, so a subprocess the server started (a CLI-based
+LLM provider in the middle of a consolidation, for one) can linger until it
+finishes on its own.
+
+The logon entry runs only while you are signed in, which matches a systemd
+user unit without lingering and a macOS LaunchAgent. For a server that runs
+before anyone signs in, or for other users of the machine, use a real Windows
+service through WinSW, below, and pass `--no-service` to `setup`.
+
+### Antivirus / EDR
+
+Behaviour-based endpoint protection watches for programs that make
+themselves start at logon, and `ai-memory.exe` is unsigned. Bitdefender's
+Advanced Threat Control has quarantined it after `setup` wrote the logon
+entry ([#1280](https://github.com/akitaonrails/ai-memory/issues/1280)).
+`setup` avoids the signals known to weigh in that decision:
+
+- It writes and reads the `Run` value through the registry API. It never
+  runs `reg.exe add` on the `Run` key.
+- The value holds plain paths, without the `\\?\` prefix a canonical path
+  carries.
+- Stopping the host is cooperative (#1300): the host stops the server through
+  a request file in the data dir, as described above, and `taskkill` runs
+  only as the fallback for a host that does not answer.
+
+That lowers the odds but guarantees nothing; a product can still flag an
+unsigned binary on its own rules.
+
+**How to tell.** A quarantine removes `ai-memory.exe` and leaves the `Run`
+value behind. The server then never starts at logon, and the hooks keep
+calling a path that is gone. `ai-memory doctor` and `ai-memory status` (from
+any copy of the binary that still exists) check the entry `setup` wrote for
+their data dir and warn with `logon_binary_missing` when the
+`ai-memory.exe` it names is no longer there. The warning is also in their
+`--json` output, and `status` prints it even when it cannot reach the
+server, which is the usual state once the binary is gone. Your antivirus
+console or quarantine list shows the detection itself.
+
+**What to do.** Restore the binary from quarantine, or put it back by
+reinstalling, and ask whoever runs the antivirus to allow it (on a managed
+machine that is an administrator change). Then re-run `ai-memory setup`,
+which points the entry at the binary you ran it from and starts the host.
+To stop using the logon entry instead, remove it: `ai-memory uninstall
+--apply` removes it along with the rest of ai-memory's wiring, or delete
+only the value:
+
+```powershell
+Remove-ItemProperty -Path HKCU:\Software\Microsoft\Windows\CurrentVersion\Run -Name ai-memory
+```
+
+`setup --no-service` skips writing the entry but does not remove one that
+already exists. Without the entry, run `ai-memory serve --transport http`
+in a terminal or use the WinSW service below.
+
+### A real Windows service
+
+A Windows service, unlike the logon entry, runs without anyone signed in. It
+needs a **service wrapper**, because ai-memory does not
 implement a Windows Service control-code dispatcher, so `sc create` or
 `New-Service` pointed straight at `ai-memory.exe` will not work: the SCM
 starts the process, waits for it to report in, never hears from it, and
@@ -316,8 +510,8 @@ kills it.
 **Symptoms: `LastTaskResult = 0` reports success forever, the server is
 gone after every reboot, and there is no crash dialog, no Application
 Error event, and no further line in the server log after its startup
-line.** A failure whose only symptom is a green status is why this
-warning exists.
+line.** This warning exists because the only visible status is a green
+one.
 
 The broken shape is a task whose action is
 `powershell.exe -File start-server.ps1`, where the script calls
@@ -333,7 +527,7 @@ The broken shape is a task whose action is
    the action process exits, the job is torn down and every process
    still assigned to it is terminated. `ai-memory.exe` was started as a
    child of the task's PowerShell and never broke away from the job, so
-   it dies with it — in the same second it started.
+   it dies with it, in the same second it started.
 
 The server's log therefore contains exactly one line, its own startup
 line, and nothing after it.
@@ -347,12 +541,12 @@ stays in the job for as long as it runs. Then also:
   logoff and starts without an interactive session;
 - clear the default **3-day execution time limit**
   (`-ExecutionTimeLimit ([TimeSpan]::Zero)`), which otherwise stops a
-  perfectly healthy long-running server;
+  healthy long-running server;
 - set restart-on-failure explicitly (`-RestartCount`,
   `-RestartInterval`). A task has no `Restart=on-failure` unless asked.
 
-Even corrected, that is a task pretending to be a service. Prefer the
-wrapper below.
+Even with those fixes it is still a task standing in for a service, so
+prefer the wrapper below.
 
 ### WinSW
 
@@ -373,7 +567,7 @@ Move-Item .\WinSW-x64.exe "$Dest\ai-memory-service.exe"
 ```
 
 `ai-memory-service.xml`, beside it. Substitute your own expanded `$Dest`
-for `C:\Users\you\AppData\Local\ai-memory` — spell it out rather than
+for `C:\Users\you\AppData\Local\ai-memory`, and spell it out rather than
 leaving a variable in the file:
 
 ```xml
@@ -394,9 +588,9 @@ that mirrors the units' `Restart=on-failure` + `RestartSec=5s`.
 
 **Use absolute paths here, not `%LOCALAPPDATA%`.** A Windows service runs
 as `LocalSystem` unless you say otherwise, and `%LOCALAPPDATA%` expands
-against *that* account — `C:\Windows\System32\config\systemprofile\AppData\Local`
-— so the service would quietly serve an empty data directory somewhere
-you never look, while your real wiki sits untouched in your profile. Either
+against *that* account (`C:\Windows\System32\config\systemprofile\AppData\Local`),
+so the service would serve an empty data directory somewhere you never
+look while your real wiki sits untouched in your profile. Either
 write the path out in full as above, or add a `<serviceaccount>` block so
 the service runs as your user.
 
@@ -414,12 +608,71 @@ ai-memory status
 
 `stop`, `restart`, and `uninstall` are the remaining commands. Because
 the bind is loopback, the service account does not affect reachability:
-agents running as your user still reach `127.0.0.1:49374`. Only the data
-directory is account-sensitive, which is what the absolute path above
-settles.
+agents running as your user still reach `127.0.0.1:49374`.
+
+### ⚠️ Run the service as the owning user when the data dir is in a profile
+
+The absolute `--data-dir` above stops the *empty-directory* trap, but it
+does **not** make a `LocalSystem` service safe over a data directory that
+lives under your user profile (`C:\Users\you\AppData\Local\ai-memory`).
+The data directory is account-sensitive, and so is the **wiki's git
+repository inside it**. libgit2 enforces the same dubious-ownership guard
+as Git itself (CVE-2022-24765): when the process account is not the owner
+of the repository, every commit fails with `code=Owner (-36)`. The server
+still starts, capture still works, and search still answers, but the
+wiki git history silently stops advancing because a wiki commit failure
+is not fatal. As of ai-memory 2.4.x the server logs this at **ERROR** on
+startup with the same remedy below; on older builds it was a WARN that was
+easy to miss.
+
+**Whenever the data directory lives under a user profile, run the service
+as that user** rather than as `LocalSystem`. In the WinSW XML add a
+`<serviceaccount>` block:
+
+```xml
+  <serviceaccount>
+    <domain>.</domain>
+    <user>you</user>
+    <password>your-account-password</password>
+    <allowservicelogon>true</allowservicelogon>
+  </serviceaccount>
+```
+
+(or set it from the service's **Log On** tab in `services.msc` after
+install, then `restart`). This is the WinSW v2.12.0 XML shape used by this
+guide. For a local account, keep `<domain>.</domain>`; for a domain account,
+put the domain in `<domain>` and the account name in `<user>`. WinSW v3 uses
+the combined `<username>DOMAIN\you</username>` form instead, so follow the
+schema for the release you pinned.
+
+Add the block before the first `install`. If the service is already installed,
+stop and uninstall it, update the XML, then install and start it again. Verify
+the account recorded by the Service Control Manager rather than relying only
+on the wrapper's running state:
+
+```powershell
+Get-CimInstance Win32_Service -Filter "Name='ai-memory'" |
+  Select-Object Name, StartName, State
+```
+
+`StartName` must name the intended account, not `LocalSystem`. `LocalSystem`
+is only appropriate when the data directory is in a location that account
+owns outright (e.g. a dedicated `C:\ProgramData\ai-memory` created and owned
+by the service account).
+
+> **WinSW error 1069 / stale password.** If `start` fails with *"The
+> service did not start due to a logon failure"* (error 1069), the
+> `<serviceaccount>` credentials are wrong or stale. This bites
+> **Microsoft-account, PIN, and Windows Hello** users especially: the
+> WinSW `<password>` must be your *account password*, which for a
+> Microsoft account is your online Microsoft password (not your PIN or
+> Hello gesture), and it must be updated in the service config whenever
+> that password changes, because Windows does not roll it forward. Consider a
+> local account, or a dedicated service account with a non-expiring
+> password, for an unattended service.
 
 Keep running `install-mcp` and `install-hooks` **as your own user**, not
-as the service — they write per-user agent config, and the rule at the
+as the service. They write per-user agent config, and the rule at the
 top of this page still applies.
 
 > Verified from the WinSW project documentation and the ai-memory CLI
@@ -434,9 +687,9 @@ top of this page still applies.
 > Confirmed: `install`; `start`; the service `Running` as `LocalSystem`
 > with `StartType Automatic`; an MCP `initialize` answered over the bound
 > port; the absolute `--data-dir` honoured, with no
-> `systemprofile\AppData\Local\ai-memory` created; crash recovery — the
+> `systemprofile\AppData\Local\ai-memory` created; crash recovery (the
 > wrapped `ai-memory.exe` was force-killed and a new process was answering
-> 8s later, consistent with the 5-second `<onfailure>` delay plus startup;
+> 8s later), consistent with the 5-second `<onfailure>` delay plus startup;
 > and a clean `stop` + `uninstall`. The service was configured with
 > `StartType Automatic`; actual boot-time startup was not independently
 > exercised. At the time of this validation (2026-08-31), v2.12.0 was the
@@ -470,25 +723,30 @@ native on an i7-6700HQ). Notes:
 - Exec form requires a real executable path (`.exe`). It does not run `.cmd` or
   `.bat` shims through a shell. `install-hooks` uses the path of the running
   `ai-memory.exe`, so release binaries and Cargo-built binaries work directly.
-- The `.sh`/`.ps1` scripts stay bundled as a fallback — the Docker /
+- The `.sh`/`.ps1` scripts stay bundled as a fallback: the Docker /
   `setup-agent` flow (no local binary) keeps emitting the shell command.
+  For outage parity with the native hooks, both script bundles spool an
+  undeliverable event (connection failure, timeout, 5xx) to the same
+  `<data_dir>/hook-spool/` contract `ai-memory hook-drain` reads, and flush
+  the backlog after the next successful delivery; a terminal 4xx is not
+  retried.
 - `AI_MEMORY_HOOK_PLATFORM` accepts five values:
-  - `windows-native` — Claude exec-form direct binary call (default on native Windows).
-  - `windows` — PowerShell `-EncodedCommand` + staged `.ps1` script. The native
-    Windows Docker-wrapper default because the helper container cannot install
+  - `windows-native`: Claude exec-form direct binary call (default on native Windows).
+  - `windows`: PowerShell `-EncodedCommand` + staged `.ps1` script. This is the
+    native Windows Docker-wrapper default because the helper container cannot install
     its Linux binary into a host hook entry.
-  - `windows-bash` — `bash -c` + `.sh` through Git Bash (the previous
+  - `windows-bash`: `bash -c` + `.sh` through Git Bash (the previous
     default; set this to opt back in, or as a fallback for older Claude Code
     builds that do not support exec form).
-  - `posix` — POSIX `.sh`. The Linux/macOS Docker-wrapper default (the host has
-    no local binary); set it explicitly to opt a native install back into the
-    scripts.
-  - `posix-native` — direct binary call on macOS / Linux (`<exe> hook
+  - `posix`: POSIX `.sh`. An explicit Linux/macOS Docker-wrapper compatibility
+    fallback; set it to opt a native install back into the scripts.
+  - `posix-native`: direct binary call on macOS / Linux (`<exe> hook
     --event …`) instead of the `.sh` script, so the hook uses the local event
     spool + OIDC-token fallback. The **default for native macOS / Linux
     Claude Code installs** (cargo / release binary), mirroring
-    `windows-native`. The Linux/macOS Docker wrapper forces `posix`, so its
-    host-rendered config keeps the `.sh` scripts.
+    `windows-native`. The Linux/macOS Docker wrapper uses its
+    checksum-verified native host client by default; set `posix` explicitly to
+    keep the `.sh` scripts.
 
   Set the env var before running `install-hooks` so the chosen platform
   is baked into the rendered hook commands.
@@ -510,10 +768,12 @@ large-backlog instances can raise them with whole-minute overrides. Unlike
 apply to the agent's environment (no re-`install-hooks` needed):
 
 Native hooks accept well-formed JSON with or without one leading UTF-8 BOM, as
-some PowerShell pipelines add that marker when writing to a native process. Any
-other malformed stdin is not spooled or sent; the hook prints a fixed warning
-to stderr, returns `{}` on stdout, and exits successfully so it cannot break the
-host agent. The warning never includes payload contents.
+some PowerShell pipelines add that marker when writing to a native process. The
+server's `/hook` ingress skips the same marker, so a shell-bundle hook that
+forwards it unchanged is still stored. Any other malformed stdin is not spooled
+or sent; the hook prints a fixed warning to stderr, returns `{}` on stdout, and
+exits successfully so it cannot break the host agent. The warning never
+includes payload contents.
 
 | Env var | Built-in default | Max override | What it caps |
 |---|---:|---:|---|
@@ -522,6 +782,11 @@ host agent. The warning never includes payload contents.
 | `AI_MEMORY_HOOK_START_BUDGET_MINUTES` | 3 seconds | 60 minutes | total time `session-start` may spend waiting for the drain lock and cleanup draining |
 | `AI_MEMORY_HOOK_BACKGROUND_DRAIN_BUDGET_MINUTES` | 5 minutes | 60 minutes | total time the detached `hook-drain` helper may spend after `session-end` |
 | `AI_MEMORY_HOOK_INCREMENTAL_THRESHOLD` | 32 events | positive integer | spool backlog size that triggers a 250 ms `post-tool-use` catch-up drain |
+| `AI_MEMORY_HOOK_SPOOL_MAX_ATTEMPTS` | 8 failed passes | non-negative integer | failed drain passes before dropping an event; `0` disables only attempt-count drops |
+
+The retry setting can also be written as `max_attempts` under `[hook_spool]` in
+`<data_dir>/config.toml`; the runtime environment wins when both are set. A zero
+value still leaves the 7-day age limit and 10,000-file spool cap active.
 
 Timing values must be positive whole minutes. Missing, empty, non-numeric, or
 zero values fall back to the built-in defaults; values above 60 are clamped. The
@@ -535,6 +800,64 @@ On Windows, a contended drain lock can be reported as the native
 ai-memory treats both as normal lock-busy states, so concurrent drains wait,
 skip, or expire according to the same spool timing rules instead of failing the
 hook.
+
+<!-- BEGIN: windows-tier-exit-criteria -->
+## Support Tier: Experimental → Supported Exit Criteria
+
+Native Windows is currently an **Experimental** tier. This is the checklist a
+maintainer uses to decide whether it can be promoted to **Supported**. It records
+status only; the tier has not changed.
+Each item is marked **done**, **in-progress**, or **deferred-pending-policy**,
+from what the repository actually ships today.
+
+- **CI trigger coverage: done.** `.github/workflows/windows.yml` runs on a
+  nightly `schedule`, on `workflow_dispatch`, and on pull requests. A pull
+  request that touches platform-sensitive code (path handling, file locking,
+  git plumbing, the hook bundle: `crates/ai-memory-{wiki,store,hooks}/**`,
+  `crates/ai-memory-cli/src/commands/install_hooks.rs`, `hooks/**`,
+  `tests/hooks/**`, and the workflow itself) now opts in automatically via the
+  workflow's leading `changes` job (`dorny/paths-filter`, SHA-pinned); the
+  `windows` label remains a manual override for PRs outside those paths, so
+  coverage does not depend on someone remembering the label.
+
+- **Hook-bundle Windows job: done.** The `hooks` job in `windows.yml` runs
+  `tests/hooks/test_lib.sh` on `windows-latest`. That suite drives
+  `hooks/lib/ai-memory-hook.ps1`, whose PowerShell branch only ever executes
+  natively on Windows, so CI now exercises that PowerShell code on the platform
+  it targets instead of leaving it to a contributor's machine.
+
+- **`#[cfg(windows)]` regression coverage: in-progress.** The Windows-only
+  regression tests that no Linux/macOS leg can compile run here: the drain-lock
+  `ERROR_LOCK_VIOLATION` busy-state handling, the libgit2 path-resolution
+  fallback to the Git CLI when opening a freshly initialized wiki repository,
+  and verbatim (`\\?\`) path handling (see the header of `windows.yml` and
+  Scenario D above). This coverage exists for the platform code that has hit a
+  documented bug. The current tests exist; the item stays **in-progress**
+  because each new Windows path-, lock-, or git-touching change is expected to
+  add its own `#[cfg(windows)]` regression before promotion.
+
+- **`.exe` code-signing: deferred-pending-policy.** Release binaries and the
+  `build.rs` helper executables Cargo emits are unsigned. On machines enforcing
+  **App Control for Business** or **Smart App Control**, unsigned binaries run
+  from user-writable directories are blocked. This is the `os error 4551`
+  build failure documented in Scenario D, and it can equally block an unsigned
+  released `ai-memory.exe`. Signing needs a code-signing certificate and a
+  decision on how its private material is held as a CI secret (and rotated).
+  Both are maintainer/policy calls, so this item is deferred until that
+  decision is made; it is a blocker for a frictionless Supported experience on
+  Application-Control-enforced fleets.
+
+- **Native `ai-memory upgrade` path: done.** `ai-memory upgrade` upgrades a
+  writable native install in place (#801, #802): it verifies the
+  `ai-memory-windows-x86_64.zip` checksum, replaces `ai-memory.exe` by
+  rename-aside, refreshes a sibling `hooks/` tree, and re-stages installed
+  hooks (see Scenario C). A non-writable prefix (for example under Program
+  Files) still upgrades through the manual download/extract sequence.
+
+Promotion to Supported is the maintainer's decision once the in-progress items
+are closed and the deferred code-signing policy is resolved (or explicitly
+accepted as out of scope for the tier).
+<!-- END: windows-tier-exit-criteria -->
 
 ## Current Harness Caveats
 
@@ -558,9 +881,10 @@ Windows agent builds.
 - MCP over HTTP should be less path-sensitive than hooks, but
   `install-mcp --apply` still writes to a client-specific config file;
   confirm the agent actually loads it.
-- OpenClaw, OpenCode (v1 `ai-memory.ts` plus the 2 beta's
-  `ai-memory-opencode2.ts`), OMP / Oh My Pi, and Pi use generated TypeScript
-  integrations rather than the shell hook bundle, so their Windows
+- OpenClaw, OpenCode (V1 `ai-memory.ts` or V2
+  `ai-memory-opencode2.ts`, selected from the resolved executable major), OMP /
+  Oh My Pi, and Pi use generated TypeScript integrations rather than the shell
+  hook bundle, so their Windows
   behavior depends on the host runtime loading those files correctly.
   Pi's generated extension also bridges MCP tools because Pi has no native
   `mcp.json` install surface.

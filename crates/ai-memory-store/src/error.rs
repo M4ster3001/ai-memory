@@ -4,6 +4,57 @@ use thiserror::Error;
 
 use ai_memory_core::MemoryError;
 
+/// Which of its keys makes a project answer to an ambiguous name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AmbiguousMatch {
+    /// The project's current name.
+    Name,
+    /// The canonical path-style key derived from its repository identity.
+    CanonicalKey,
+    /// The v2 basename key derived from its repository identity.
+    LegacyKey,
+}
+
+/// One project that answers to an ambiguous name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AmbiguousProjectHolder {
+    /// The project's current name, or `None` for a restricted project: the
+    /// project list hides those names from callers without a grant, and the
+    /// lookup that fails here runs before any caller is authorized.
+    pub name: Option<String>,
+    /// The key that matched.
+    pub matched_by: AmbiguousMatch,
+}
+
+/// The projects behind a [`StoreError::ProjectNameAmbiguous`], rendered as
+/// the tail of its message so the operator can see which project to rename,
+/// purge or pin with a marker. Empty when the lookup did not collect them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AmbiguousProjectHolders(pub Vec<AmbiguousProjectHolder>);
+
+impl std::fmt::Display for AmbiguousProjectHolders {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let last = self.0.len().saturating_sub(1);
+        for (index, holder) in self.0.iter().enumerate() {
+            f.write_str(match index {
+                0 => ": it is ",
+                _ if index == last => " and ",
+                _ => ", ",
+            })?;
+            f.write_str(match holder.matched_by {
+                AmbiguousMatch::Name => "the name of ",
+                AmbiguousMatch::CanonicalKey => "the canonical key of ",
+                AmbiguousMatch::LegacyKey => "the legacy key of ",
+            })?;
+            match &holder.name {
+                Some(name) => write!(f, "project '{name}'")?,
+                None => f.write_str("a restricted project")?,
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Result alias used throughout the store crate.
 pub type StoreResult<T> = Result<T, StoreError>;
 
@@ -20,7 +71,7 @@ pub enum StoreError {
     Migration(#[from] refinery::Error),
 
     /// The store's schema is newer than this binary: an applied migration is
-    /// absent from the compiled-in set (refinery reports this as
+    /// above the highest compiled-in version (refinery reports this as
     /// `MissingVersion`). The data was written by a newer ai-memory build than
     /// the one now running, so the store is left untouched rather than opened
     /// against a schema this binary does not understand. This replaces
@@ -41,6 +92,20 @@ pub enum StoreError {
         supported: u32,
     },
 
+    /// An embedded migration is absent from the store's history even though a
+    /// later version is already applied. Opening remains refused; deciding how
+    /// to repair a divergent history requires inspecting the actual schema.
+    #[error(
+        "memory database migration history has a gap: migration {missing} is \
+         not recorded, but a later migration is already applied. Back up the \
+         data directory and report the migration history for review before \
+         attempting a repair."
+    )]
+    MigrationHistoryGap {
+        /// Missing embedded migration, formatted as `V{version} ({name})`.
+        missing: String,
+    },
+
     /// I/O failed (e.g. opening the DB file).
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -52,6 +117,11 @@ pub enum StoreError {
     /// Writer actor has shut down.
     #[error("writer actor is no longer running")]
     WriterClosed,
+
+    /// The read connection pool was closed at shutdown; no new read opens a
+    /// connection.
+    #[error("read connection pool is closed")]
+    ReaderClosed,
 
     /// A hook tried to reuse a session id that belongs to another immutable
     /// session tuple or operator. Deliberately carries no row details.
@@ -71,6 +141,15 @@ pub enum StoreError {
     #[error("project name '{0}' is already taken in this workspace")]
     ProjectNameTaken(String),
 
+    /// More than one project in a workspace matched a compatibility name.
+    #[error("project name '{name}' is ambiguous in this workspace{holders}")]
+    ProjectNameAmbiguous {
+        /// The name the caller asked for.
+        name: String,
+        /// The projects that answer to it, when the lookup knows them.
+        holders: AmbiguousProjectHolders,
+    },
+
     /// The supplied project name failed validation (empty, slash, etc.).
     #[error("invalid project name: {0}")]
     InvalidProjectName(String),
@@ -80,7 +159,7 @@ pub enum StoreError {
     /// caller-invariant violation).
     #[error("not found: {0}")]
     NotFound(String),
-    /// A late-arriving event named a session that `purge_session` removed.
+    /// An event or disk reindex named a session that `purge_session` removed.
     /// Recreating it would silently undo a deletion the operator already
     /// performed and an application may already have reported to a user, so
     /// ingest refuses instead (#387).
@@ -162,6 +241,10 @@ pub enum StoreError {
     /// description.
     #[error("os error: {0}")]
     Os(String),
+
+    /// An authenticated finish authority failed an owner or project guard.
+    #[error("forbidden: {0}")]
+    Forbidden(&'static str),
 
     /// A persisted row contains malformed data.
     #[error("malformed record: {0}")]

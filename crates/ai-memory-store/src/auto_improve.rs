@@ -313,6 +313,45 @@ pub struct OwnedAutoImproveProposalDetail {
     pub staged_by_actor_user: Option<String>,
 }
 
+/// One pending proposal with the names and bodies a human reviewer reads.
+///
+/// Feeds the root-only `/web/pending` triage page, which lists every project's
+/// queue at once; the decision itself still goes through
+/// `/admin/pending-writes/{id}/approve|reject`.
+#[derive(Debug, Clone, Serialize)]
+pub struct PendingAutoImproveReview {
+    /// The list-view fields.
+    pub summary: AutoImproveProposalSummary,
+    /// Owning workspace name.
+    pub workspace_name: String,
+    /// Owning project name.
+    pub project_name: String,
+    /// Why the reviewer proposed this edit.
+    pub rationale: String,
+    /// Full proposed page body.
+    pub body_markdown: String,
+    /// `full_page` or `patch`.
+    pub edit_mode: String,
+}
+
+/// One project that has pending proposals, with its pending count.
+///
+/// Feeds the `/web/pending` project filter, so every project with a pending
+/// proposal is listed even when the page reads only part of the queue.
+#[derive(Debug, Clone, Serialize)]
+pub struct PendingAutoImproveScope {
+    /// Owning workspace.
+    pub workspace_id: WorkspaceId,
+    /// Owning project.
+    pub project_id: ProjectId,
+    /// Workspace name.
+    pub workspace_name: String,
+    /// Project name.
+    pub project_name: String,
+    /// Pending proposals in this project.
+    pub pending: u64,
+}
+
 /// One append-only status-history entry for a proposal.
 #[derive(Debug, Clone, Serialize)]
 pub struct AutoImproveProposalEvent {
@@ -431,6 +470,10 @@ pub struct FailAutoImproveProposal {
     pub proposal_id: AutoImproveProposalId,
     /// What went wrong.
     pub reason: String,
+    /// Also record `reason` in `auto_improve_rejections`, which later review
+    /// runs read as patterns to avoid. `false` when the failure says nothing
+    /// about the proposal itself, such as an unreachable admission webhook.
+    pub record_rejection: bool,
     /// Actor attribution for the decision event.
     pub actor: ActorContext,
     /// Deciding user, when identified.
@@ -959,8 +1002,9 @@ fn stage_run_impl(
     })
 }
 
-/// Mark a pending proposal `failed`, record the rejection fingerprint, and
-/// append a `failed` event.
+/// Mark a pending proposal `failed`, record the rejection fingerprint when
+/// [`FailAutoImproveProposal::record_rejection`] is set, and append a
+/// `failed` event.
 ///
 /// # Errors
 /// Returns [`StoreError::InvalidState`] when the proposal is not pending in
@@ -989,7 +1033,9 @@ pub fn fail_proposal(conn: &mut Connection, input: &FailAutoImproveProposal) -> 
             "auto-improve proposal is not pending or not in scope".into(),
         ));
     }
-    insert_rejection_for_proposal_in_tx(&tx, input.proposal_id, &input.reason, now)?;
+    if input.record_rejection {
+        insert_rejection_for_proposal_in_tx(&tx, input.proposal_id, &input.reason, now)?;
+    }
     insert_event_in_tx(
         &tx,
         input.proposal_id,

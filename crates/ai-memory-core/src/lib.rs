@@ -7,18 +7,30 @@
 
 pub mod active_project;
 pub mod actor;
+pub mod agent_backup;
+pub mod compaction_recap;
 pub mod error;
+pub mod excerpt;
+pub mod fix_lines;
 pub mod handoff;
 pub mod ingest_metrics;
 pub use ingest_metrics::{IngestMetrics, IngestMetricsSnapshot};
 pub mod ids;
+pub mod latency;
+pub use latency::{LATENCY_BUCKET_BOUNDS_US, LatencyHistogram, LatencySnapshot, LatencyTimer};
+pub mod log_ledger;
 pub mod message;
 pub mod observation;
 pub mod okf;
 pub mod page;
+pub mod profile;
+pub mod repository_identity;
+pub use repository_identity::{MARKER_FILENAME, MARKER_FILENAMES};
 pub mod routing_skills;
 pub mod scaffolding;
-pub use scaffolding::looks_like_scaffolding;
+pub use scaffolding::{
+    looks_like_codex_instructions, looks_like_markup_block, looks_like_scaffolding,
+};
 pub mod routing_snippet;
 pub mod sanitize;
 pub mod slots;
@@ -46,9 +58,13 @@ pub use active_project::{
     DEFAULT_PER_KEY_TTL, MidSessionRouting, ReadPointer,
 };
 pub use actor::{
-    ActorContext, AuthLevel, AuthzError, Capability, IdentityKey, OwnerFilter,
-    SKIP_ADMISSION_CHAIN_HEADER, owner_identity, owner_stamp, parse_skip_admission_chain,
-    skip_admission_chain_for,
+    ActorContext, AuthLevel, AuthorizedViewer, AuthzError, Capability, IdentityKey,
+    LegacyBrowserAuth, OwnerFilter, SKIP_ADMISSION_CHAIN_HEADER, owner_identity, owner_stamp,
+    parse_skip_admission_chain, skip_admission_chain_for,
+};
+pub use agent_backup::{
+    AGENT_BACKUP_SCHEMA_VERSION, AgentAssetKind, AgentAssetScope, AgentBackupEntry,
+    AgentBackupManifest, HostInfo,
 };
 pub use error::{MemoryError, MemoryResult};
 pub use handoff::{
@@ -58,7 +74,8 @@ pub use handoff::{
 pub use ids::{
     AgentKind, ApiCredentialId, AutoImproveProposalId, AutoImproveRunId, EntityId, HandoffId,
     ManagedRunId, MessageId, ObservationId, PageFeedbackId, PageId, PagePath, ProjectId, SessionId,
-    UserId, WorkspaceId, WorkstreamId, is_git_reserved_component, portable_page_key,
+    UserId, WorkspaceId, WorkstreamId, is_dos_device_name, is_git_reserved_component,
+    portable_page_key,
 };
 pub use message::{
     AgentMessage, MessageBox, MessageClaim, MessageOrigin, MessageState, NewAgentMessage,
@@ -68,15 +85,15 @@ pub use observation::{NewObservation, NewSession, NewSessionUsage, Observation, 
 pub use page::{
     FeedbackKind, LinkTarget, MAX_ENTITIES_PER_PAGE, MAX_ENTITY_LEN, NewPage, Page, PageEvidence,
     PageEvidenceKind, Relation, Tier, frontmatter_entity_names, normalize_entities,
-    normalize_entity,
+    normalize_entity, parse_expires_at_instant,
 };
 pub use routing_snippet::{
     COMPACT_SNIPPET_BODY, MARKER_END, MARKER_START, SNIPPET_BODY, compact_block, find_marker_line,
     full_block,
 };
 pub use sanitize::{
-    OBSERVATION_BODY_MAX_BYTES, SanitizeConfig, Sanitized, Sanitizer, truncate_utf8_bytes,
-    truncate_utf8_bytes_head_tail,
+    OBSERVATION_BODY_MAX_BYTES, SanitizeConfig, Sanitized, Sanitizer, truncate_for_title,
+    truncate_utf8_bytes, truncate_utf8_bytes_head_tail,
 };
 pub use slots::{
     SLOT_PREFIX, SlotPlacement, SlotVisibility, is_slot_named, is_slot_path, slot_owner,
@@ -90,8 +107,9 @@ pub use user::{
 };
 pub use workstream::{
     FinishManagedRunRequest, FinishManagedRunResponse, LinkManagedRunRequest,
-    ListManagedWorkstreamsRequest, MANAGED_WORKSTREAM_PACKET_MARKER, ManagedRunContextResponse,
-    ManagedRunStatus, ManagedWorkstreamSummary, NewWorkstreamEvent, PrepareManagedRunRequest,
-    PrepareManagedRunResponse, RenameManagedWorkstreamRequest, RenamedManagedWorkstream,
-    UNTRUSTED_MEMORY_NOTICE, WorkstreamCheckpoint, WorkstreamEvent, WorkstreamEventKind,
+    ListManagedWorkstreamsRequest, MANAGED_WORKSTREAM_PACKET_MARKER, ManagedNativeSessionReference,
+    ManagedRunContextResponse, ManagedRunStatus, ManagedWorkstreamSummary, NativeSessionIdentity,
+    NewWorkstreamEvent, PrepareManagedRunRequest, PrepareManagedRunResponse,
+    RenameManagedWorkstreamRequest, RenamedManagedWorkstream, UNTRUSTED_MEMORY_NOTICE,
+    WorkstreamCheckpoint, WorkstreamEvent, WorkstreamEventKind, scrub_workstream_provenance,
 };

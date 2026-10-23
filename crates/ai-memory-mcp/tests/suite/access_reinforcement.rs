@@ -267,7 +267,7 @@ async fn read_page_throttle_no_double_bump() {
     );
 }
 
-/// The bump is additive: a plain read's response payload is exactly the four
+/// The bump is additive: a plain read's response payload is exactly the
 /// documented fields, unchanged by reinforcement.
 #[tokio::test]
 async fn read_page_response_payload_unchanged() {
@@ -288,6 +288,7 @@ async fn read_page_response_payload_unchanged() {
         vec![
             "body",
             "frontmatter",
+            "page_id",
             "path",
             "title",
             "total_chars",

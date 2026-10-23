@@ -1,5 +1,6 @@
 //! `GET /` — project list cards.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use askama::Template;
@@ -9,19 +10,39 @@ use axum::response::Html;
 
 use crate::state::WebState;
 use crate::templates::{
-    DashboardStats, IngestStats, OkfDialog, ProjectCard, ProjectsView, humanize, project_href,
+    DashboardStats, IngestStats, MailSummaryItem, OkfDialog, ProjectCard, ProjectsView, humanize,
+    project_href,
 };
 
+/// Projects the home page's mail summary names before saying "and N more".
+const MAIL_SUMMARY_PROJECTS: usize = 5;
+
 /// Handler for `GET /`.
+///
+/// Lists only the repositories the viewer may read once authorization is on
+/// (#708): the card grid is a list of repository names, and a name is itself
+/// what a team from another organisation must not see.
 pub(crate) async fn handler(
     State(state): State<Arc<WebState>>,
+    level: Option<axum::Extension<ai_memory_core::AuthLevel>>,
+    viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
 ) -> Result<Html<String>, StatusCode> {
-    let summaries = state
-        .reader
-        .list_projects_with_stats()
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let viewer_id = viewer.map(|axum::Extension(viewer)| viewer.user());
+    let (summaries, counts) = tokio::try_join!(
+        state.reader.list_projects_with_stats(viewer_id),
+        // One grouped query for every card; the badge shows only where mail waits.
+        state.reader.pending_inbox_counts(viewer_id),
+    )
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut pending: HashMap<String, HashMap<String, u64>> = HashMap::new();
+    for c in counts {
+        pending
+            .entry(c.workspace_name)
+            .or_default()
+            .insert(c.project_name, c.pending);
+    }
 
+    let show_ingest = super::require_admin(&state, level).await.is_ok();
     let dashboard = DashboardStats {
         project_count: summaries.len(),
         page_count: summaries.iter().map(|s| s.page_count).sum(),
@@ -33,22 +54,31 @@ pub(crate) async fn handler(
             .find_map(|s| s.last_activity.as_deref())
             .map(humanize)
             .unwrap_or_default(),
-        ingest: state.ingest_metrics.as_ref().map(|metrics| {
-            let snapshot = metrics.snapshot();
-            IngestStats {
-                accepted: snapshot.accepted,
-                dropped_by_policy: snapshot.dropped_by_policy,
-                shed_saturated: snapshot.shed_saturated,
-                shed_rate_limited: snapshot.shed_rate_limited,
-            }
-        }),
+        ingest: state
+            .ingest_metrics
+            .as_ref()
+            .filter(|_| show_ingest)
+            .map(|metrics| {
+                let snapshot = metrics.snapshot();
+                IngestStats {
+                    accepted: snapshot.accepted,
+                    dropped_by_policy: snapshot.dropped_by_policy,
+                    shed_saturated: snapshot.shed_saturated,
+                    shed_rate_limited: snapshot.shed_rate_limited,
+                }
+            }),
     };
-    let projects = summaries
+    let projects: Vec<ProjectCard> = summaries
         .into_iter()
         .map(|s| {
             let last_updated_relative =
                 s.last_activity.as_deref().map(humanize).unwrap_or_default();
             let href = project_href(&s.workspace_name, &s.project_name);
+            let pending_inbox = pending
+                .get(&s.workspace_name)
+                .and_then(|projects| projects.get(&s.project_name))
+                .copied()
+                .unwrap_or(0);
             ProjectCard {
                 workspace: s.workspace_name,
                 project: s.project_name,
@@ -57,8 +87,33 @@ pub(crate) async fn handler(
                 observation_count: s.observation_count,
                 open_session_count: s.open_session_count,
                 last_updated_relative,
+                pending_inbox,
                 href,
             }
+        })
+        .collect();
+
+    // The summary reads from the cards the viewer may see, so it can never
+    // name a project the grid below it does not.
+    let mut with_mail: Vec<&ProjectCard> = projects
+        .iter()
+        .filter(|card| card.pending_inbox > 0)
+        .collect();
+    with_mail.sort_by(|a, b| {
+        b.pending_inbox
+            .cmp(&a.pending_inbox)
+            .then_with(|| a.workspace.cmp(&b.workspace))
+            .then_with(|| a.project.cmp(&b.project))
+    });
+    let mail_total: u64 = with_mail.iter().map(|card| card.pending_inbox).sum();
+    let mail_hidden = with_mail.len().saturating_sub(MAIL_SUMMARY_PROJECTS);
+    let mail_projects = with_mail
+        .into_iter()
+        .take(MAIL_SUMMARY_PROJECTS)
+        .map(|card| MailSummaryItem {
+            label: format!("{}/{}", card.workspace, card.project),
+            href: card.href.clone(),
+            pending: card.pending_inbox,
         })
         .collect();
 
@@ -67,6 +122,9 @@ pub(crate) async fn handler(
         projects,
         dashboard,
         okf_dialog,
+        mail_total,
+        mail_projects,
+        mail_hidden,
     }
     .render()
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;

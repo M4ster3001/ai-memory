@@ -17,12 +17,13 @@ use tracing::{debug, info, warn};
 use crate::auth::CopilotAuth;
 use crate::auth_file::{load_entry, now_ms, save_entry};
 use crate::embedding::{
-    Embedder, OPENAI_EMBED_MAX_TOKENS, normalise, parse_openai_embedding_values,
+    Embedder, OPENAI_EMBED_MAX_TOKENS, normalise, parse_openai_embedding_values, retry_delay,
 };
 use crate::error::{LlmError, LlmResult};
 use crate::openai::{STRUCTURED_OUTPUT_SCHEMA_NAME, enforce_strict_object_schemas};
+use crate::openai_oauth::model_uses_default_temperature;
 use crate::provider::LlmProvider;
-use crate::response::{provider_error_body, response_json_limited, response_text_limited};
+use crate::response::{provider_error, response_json_limited, response_text_limited};
 use crate::text::truncate_for_embedding;
 use crate::types::{ChatRequest, ChatResponse, ExtraHeaders, Usage};
 
@@ -209,6 +210,7 @@ impl CopilotAuthState {
             )));
         }
         let client = reqwest::Client::builder()
+            .redirect(crate::redirect::same_origin_redirects())
             .user_agent(COPILOT_USER_AGENT)
             .build()
             .map_err(LlmError::from)?;
@@ -253,7 +255,13 @@ impl CopilotAuthState {
             })?;
 
         info!("copilot API token expired or missing, exchanging GitHub token");
-        let exchanged = exchange_copilot_token(&self.client, self.timeout, &github).await?;
+        let exchanged = exchange_copilot_token(
+            &self.client,
+            self.timeout,
+            &github,
+            GITHUB_COPILOT_TOKEN_URL,
+        )
+        .await?;
         guard.copilot_access = Some(exchanged.access.clone());
         guard.copilot_expires_at_ms = Some(exchanged.expires_at_ms);
         guard.api_base_url = Some(resolve_copilot_api_base_url(
@@ -383,13 +391,8 @@ impl CopilotProvider {
                 .headers(copilot_runtime_headers()),
         );
         let resp = request.json(body).send().await.map_err(LlmError::from)?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = provider_error_body(resp).await;
-            return Err(LlmError::Provider {
-                status: status.as_u16(),
-                body,
-            });
+        if !resp.status().is_success() {
+            return Err(provider_error(resp).await);
         }
         response_json_limited::<CopilotChatResponse>(resp).await
     }
@@ -410,12 +413,8 @@ impl CopilotProvider {
                 .headers(copilot_runtime_headers()),
         );
         let resp = request.json(body).send().await.map_err(LlmError::from)?;
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(LlmError::Provider {
-                status: status.as_u16(),
-                body: provider_error_body(resp).await,
-            });
+        if !resp.status().is_success() {
+            return Err(provider_error(resp).await);
         }
         response_json_limited::<CopilotResponsesResponse>(resp).await
     }
@@ -444,6 +443,7 @@ impl LlmProvider for CopilotProvider {
                     &build_responses_request(&self.model, &request, None),
                 )
                 .await?,
+                &self.model,
             )?),
         }
     }
@@ -489,6 +489,7 @@ impl LlmProvider for CopilotProvider {
                         &build_responses_request(&self.model, &request, Some(schema)),
                     )
                     .await?,
+                &self.model,
             )?,
         };
         serde_json::from_str::<serde_json::Value>(&text).map_err(LlmError::from)
@@ -578,6 +579,7 @@ impl Embedder for CopilotEmbedder {
             model: &self.model,
         };
         let mut attempt = 0u32;
+        let mut waited = Duration::ZERO;
         loop {
             let resp = self
                 .state
@@ -591,27 +593,25 @@ impl Embedder for CopilotEmbedder {
                 .await
                 .map_err(LlmError::from)?;
             let status = resp.status();
-            if status.as_u16() == 429 && attempt < 5 {
+            let retry_after = resp.headers().get(reqwest::header::RETRY_AFTER);
+            if let Some(delay) = retry_delay(status, retry_after, attempt + 1, waited) {
                 attempt += 1;
-                let delay = Duration::from_secs(2u64.saturating_pow(attempt));
-                debug!(attempt, ?delay, "copilot embeddings rate-limited; retrying");
+                waited += delay;
+                debug!(
+                    attempt,
+                    ?delay,
+                    status = status.as_u16(),
+                    "copilot embeddings 429/503; retrying"
+                );
                 tokio::time::sleep(delay).await;
                 continue;
             }
             // Client errors (e.g. input too long) are not retried.
             if status.as_u16() == 400 {
-                let body = provider_error_body(resp).await;
-                return Err(LlmError::Provider {
-                    status: status.as_u16(),
-                    body,
-                });
+                return Err(provider_error(resp).await);
             }
             if !status.is_success() {
-                let body = provider_error_body(resp).await;
-                return Err(LlmError::Provider {
-                    status: status.as_u16(),
-                    body,
-                });
+                return Err(provider_error(resp).await);
             }
             let body = response_text_limited(resp).await?;
             let values = parse_openai_embedding_values(&body, status.as_u16())?;
@@ -637,9 +637,10 @@ async fn exchange_copilot_token(
     client: &reqwest::Client,
     timeout: Duration,
     github_token: &SecretString,
+    token_url: &str,
 ) -> LlmResult<CopilotApiToken> {
     let resp = client
-        .get(GITHUB_COPILOT_TOKEN_URL)
+        .get(token_url)
         .timeout(timeout)
         .bearer_auth(github_token.expose_secret())
         .headers(copilot_token_exchange_headers())
@@ -648,7 +649,24 @@ async fn exchange_copilot_token(
         .map_err(LlmError::from)?;
     let status = resp.status();
     if !status.is_success() {
-        let body = provider_error_body(resp).await;
+        let error = provider_error(resp).await;
+        let LlmError::Provider {
+            body, retry_after, ..
+        } = error
+        else {
+            return Err(error);
+        };
+        // GitHub rate-limits this endpoint per account. A 429/5xx here says
+        // nothing about the credential, and `LlmError::Auth` is not transient,
+        // so classifying it as auth stops the fallback chain and tells the
+        // operator to fix a token that is fine.
+        if LlmError::status_is_transient(status.as_u16()) {
+            return Err(LlmError::Provider {
+                status: status.as_u16(),
+                body: format!("copilot token exchange: {body}"),
+                retry_after,
+            });
+        }
         return Err(LlmError::Auth(format!(
             "copilot token exchange failed ({status}): {body}"
         )));
@@ -693,11 +711,6 @@ fn build_chat_request<'a>(
         stream: false,
         response_format,
     }
-}
-
-fn model_uses_default_temperature(model: &str) -> bool {
-    let m = model.to_ascii_lowercase();
-    m.starts_with("gpt-5") || m.starts_with('o')
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -860,6 +873,8 @@ struct CopilotResponsesResponse {
     #[serde(default)]
     status: Option<String>,
     #[serde(default)]
+    incomplete_details: Option<CopilotIncompleteDetails>,
+    #[serde(default)]
     error: Option<CopilotResponsesError>,
 }
 
@@ -889,6 +904,14 @@ struct CopilotResponsesUsage {
     output_tokens: u32,
 }
 
+/// Why a `/responses` answer stopped short. `error` is null on an incomplete
+/// response, so this is the only field that explains one.
+#[derive(Debug, Deserialize)]
+struct CopilotIncompleteDetails {
+    #[serde(default)]
+    reason: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct CopilotResponsesError {
     #[serde(default)]
@@ -897,12 +920,26 @@ struct CopilotResponsesError {
     message: Option<String>,
 }
 
-fn response_text(response: &CopilotResponsesResponse) -> LlmResult<String> {
+fn response_text(response: &CopilotResponsesResponse, model: &str) -> LlmResult<String> {
     if response
         .status
         .as_deref()
         .is_some_and(|status| status != "completed")
     {
+        // `max_output_tokens` is the one non-completed status the operator can
+        // act on, and it is not an unexpected shape: raising `max_tokens` fixes
+        // it. The OpenAI path reports the same stop as `TruncatedResponse`.
+        if response
+            .incomplete_details
+            .as_ref()
+            .and_then(|details| details.reason.as_deref())
+            == Some("max_output_tokens")
+        {
+            return Err(LlmError::TruncatedResponse {
+                model: model.to_owned(),
+                completion_tokens: response.usage.as_ref().map(|usage| usage.output_tokens),
+            });
+        }
         let detail = response
             .error
             .as_ref()
@@ -943,8 +980,11 @@ fn response_text(response: &CopilotResponsesResponse) -> LlmResult<String> {
     ))
 }
 
-fn to_responses_chat_response(response: CopilotResponsesResponse) -> LlmResult<ChatResponse> {
-    let text = response_text(&response)?;
+fn to_responses_chat_response(
+    response: CopilotResponsesResponse,
+    model: &str,
+) -> LlmResult<ChatResponse> {
+    let text = response_text(&response, model)?;
     Ok(ChatResponse {
         text,
         usage: response.usage.map(|usage| Usage {
@@ -1130,6 +1170,40 @@ mod tests {
 
     use super::*;
 
+    #[tokio::test]
+    async fn token_exchange_treats_a_throttled_endpoint_as_transient() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for (code, transient) in [(429u16, true), (503, true), (401, false)] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(code).set_body_string("{}"))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let Err(err) = exchange_copilot_token(
+                &reqwest::Client::new(),
+                Duration::from_secs(5),
+                &SecretString::from("gho_test"),
+                &server.uri(),
+            )
+            .await
+            else {
+                panic!("{code} from the token endpoint must fail");
+            };
+
+            assert_eq!(err.is_transient(), transient, "{code}: {err:?}");
+            if transient {
+                assert_eq!(err.http_status(), Some(code), "{code}: {err:?}");
+                assert!(err.to_string().contains("copilot token exchange"), "{err}");
+            } else {
+                assert!(matches!(err, LlmError::Auth(_)), "{code}: {err:?}");
+            }
+        }
+    }
+
     #[test]
     fn token_file_round_trips_copilot_entry() {
         let dir = tempfile::tempdir().unwrap();
@@ -1314,6 +1388,31 @@ mod tests {
         assert_eq!(value["max_tokens"], 123);
         assert!(value.get("temperature").is_none());
         assert_eq!(value["stream"], false);
+    }
+
+    #[test]
+    fn chat_request_omits_gpt6_temperature() {
+        let request = ChatRequest {
+            system: None,
+            messages: vec![crate::types::ChatMessage::user("hello")],
+            temperature: Some(0.2),
+            max_tokens: 123,
+        };
+        let value = serde_json::to_value(build_chat_request("gpt-6-sol", &request, None)).unwrap();
+        assert!(value.get("temperature").is_none());
+    }
+
+    #[test]
+    fn responses_request_omits_gpt6_temperature() {
+        let request = ChatRequest {
+            system: None,
+            messages: vec![crate::types::ChatMessage::user("hello")],
+            temperature: Some(0.2),
+            max_tokens: 123,
+        };
+        let value =
+            serde_json::to_value(build_responses_request("gpt-6-sol", &request, None)).unwrap();
+        assert!(value.get("temperature").is_none());
     }
 
     #[test]

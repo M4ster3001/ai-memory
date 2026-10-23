@@ -1,5 +1,7 @@
 //! LLM error type.
 
+use std::time::Duration;
+
 use thiserror::Error;
 
 /// Result alias used throughout the LLM crate.
@@ -20,6 +22,8 @@ pub enum LlmError {
         status: u16,
         /// Response body (truncated).
         body: String,
+        /// Provider-requested delay before another equivalent request.
+        retry_after: Option<Duration>,
     },
 
     /// JSON (de)serialization failure.
@@ -31,6 +35,32 @@ pub enum LlmError {
     #[error("unexpected response shape: {0}")]
     UnexpectedShape(String),
 
+    /// Structured response stopped at the provider's token budget
+    /// (`finish_reason = "length"`): the engine ran out of output budget
+    /// before finishing the JSON. Terminal — a retry reproduces the same
+    /// truncation and doubles the spend. Carries only the configured
+    /// model label and the provider-reported completion token count —
+    /// never response content, prompt text, or secrets.
+    #[error(
+        "structured response truncated at token budget (finish_reason=length) for model {model}"
+    )]
+    TruncatedResponse {
+        /// Configured model label.
+        model: String,
+        /// `usage.completion_tokens` when the provider reported it.
+        completion_tokens: Option<u32>,
+    },
+
+    /// Structured request got HTTP 2xx but no usable message content
+    /// (`message.content` missing, empty, or whitespace-only). Terminal
+    /// and distinct from [`Self::TruncatedResponse`] and from a JSON
+    /// parse error: nothing was produced to parse.
+    #[error("provider returned no message content for model {model}")]
+    EmptyContent {
+        /// Configured model label.
+        model: String,
+    },
+
     /// Configured provider lacks the env var we need.
     #[error("provider not configured: {0}")]
     NotConfigured(String),
@@ -38,6 +68,12 @@ pub enum LlmError {
     /// Provider authentication failed or expired.
     #[error("auth: {0}")]
     Auth(String),
+
+    /// Optional local work could not start without waiting behind already
+    /// active work. Callers should use their non-provider fallback instead of
+    /// retrying or reporting the provider unhealthy.
+    #[error("{0} capacity is busy")]
+    CapacityBusy(&'static str),
 
     /// JSON schema for structured output could not be derived.
     #[error("schema: {0}")]
@@ -72,10 +108,19 @@ impl LlmError {
     #[must_use]
     pub fn is_transient(&self) -> bool {
         match self {
-            Self::Provider { status, .. } => *status == 429 || (500..=599).contains(status),
+            Self::Provider { status, .. } => Self::status_is_transient(*status),
             Self::Http(e) => e.is_timeout() || e.is_connect(),
             _ => false,
         }
+    }
+
+    /// The status half of [`Self::is_transient`], for a call site that must
+    /// pick an error variant before one exists — a token endpoint answering
+    /// `429`/`5xx` has not rejected the credential, so it must not become an
+    /// `Auth` error, which is deterministic.
+    #[must_use]
+    pub fn status_is_transient(status: u16) -> bool {
+        status == 429 || (500..=599).contains(&status)
     }
 
     /// HTTP status captured from this error, when the failure carries one.
@@ -84,6 +129,16 @@ impl LlmError {
         match self {
             Self::Http(e) => e.status().map(|status| status.as_u16()),
             Self::Provider { status, .. } => Some(*status),
+            _ => None,
+        }
+    }
+
+    /// Provider-requested delay before another equivalent request, when the
+    /// failed HTTP response carried a trustworthy, boundedly parsed hint.
+    #[must_use]
+    pub const fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::Provider { retry_after, .. } => *retry_after,
             _ => None,
         }
     }
@@ -97,8 +152,11 @@ impl LlmError {
             Self::Provider { .. } => "provider",
             Self::Serde(_) => "serde",
             Self::UnexpectedShape(_) => "unexpected-shape",
+            Self::TruncatedResponse { .. } => "truncated-response",
+            Self::EmptyContent { .. } => "empty-content",
             Self::NotConfigured(_) => "not-configured",
             Self::Auth(_) => "auth",
+            Self::CapacityBusy(_) => "capacity-busy",
             Self::Schema(_) => "schema",
             Self::AllCandidatesFailed { .. } => "all-candidates-failed",
         }
@@ -120,7 +178,8 @@ mod tests {
         assert!(
             LlmError::Provider {
                 status: 429,
-                body: String::new()
+                body: String::new(),
+                retry_after: None,
             }
             .is_transient()
         );
@@ -128,7 +187,8 @@ mod tests {
             assert!(
                 LlmError::Provider {
                     status,
-                    body: String::new()
+                    body: String::new(),
+                    retry_after: None,
                 }
                 .is_transient(),
                 "status {status} should be transient"
@@ -139,7 +199,8 @@ mod tests {
             assert!(
                 !LlmError::Provider {
                     status,
-                    body: String::new()
+                    body: String::new(),
+                    retry_after: None,
                 }
                 .is_transient(),
                 "status {status} must not be treated as transient"
@@ -150,10 +211,48 @@ mod tests {
     #[test]
     fn deterministic_errors_are_not_transient() {
         assert!(!LlmError::Auth("expired".into()).is_transient());
+        assert!(!LlmError::CapacityBusy("embedding").is_transient());
         assert!(!LlmError::Schema("bad".into()).is_transient());
         assert!(!LlmError::Serde("nope".into()).is_transient());
         assert!(!LlmError::UnexpectedShape("no tool block".into()).is_transient());
         assert!(!LlmError::NotConfigured("no key".into()).is_transient());
+    }
+
+    // A `length` stop or an empty 2xx is a definitive answer about this
+    // response: it is not transient, and the error must carry no response
+    // content in its message.
+    #[test]
+    fn truncated_and_empty_content_are_terminal_and_content_free() {
+        let truncated = LlmError::TruncatedResponse {
+            model: "qwen3.8-27b".into(),
+            completion_tokens: Some(4096),
+        };
+        assert_eq!(truncated.class(), "truncated-response");
+        assert!(!truncated.is_transient());
+        assert_eq!(truncated.http_status(), None);
+        let rendered = truncated.to_string();
+        assert!(rendered.contains("finish_reason=length"), "{rendered}");
+        assert!(rendered.contains("qwen3.8-27b"), "{rendered}");
+
+        let empty = LlmError::EmptyContent {
+            model: "qwen3.8-27b".into(),
+        };
+        assert_eq!(empty.class(), "empty-content");
+        assert!(!empty.is_transient());
+        assert_eq!(empty.http_status(), None);
+    }
+
+    #[test]
+    fn truncated_response_message_carries_no_content() {
+        let err = LlmError::TruncatedResponse {
+            model: "qwen3.8-27b".into(),
+            completion_tokens: None,
+        };
+        let rendered = err.to_string();
+        // Only the class, the wire fact, and the operator's own model
+        // label may appear — never the (truncated) completion text.
+        assert!(!rendered.contains('{'), "{rendered}");
+        assert_eq!(rendered.matches('"').count(), 0, "{rendered}");
     }
 
     #[test]
@@ -173,7 +272,8 @@ mod tests {
         assert_eq!(
             LlmError::Provider {
                 status: 503,
-                body: "boom".into()
+                body: "boom".into(),
+                retry_after: None,
             }
             .http_status(),
             Some(503)
@@ -188,6 +288,7 @@ mod tests {
                 LlmError::Provider {
                     status: 500,
                     body: "secret upstream body".into(),
+                    retry_after: None,
                 },
                 "provider",
             ),
@@ -196,8 +297,20 @@ mod tests {
                 LlmError::UnexpectedShape("no tool block".into()),
                 "unexpected-shape",
             ),
+            (
+                LlmError::TruncatedResponse {
+                    model: "qwen3.8-27b".into(),
+                    completion_tokens: Some(4096),
+                },
+                "truncated-response",
+            ),
+            (
+                LlmError::EmptyContent { model: "m".into() },
+                "empty-content",
+            ),
             (LlmError::NotConfigured("no key".into()), "not-configured"),
             (LlmError::Auth("expired".into()), "auth"),
+            (LlmError::CapacityBusy("embedding"), "capacity-busy"),
             (LlmError::Schema("bad".into()), "schema"),
             (
                 LlmError::AllCandidatesFailed {
@@ -210,6 +323,34 @@ mod tests {
         for (err, expected) in cases {
             assert_eq!(err.class(), *expected, "unexpected class for {err}");
             assert!(!err.class().contains("secret upstream body"));
+        }
+    }
+
+    #[test]
+    fn status_is_transient_matches_is_transient() {
+        for status in [429u16, 500, 503, 529, 599] {
+            assert!(LlmError::status_is_transient(status), "{status}");
+            assert!(
+                LlmError::Provider {
+                    status,
+                    body: String::new(),
+                    retry_after: None,
+                }
+                .is_transient(),
+                "{status} must agree with is_transient"
+            );
+        }
+        for status in [400u16, 401, 403, 404, 422, 600] {
+            assert!(!LlmError::status_is_transient(status), "{status}");
+            assert!(
+                !LlmError::Provider {
+                    status,
+                    body: String::new(),
+                    retry_after: None,
+                }
+                .is_transient(),
+                "{status} must agree with is_transient"
+            );
         }
     }
 }

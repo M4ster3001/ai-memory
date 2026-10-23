@@ -4,14 +4,108 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// Identifier shared by every HTTP attempt for one logical LLM operation.
+///
+/// Fresh per operation: the caller of one LLM operation (a consolidation
+/// invocation, an auto-improve review) generates one value with
+/// [`LlmOperationId::new`] and passes it to every attempt of that
+/// operation. It is never derived from an agent session id — two
+/// operations of the same session (or a crash-resumed or re-claimed run)
+/// must not look like one operation on the provider side.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct LlmOperationId(Uuid);
+pub struct LlmOperationId {
+    id: Uuid,
+    workload: LlmWorkload,
+}
+
+/// Closed workload labels for passive LLM telemetry.
+///
+/// These labels describe why ai-memory made a call. They are not provider
+/// routes and do not select a model. Keeping the set closed prevents prompts,
+/// project names, or other caller-controlled text from becoming metric keys.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[repr(u8)]
+pub enum LlmWorkload {
+    /// A caller used the provider API without assigning a workload.
+    #[default]
+    Unspecified,
+    /// Session-to-page consolidation.
+    Consolidation,
+    /// Post-retrieval relevance reranking.
+    Rerank,
+    /// Reviewed auto-improvement proposal generation.
+    AutoImprove,
+    /// Existing-project bootstrap extraction.
+    Bootstrap,
+    /// Opt-in query answer or project briefing synthesis.
+    QueryAnswer,
+    /// LLM-assisted wiki lint.
+    Lint,
+    /// Profile classification or extraction.
+    Profile,
+    /// Cross-session dream merge.
+    Dream,
+    /// Cross-trajectory experience abstraction.
+    Experience,
+}
+
+impl LlmWorkload {
+    /// Every workload in stable wire order.
+    pub const ALL: [Self; 10] = [
+        Self::Unspecified,
+        Self::Consolidation,
+        Self::Rerank,
+        Self::AutoImprove,
+        Self::Bootstrap,
+        Self::QueryAnswer,
+        Self::Lint,
+        Self::Profile,
+        Self::Dream,
+        Self::Experience,
+    ];
+
+    /// Stable kebab-case label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unspecified => "unspecified",
+            Self::Consolidation => "consolidation",
+            Self::Rerank => "rerank",
+            Self::AutoImprove => "auto-improve",
+            Self::Bootstrap => "bootstrap",
+            Self::QueryAnswer => "query-answer",
+            Self::Lint => "lint",
+            Self::Profile => "profile",
+            Self::Dream => "dream",
+            Self::Experience => "experience",
+        }
+    }
+
+    pub(crate) const fn index(self) -> usize {
+        self as usize
+    }
+}
 
 impl LlmOperationId {
     /// Generate a fresh time-ordered operation identifier.
     #[must_use]
     pub fn new() -> Self {
-        Self(Uuid::now_v7())
+        Self::for_workload(LlmWorkload::Unspecified)
+    }
+
+    /// Generate an operation identifier carrying a passive workload label.
+    #[must_use]
+    pub fn for_workload(workload: LlmWorkload) -> Self {
+        Self {
+            id: Uuid::now_v7(),
+            workload,
+        }
+    }
+
+    /// Workload assigned by the call site.
+    #[must_use]
+    pub const fn workload(self) -> LlmWorkload {
+        self.workload
     }
 }
 
@@ -21,15 +115,9 @@ impl Default for LlmOperationId {
     }
 }
 
-impl From<ai_memory_core::SessionId> for LlmOperationId {
-    fn from(value: ai_memory_core::SessionId) -> Self {
-        Self(value.0)
-    }
-}
-
 impl std::fmt::Display for LlmOperationId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
+        self.id.fmt(f)
     }
 }
 
@@ -329,6 +417,29 @@ impl ExtraHeaders {
         }
     }
 
+    /// Insert `name: value`, replacing any existing value for that name.
+    ///
+    /// Unlike [`Self::set_default`], this overrides an operator entry: it is
+    /// reserved for headers ai-memory sets itself per request (the
+    /// openai-compat `x-request-id`, which carries the logical operation id).
+    /// The factory refuses a static `AI_MEMORY_LLM_HEADERS` entry for those
+    /// names up front, so on the configured path this can never silently
+    /// replace operator material — and [`Self::apply`] replaces per name
+    /// either way, so one value always goes on the wire.
+    pub(crate) fn insert(
+        &mut self,
+        name: reqwest::header::HeaderName,
+        value: reqwest::header::HeaderValue,
+    ) {
+        self.0.insert(name, value);
+    }
+
+    /// Whether `name` is configured (header-name comparison is
+    /// case-insensitive, as on the wire).
+    pub(crate) fn contains(&self, name: &str) -> bool {
+        self.0.contains_key(name)
+    }
+
     /// Attach the configured headers to `builder`.
     ///
     /// Uses `RequestBuilder::headers`, which *replaces* any value already set
@@ -381,7 +492,7 @@ fn split_entry(entry: &str, position: usize) -> crate::error::LlmResult<(&str, &
 
 #[cfg(test)]
 mod tests {
-    use super::{ExtraHeaders, ReasoningEffort};
+    use super::{ExtraHeaders, LlmOperationId, LlmWorkload, ReasoningEffort};
     use rstest::rstest;
 
     const ALL_EFFORTS: [ReasoningEffort; 9] = [
@@ -395,6 +506,25 @@ mod tests {
         ReasoningEffort::Ultra,
         ReasoningEffort::Persistent,
     ];
+
+    #[test]
+    fn workload_labels_are_stable_and_do_not_change_the_wire_operation_id() {
+        for workload in LlmWorkload::ALL {
+            let value = serde_json::to_value(workload).unwrap();
+            assert_eq!(value, serde_json::json!(workload.as_str()));
+            assert_eq!(
+                serde_json::from_value::<LlmWorkload>(value).unwrap(),
+                workload
+            );
+            let wire_id = LlmOperationId::for_workload(workload).to_string();
+            assert_eq!(wire_id.len(), 36);
+            assert_eq!(
+                uuid::Uuid::parse_str(&wire_id).unwrap().get_version_num(),
+                7
+            );
+            assert!(!wire_id.contains(workload.as_str()));
+        }
+    }
 
     #[test]
     fn reasoning_effort_roundtrips() {
@@ -537,6 +667,25 @@ mod tests {
             reqwest::header::HeaderValue::from_static("fallback/1"),
         );
         assert_eq!(headers.get("user-agent"), Some("fallback/1"));
+    }
+
+    /// `insert` is the per-request override used for headers ai-memory owns
+    /// (the openai-compat `x-request-id`): an existing entry is *replaced*,
+    /// so exactly one value survives, and `contains` sees it case-insensitively.
+    #[test]
+    fn insert_replaces_an_existing_value() {
+        let mut headers = ExtraHeaders::parse(["x-request-id: static-1"]).expect("valid");
+        assert!(headers.contains("x-request-id"));
+        headers.insert(
+            reqwest::header::HeaderName::from_static("x-request-id"),
+            reqwest::header::HeaderValue::from_static("dynamic-1"),
+        );
+        assert_eq!(headers.get("x-request-id"), Some("dynamic-1"));
+        // The header-name match used by the factory's refuse check is
+        // case-insensitive, so a mixed-case operator entry is caught too.
+        let mixed = ExtraHeaders::parse(["X-Request-Id: static-2"]).expect("valid");
+        assert!(mixed.contains("x-request-id"));
+        assert!(!mixed.contains("x-opencode-session"));
     }
 
     /// `ProviderConfig` derives `Debug` and gets rendered into configuration

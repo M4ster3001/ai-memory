@@ -1,12 +1,14 @@
-//! `ai-memory auth` — manage upstream LLM provider credentials.
+//! `ai-memory auth` — manage upstream LLM provider credentials, and require a
+//! bearer token on this install's own server (`auth enable`).
 
+use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ai_memory_llm::{
     CODEX_CLIENT_ID, CopilotToken, DeviceAuthorizationResponse, GITHUB_ACCESS_TOKEN_URL,
     GITHUB_COPILOT_CLIENT_ID, GITHUB_DEVICE_CODE_URL, OIDC_DEFAULT_SCOPE, OPENAI_OAUTH_TOKEN_URL,
     OidcDiscovery, OidcToken, OidcTokenResponse, OpenAiOAuthToken, OpenAiOAuthTokenResponse,
-    PollOutcome, discover, poll_token_once, request_device_code,
+    PollOutcome, discover, poll_token_once, provider_error_body, request_device_code,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use secrecy::ExposeSecret as _;
@@ -14,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use tokio::time::sleep;
 
 use crate::cli::{AuthArgs, AuthCommand, AuthProviderChoice};
+use crate::commands::path_util::display_path;
 use crate::config::Config;
 
 const DEVICE_USER_CODE_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/usercode";
@@ -26,7 +29,7 @@ const POLLING_SAFETY_MARGIN_SECS: u64 = 3;
 ///
 /// # Errors
 /// Returns an error if token storage or provider auth requests fail.
-pub async fn run(config: &Config, args: AuthArgs) -> Result<()> {
+pub async fn run(config: &Config, args: AuthArgs, config_path: Option<&Path>) -> Result<()> {
     match args.command {
         AuthCommand::Login(args) => match args.provider {
             AuthProviderChoice::OpenaiOauth => {
@@ -63,6 +66,7 @@ pub async fn run(config: &Config, args: AuthArgs) -> Result<()> {
             AuthProviderChoice::OidcDevice => logout_oidc_device(config),
         },
         AuthCommand::Status(_) => status(config),
+        AuthCommand::Enable(args) => super::auth_enable::run(config, &args, config_path),
     }
 }
 
@@ -105,7 +109,7 @@ async fn login_oidc_device(
 
     println!("oidc-device: logged in");
     println!("issuer: {issuer}");
-    println!("token file: {}", path.display());
+    println!("token file: {}", display_path(&path));
     Ok(())
 }
 
@@ -146,7 +150,7 @@ fn logout_oidc_device(config: &Config) -> Result<()> {
     let path = config.oidc_device_token_path();
     OidcToken::remove(&path).map_err(anyhow::Error::from)?;
     println!("oidc-device: logged out");
-    println!("token file: {}", path.display());
+    println!("token file: {}", display_path(&path));
     Ok(())
 }
 
@@ -177,7 +181,7 @@ async fn login_openai_oauth(config: &Config, timeout_secs: u64) -> Result<()> {
     if let Some(account_id) = token.extra.account_id.as_deref() {
         println!("account: {account_id}");
     }
-    println!("token file: {}", path.display());
+    println!("token file: {}", display_path(&path));
     Ok(())
 }
 
@@ -185,7 +189,7 @@ fn logout_openai_oauth(config: &Config) -> Result<()> {
     let path = config.openai_oauth_token_path();
     OpenAiOAuthToken::remove(&path).map_err(anyhow::Error::from)?;
     println!("openai-oauth: logged out");
-    println!("token file: {}", path.display());
+    println!("token file: {}", display_path(&path));
     Ok(())
 }
 
@@ -213,7 +217,7 @@ async fn login_copilot(
     let path = config.copilot_token_path();
     token.save(&path).map_err(anyhow::Error::from)?;
     println!("copilot: logged in");
-    println!("token file: {}", path.display());
+    println!("token file: {}", display_path(&path));
     Ok(())
 }
 
@@ -221,7 +225,7 @@ fn logout_copilot(config: &Config) -> Result<()> {
     let path = config.copilot_token_path();
     CopilotToken::remove(&path).map_err(anyhow::Error::from)?;
     println!("copilot: logged out");
-    println!("token file: {}", path.display());
+    println!("token file: {}", display_path(&path));
     Ok(())
 }
 
@@ -234,11 +238,11 @@ fn status(config: &Config) -> Result<()> {
                 println!("account: {account_id}");
             }
             println!("expires in: {}", format_duration_until(token.expires_at_ms));
-            println!("token file: {}", openai_path.display());
+            println!("token file: {}", display_path(&openai_path));
         }
         None => {
             println!("openai-oauth: not logged in");
-            println!("token file: {}", openai_path.display());
+            println!("token file: {}", display_path(&openai_path));
         }
     }
 
@@ -271,11 +275,11 @@ fn status(config: &Config) -> Result<()> {
             if let Some(api_base_url) = token.api_base_url.as_deref() {
                 println!("api base: {api_base_url}");
             }
-            println!("token file: {}", copilot_path.display());
+            println!("token file: {}", display_path(&copilot_path));
         }
         None => {
             println!("copilot: not logged in");
-            println!("token file: {}", copilot_path.display());
+            println!("token file: {}", display_path(&copilot_path));
         }
     }
 
@@ -285,11 +289,11 @@ fn status(config: &Config) -> Result<()> {
             println!("oidc-device: logged in");
             println!("issuer: {}", token.extra.issuer);
             println!("expires in: {}", format_duration_until(token.expires_at_ms));
-            println!("token file: {}", oidc_path.display());
+            println!("token file: {}", display_path(&oidc_path));
         }
         None => {
             println!("oidc-device: not logged in");
-            println!("token file: {}", oidc_path.display());
+            println!("token file: {}", display_path(&oidc_path));
         }
     }
     Ok(())
@@ -312,6 +316,10 @@ async fn run_copilot_device_flow(client_id: &str, timeout_secs: u64) -> Result<S
 
 fn auth_http_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
+        // Authentication requests can carry device codes, authorization codes,
+        // refresh tokens, or issued credentials. Do not let an IdP redirect
+        // those request bodies to a different URL or a TLS downgrade.
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(60))
         .user_agent(format!("ai-memory/{}", env!("CARGO_PKG_VERSION")))
         .build()
@@ -329,7 +337,7 @@ async fn start_device_authorization(client: &reqwest::Client) -> Result<DeviceAu
         .context("starting openai-oauth device authorization")?;
     let status = resp.status();
     if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
+        let body = provider_error_body(resp).await;
         bail!("openai-oauth device authorization failed ({status}): {body}");
     }
     resp.json::<DeviceAuthorization>()
@@ -374,7 +382,7 @@ async fn poll_device_authorization(
             && resp.status() != reqwest::StatusCode::NOT_FOUND
         {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+            let body = provider_error_body(resp).await;
             bail!("openai-oauth authorization polling failed ({status}): {body}");
         }
         sleep(interval).await;
@@ -399,7 +407,7 @@ async fn exchange_authorization_code(
         .context("exchanging openai-oauth authorization code")?;
     let status = resp.status();
     if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
+        let body = provider_error_body(resp).await;
         bail!("openai-oauth token exchange failed ({status}): {body}");
     }
     resp.json::<OpenAiOAuthTokenResponse>()
@@ -420,7 +428,7 @@ async fn start_github_device_authorization(
         .context("starting copilot GitHub device authorization")?;
     let status = resp.status();
     if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
+        let body = provider_error_body(resp).await;
         bail!("copilot GitHub device authorization failed ({status}): {body}");
     }
     resp.json::<GitHubDeviceAuthorization>()
@@ -455,7 +463,7 @@ async fn poll_github_device_authorization(
             .context("polling copilot GitHub device authorization")?;
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
+            let body = provider_error_body(resp).await;
             bail!("copilot GitHub authorization polling failed ({status}): {body}");
         }
         let body = resp
@@ -553,5 +561,40 @@ mod tests {
     #[test]
     fn expiry_status_does_not_print_exact_token_time() {
         assert_eq!(format_duration_until(0), "expired");
+    }
+
+    #[tokio::test]
+    async fn auth_client_never_forwards_credentials_through_redirects() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_url = format!("http://{}/received", target.local_addr().unwrap());
+        let source = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let source_url = format!("http://{}/token", source.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut stream, _) = source.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).await;
+            let response = format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: {target_url}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let response = auth_http_client()
+            .unwrap()
+            .post(source_url)
+            .form(&[("device_code", "synthetic-secret")])
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), target.accept())
+                .await
+                .is_err(),
+            "an authentication request body reached the redirect target"
+        );
     }
 }

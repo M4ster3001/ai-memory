@@ -20,6 +20,8 @@
   <p class="mt-1 text-sm text-slate-500 dark:text-slate-400">Human-facing overview of capture, continuity, and compiled memory.</p>
 </div>
 
+<p class="mb-6"><a href="graph" class="text-sm font-medium text-blue-600 dark:text-blue-400 hover:underline">Link graph</a></p>
+
 <section aria-label="Memory health overview" class="mb-8">
   <div class="memory-summary-grid">
     <div class="rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-4"><div class="text-xs text-slate-500">Projects</div><div class="mt-1 text-2xl font-semibold">{{ dashboard.project_count }}</div></div>
@@ -47,6 +49,14 @@
     <div><div class="text-slate-500">Rate-limited</div><div class="mt-1 text-xl font-semibold {% if ingest.shed_rate_limited > 0 %}text-amber-700 dark:text-amber-300{% endif %}">{{ ingest.shed_rate_limited }}</div></div>
   </div>
 </section>
+{% endif %}
+
+{% if mail_total > 0 %}
+<div class="mb-6 rounded-md border border-amber-200 dark:border-amber-900/50 bg-amber-50 dark:bg-amber-950/30 px-4 py-3 text-sm text-amber-900 dark:text-amber-200">
+  <span class="font-medium">{{ mail_total }} message{% if mail_total != 1 %}s{% endif %} waiting for agents</span>
+  <span class="text-amber-800 dark:text-amber-300/90">in
+  {% for item in mail_projects %}<a href="{{ item.href }}" class="font-medium underline hover:text-amber-950 dark:hover:text-amber-100">{{ item.label }}</a> ({{ item.pending }}){% if !loop.last %}, {% endif %}{% endfor %}{% if mail_hidden > 0 %} and {{ mail_hidden }} more project{% if mail_hidden != 1 %}s{% endif %}{% endif %}.</span>
+</div>
 {% endif %}
 
 <div id="llm-notice" class="mb-6 hidden relative rounded-md border border-amber-200 dark:border-amber-900/50 bg-amber-50 dark:bg-amber-950/30 p-4 pr-10 text-sm text-amber-900 dark:text-amber-200">
@@ -127,7 +137,7 @@
         <input id="okf-dialog-dismiss" type="checkbox" class="rounded border-slate-300 dark:border-slate-600">
         Do not show me again
       </label>
-      <button id="okf-dialog-close" class="rounded-md bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900 text-sm font-medium px-4 py-2 hover:bg-slate-700 dark:hover:bg-slate-300">Got it</button>
+      <button id="okf-dialog-close" type="button" class="rounded-md bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900 text-sm font-medium px-4 py-2 hover:bg-slate-700 dark:hover:bg-slate-300">Got it</button>
     </div>
   </div>
 </div>
@@ -139,13 +149,41 @@
     try {
       if (localStorage.getItem(key) === "1") return;
     } catch (e) { /* storage blocked: still show the dialog */ }
-    overlay.classList.remove("hidden");
-    document.getElementById("okf-dialog-close").addEventListener("click", function () {
-      if (document.getElementById("okf-dialog-dismiss").checked) {
+    var closeBtn = document.getElementById("okf-dialog-close");
+    var dismiss = document.getElementById("okf-dialog-dismiss");
+    // aria-modal alone moves no focus: remember the opener to hand it back.
+    var opener = document.activeElement;
+    function close() {
+      if (dismiss.checked) {
         try { localStorage.setItem(key, "1"); } catch (e) { /* best effort */ }
       }
       overlay.classList.add("hidden");
-    });
+      document.removeEventListener("keydown", onKey);
+      if (opener && opener.isConnected && typeof opener.focus === "function") opener.focus();
+    }
+    // Only two focusables, so Tab wraps by hand to keep focus inside the modal.
+    function onKey(e) {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        close();
+      } else if (e.key === "Tab") {
+        var active = document.activeElement;
+        if (e.shiftKey && active === dismiss) {
+          e.preventDefault();
+          closeBtn.focus();
+        } else if (!e.shiftKey && active === closeBtn) {
+          e.preventDefault();
+          dismiss.focus();
+        } else if (active !== dismiss && active !== closeBtn) {
+          e.preventDefault();
+          dismiss.focus();
+        }
+      }
+    }
+    overlay.classList.remove("hidden");
+    closeBtn.addEventListener("click", close);
+    document.addEventListener("keydown", onKey);
+    closeBtn.focus();
   })();
 </script>
 {% endif %}
@@ -160,13 +198,18 @@
 {% else %}
 <div class="project-cards-grid">
   {% for card in projects %}
-  <a href="{{ card.href }}" class="block rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-5 hover:border-blue-400 dark:hover:border-blue-600 hover:shadow-sm transition-all" aria-label="Open {{ card.workspace }}/{{ card.project }}">
-    <div class="text-xs font-medium text-slate-400 dark:text-slate-500 mb-1">{{ card.workspace }}</div>
+  <a aria-label="Open {{ card.workspace }}/{{ card.project }}" href="{{ card.href }}" class="block rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-5 hover:border-blue-400 dark:hover:border-blue-600 hover:shadow-sm transition-all">
+    <div class="flex items-center justify-between gap-2 h-5 mb-1">
+      <div class="min-w-0 truncate text-xs font-medium text-slate-500 dark:text-slate-400">{{ card.workspace }}</div>
+      {% if card.pending_inbox > 0 %}
+      <span class="shrink-0 inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium border border-amber-200 dark:border-amber-900/50 bg-amber-50 dark:bg-amber-950/30 text-amber-800 dark:text-amber-300" title="Messages from other projects waiting for an agent here">{{ card.pending_inbox }} inbox</span>
+      {% endif %}
+    </div>
     <div class="text-base font-semibold text-slate-800 dark:text-slate-100 truncate">{{ card.project }}</div>
     <div class="project-card-metrics mt-3 text-xs">
       <div class="project-card-metric"><div class="text-slate-500 dark:text-slate-400">Sessions</div><div class="mt-1 font-semibold text-slate-800 dark:text-slate-100">{{ card.session_count }}</div></div>
       <div class="project-card-metric"><div class="text-slate-500 dark:text-slate-400">Captured events</div><div class="mt-1 font-semibold text-slate-800 dark:text-slate-100">{{ card.observation_count }}</div></div>
-      <div class="project-card-metric"><div class="text-slate-500 dark:text-slate-400">Compiled pages</div><div class="mt-1 font-semibold text-slate-800 dark:text-slate-100">{{ card.page_count }}</div></div>
+      <div class="project-card-metric"><div class="text-slate-500 dark:text-slate-400">Compiled pages</div><div class="mt-1 font-semibold text-slate-800 dark:text-slate-100">{{ card.page_count }} page{% if card.page_count != 1 %}s{% endif %}</div></div>
       <div class="project-card-metric {% if card.open_session_count > 0 %}bg-amber-50 dark:bg-amber-950/20{% endif %}"><div class="text-slate-500 dark:text-slate-400">Open sessions</div><div class="mt-1 font-semibold {% if card.open_session_count > 0 %}text-amber-700 dark:text-amber-300{% else %}text-emerald-700 dark:text-emerald-300{% endif %}">{{ card.open_session_count }}</div></div>
     </div>
     <div class="project-card-footer text-xs text-slate-500 dark:text-slate-400">

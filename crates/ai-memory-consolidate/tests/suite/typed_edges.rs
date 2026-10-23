@@ -126,6 +126,8 @@ async fn a_declared_contradiction_is_a_lint_finding_without_an_llm() {
             use_llm: false,
             decay_lambda: 0.02,
             embedding: None,
+            contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+            contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
         },
     )
     .await
@@ -172,6 +174,8 @@ async fn a_contradiction_to_a_deleted_page_reports_the_stale_declaration() {
             use_llm: false,
             decay_lambda: 0.02,
             embedding: None,
+            contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+            contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
         },
     )
     .await
@@ -182,6 +186,75 @@ async fn a_contradiction_to_a_deleted_page_reports_the_stale_declaration() {
         .find(|f| f.kind == "contradiction")
         .expect("unresolved contradicts still lints");
     assert!(finding.message.contains("does not resolve"));
+}
+
+#[tokio::test]
+async fn a_contradiction_to_a_soft_deleted_page_reports_the_stale_declaration() {
+    let tmp = TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+
+    let target_id = wiki
+        .write_page(req(
+            ws,
+            proj,
+            "decisions/tombstoned.md",
+            "old policy",
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+
+    wiki.write_page(req(
+        ws,
+        proj,
+        "notes/disagreement.md",
+        "contradicts tombstoned",
+        serde_json::json!({"relations": {"contradicts": ["decisions/tombstoned.md"]}}),
+    ))
+    .await
+    .unwrap();
+
+    let soft_deleted = store
+        .writer
+        .soft_delete_for_decay_if_latest(
+            ws,
+            proj,
+            PagePath::new("decisions/tombstoned.md").unwrap(),
+            target_id,
+        )
+        .await
+        .unwrap();
+    assert!(soft_deleted);
+
+    let report = run_lint(
+        &store.reader,
+        &wiki,
+        None,
+        ws,
+        proj,
+        LintOptions {
+            dry_run: true,
+            use_llm: false,
+            decay_lambda: 0.02,
+            embedding: None,
+            contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+            contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
+        },
+    )
+    .await
+    .unwrap();
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.kind == "contradiction")
+        .expect("unresolved contradicts still lints");
+    assert!(finding.message.contains("does not resolve"));
+    assert_eq!(
+        finding.pages,
+        vec!["notes/disagreement.md", "decisions/tombstoned.md"]
+    );
 }
 
 // ── 2.0.1: lint reports are one superseding page, not a daily pile ──
@@ -238,6 +311,8 @@ async fn lint_supersedes_one_report_and_prunes_the_legacy_daily_pile() {
         use_llm: false,
         decay_lambda: 0.02,
         embedding: None,
+        contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+        contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
     };
     let report = run_lint(&store.reader, &wiki, None, ws, proj, opts.clone())
         .await
@@ -288,6 +363,8 @@ async fn a_clean_pass_removes_the_stale_report() {
         use_llm: false,
         decay_lambda: 0.02,
         embedding: None,
+        contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+        contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
     };
     run_lint(&store.reader, &wiki, None, ws, proj, opts.clone())
         .await

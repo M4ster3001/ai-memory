@@ -3,6 +3,35 @@
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
+/// Create `dir` (and its parents) `0700` on Unix. On non-Unix the mode is a
+/// no-op (falls back to `create_dir_all`). Idempotent: an existing
+/// directory's mode is left untouched (never widened, never narrowed) to
+/// avoid churning a path an operator may have set deliberately.
+pub(crate) fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        if dir.is_dir() {
+            return Ok(());
+        }
+        match std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+        {
+            Ok(()) => Ok(()),
+            // A concurrent caller may have created it between the check and
+            // the call; treat an existing directory as success.
+            Err(_) if dir.is_dir() => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir)
+    }
+}
+
 /// Resolve the user home used for agent configuration paths.
 ///
 /// Tests and scripted wrappers can set `AI_MEMORY_HOME` to exercise the
@@ -20,18 +49,16 @@ pub(crate) fn home_dir() -> Option<PathBuf> {
 ///
 /// Blank is treated as unset on purpose: an exported-but-empty variable is far
 /// more often an unset shell expansion than a deliberate request to install
-/// into the filesystem root.
+/// into the filesystem root. The rule lives in
+/// [`ai_memory_workstream::env_dir_override`] so native session import applies
+/// the same one and never reads a store the installers did not wire.
 ///
 /// The env value comes in as a parameter so tests can exercise both branches
 /// without mutating process env — which is not merely inconvenient here but
 /// forbidden: `std::env::set_var` is `unsafe` under edition 2024 and this
 /// workspace forbids `unsafe_code`.
 pub(crate) fn agent_config_home(env_override: Option<std::ffi::OsString>) -> Option<PathBuf> {
-    let value = env_override?;
-    if value.to_str().is_some_and(|s| s.trim().is_empty()) {
-        return None;
-    }
-    Some(PathBuf::from(value))
+    ai_memory_workstream::env_dir_override(env_override)
 }
 
 /// Claude Code's relocated config root: `$CLAUDE_CONFIG_DIR` when set, else
@@ -59,6 +86,22 @@ pub(crate) fn claude_config_paths(
         }
     }
     paths
+}
+
+/// `path` as shown to the operator: without a safe `\\?\` verbatim prefix,
+/// which the canonical data dir carries on Windows and which `cmd` and most
+/// scripts cannot use when the path is copied out of a message.
+pub(crate) fn display_path(path: &Path) -> String {
+    strip_windows_verbatim_prefix(&path.to_string_lossy())
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                '?'
+            } else {
+                character
+            }
+        })
+        .collect()
 }
 
 /// Strip only Windows verbatim path prefixes that are safe to render as plain
@@ -131,6 +174,28 @@ mod tests {
                 Path::new("settings.json"),
             ),
             [PathBuf::from("/home/alice/.claude/settings.json")]
+        );
+    }
+
+    #[test]
+    fn display_path_drops_the_verbatim_prefix() {
+        assert_eq!(
+            display_path(Path::new(
+                r"\\?\C:\Users\me\AppData\Local\ai-memory\auth.json"
+            )),
+            r"C:\Users\me\AppData\Local\ai-memory\auth.json"
+        );
+        assert_eq!(
+            display_path(Path::new(r"\\?\UNC\server\share\ai-memory")),
+            r"\\server\share\ai-memory"
+        );
+        assert_eq!(
+            display_path(Path::new("/home/alice/.local/share/ai-memory")),
+            "/home/alice/.local/share/ai-memory"
+        );
+        assert_eq!(
+            display_path(Path::new("/tmp/line\nbreak")),
+            "/tmp/line?break"
         );
     }
 
