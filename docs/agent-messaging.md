@@ -311,7 +311,11 @@ projects. The sender needs write on both projects; the configured sanitizer,
 `message_send` admission webhooks, audit and bounded writer queue apply before
 success. Cookie-authenticated browser writes use the existing CSRF token;
 JSON plus a custom UI header and an origin check prevent cross-site form sends
-with cached Basic credentials.
+with cached Basic credentials. The legacy GET-only login shows a write-token
+field: the operator supplies a token explicitly for that message. It goes only
+in the request header and is cleared on success or failure, never saved in a
+cookie, URL or browser storage. Existing human sessions use their normal CSRF
+authentication and do not show this field.
 
 The destination harness is stored as `to_agent`. A matching agent claims it
 through `memory_message_pop` (pass `agent: "codex"`, for example, when session

@@ -533,3 +533,41 @@ async fn operations_agent_aggregates_and_drilldowns_apply_ownership_before_total
         .unwrap();
     assert_eq!(foreign.call_count, 0);
 }
+
+#[tokio::test]
+async fn operations_legacy_login_requires_an_explicit_nonpersistent_write_token() {
+    let (_tmp, store, wiki, _, _, _) = fixture().await;
+    let app = router(store.reader.clone(), wiki);
+    for legacy in [false, true] {
+        let mut request = Request::builder().uri("/inbox?workspace=team&project=app");
+        if legacy {
+            request = request.extension(ai_memory_core::LegacyBrowserAuth);
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = text(response).await;
+        assert_eq!(html.contains("id=\"message-access-token\""), legacy);
+        if legacy {
+            let input = html
+                .split("<input id=\"message-access-token\"")
+                .nth(1)
+                .unwrap()
+                .split('>')
+                .next()
+                .unwrap();
+            assert!(
+                input.contains("type=\"password\"")
+                    && input.contains("autocomplete=\"off\"")
+                    && input.contains("required")
+            );
+            assert!(!input.contains("value=") && !input.contains("name="));
+        }
+        assert!(html.contains("if(token)token.value=\"\""));
+        assert!(html.contains("if(token)headers.Authorization="));
+        assert!(!html.contains("localStorage.setItem(\"token"));
+    }
+}

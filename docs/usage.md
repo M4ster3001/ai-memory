@@ -731,9 +731,13 @@ a human password or completed bootstrap exists. For human-authenticated
 administration, create the first root account ([first-time
 root](install.md#first-time-root-greenfield)) and serve the compiled admin SPA
 with `--web-ui-dir`: it signs in through `/auth/login` and uses an HttpOnly web
-session plus CSRF protection. Browser-stored Bearers remain unsupported.
-`AI_MEMORY_AUTH_TOKEN` and `aim_` API keys remain machine-only credentials sent
-as `Authorization: Bearer <token>` by MCP, hook, handoff, and workstream clients.
+session plus CSRF protection. Browser-stored Bearers remain unsupported. The
+inbox composer can use an explicitly entered write token for a single message
+when the legacy sign-in is
+read-only; it clears the token after the request and never persists it.
+Outside this inbox action, `AI_MEMORY_AUTH_TOKEN` and `aim_` API keys remain
+machine credentials sent as `Authorization: Bearer <token>` by MCP, hook, handoff,
+and workstream clients.
 
 To host the web UI under a URL subpath behind a reverse proxy, the
 `--base-path` / `--web-slug` flags do the work. See

@@ -42,6 +42,7 @@ fn mailbox_href(workspace: &str, project: &str, outbox: bool, offset: usize) -> 
 pub(crate) async fn handler(
     State(state): State<Arc<WebState>>,
     viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
+    legacy: Option<axum::Extension<ai_memory_core::LegacyBrowserAuth>>,
     Query(query): Query<InboxQuery>,
 ) -> Response {
     let viewer = viewer.map(|v| v.0.user());
@@ -194,6 +195,7 @@ pub(crate) async fn handler(
             String::new()
         },
         can_send: !recipients.is_empty(),
+        needs_write_token: legacy.is_some(),
         project_href: project_href(&workspace, &project),
         workspace,
         project,
