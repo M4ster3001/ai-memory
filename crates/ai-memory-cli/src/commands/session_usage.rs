@@ -1,8 +1,9 @@
 //! Client-side session token-usage extraction (token-cost visibility).
 //!
 //! Reads a harness's own transcript file to compute cumulative token totals
-//! for one session. Called only at `session-end` (once per session, never on
-//! the frequent `stop`/`post-tool-use` hot path — see `hook.rs`), so a
+//! for one session. Live capture reads a bounded tail on model/tool boundaries.
+//! The legacy full-session fallback runs at `session-end`; it stays off
+//! the frequent `stop`/`post-tool-use` hot path. A
 //! bounded linear scan (Claude Code) or a bounded tail read (Codex, whose
 //! rollout files can reach hundreds of MB for a long session) is cheap
 //! enough to run synchronously inline in the native hook before it spools
@@ -18,6 +19,148 @@
 use std::collections::HashSet;
 use std::io::{BufRead as _, Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
+
+/// Read a bounded tail for live response usage. Replaying the window is safe:
+/// the store keys responses by native id and merges partial usage with MAX.
+pub fn extract_live_calls(
+    path: &Path,
+    agent: ai_memory_core::AgentKind,
+) -> Vec<ai_memory_core::TokenCall> {
+    let read = || -> Option<(String, bool)> {
+        let mut file = std::fs::File::open(path).ok()?;
+        let len = file.metadata().ok()?.len();
+        let start = len.saturating_sub(CODEX_TAIL_SCAN_BYTES);
+        file.seek(SeekFrom::Start(start)).ok()?;
+        let mut bytes = Vec::new();
+        file.take(CODEX_TAIL_SCAN_BYTES)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        Some((String::from_utf8_lossy(&bytes).into_owned(), start == 0))
+    };
+    let Some((text, from_start)) = read() else {
+        return Vec::new();
+    };
+    let mut result = std::collections::BTreeMap::<String, ai_memory_core::TokenCall>::new();
+    let mut order = Vec::new();
+    let mut previous: Option<[u64; 4]> = from_start.then_some([0; 4]);
+    let mut model = None;
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if v.get("type").and_then(|v| v.as_str()) == Some("turn_context") {
+            model = v
+                .pointer("/payload/model")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned);
+        }
+        let (id, usage, current_model, codex) = if agent == ai_memory_core::AgentKind::ClaudeCode {
+            if v.get("type").and_then(|v| v.as_str()) != Some("assistant")
+                || v.get("isMeta").and_then(|v| v.as_bool()) == Some(true)
+            {
+                continue;
+            }
+            let Some(id) = v.pointer("/message/id").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Some(u) = v.pointer("/message/usage") else {
+                continue;
+            };
+            (
+                id.to_owned(),
+                u.clone(),
+                v.pointer("/message/model")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned),
+                false,
+            )
+        } else {
+            let total = v
+                .pointer("/payload/info/total_token_usage")
+                .or_else(|| v.pointer("/payload/thread_token_usage"));
+            let Some(total) = total else { continue };
+            let cached = u64_field(total, "cached_input_tokens");
+            let totals = [
+                u64_field(total, "input_tokens").saturating_sub(cached),
+                u64_field(total, "output_tokens"),
+                u64_field(total, "cache_write_input_tokens"),
+                cached,
+            ];
+            let id = format!(
+                "codex:{}:{}:{}:{}",
+                totals[0], totals[1], totals[2], totals[3]
+            );
+            let usage = if let Some(last) = v.pointer("/payload/info/last_token_usage") {
+                last.clone()
+            } else if let Some(old) = previous {
+                serde_json::json!({"input_tokens":totals[0].saturating_sub(old[0])+totals[3].saturating_sub(old[3]),"output_tokens":totals[1].saturating_sub(old[1]),"cache_write_input_tokens":totals[2].saturating_sub(old[2]),"cached_input_tokens":totals[3].saturating_sub(old[3])})
+            } else {
+                previous = Some(totals);
+                continue;
+            };
+            // A duplicate cumulative checkpoint is not a second response.
+            if previous == Some(totals) {
+                continue;
+            }
+            previous = Some(totals);
+            (id, usage, model.clone(), true)
+        };
+        if id.len() > 128 {
+            continue;
+        }
+        let cached = u64_field(
+            &usage,
+            if codex {
+                "cached_input_tokens"
+            } else {
+                "cache_read_input_tokens"
+            },
+        );
+        let input = u64_field(&usage, "input_tokens");
+        let call = ai_memory_core::TokenCall {
+            call_id: id.clone(),
+            input_tokens: if codex {
+                input.saturating_sub(cached)
+            } else {
+                input
+            },
+            output_tokens: u64_field(&usage, "output_tokens"),
+            cache_write_tokens: u64_field(
+                &usage,
+                if codex {
+                    "cache_write_input_tokens"
+                } else {
+                    "cache_creation_input_tokens"
+                },
+            ),
+            cache_read_tokens: cached,
+            model: current_model,
+        };
+        if !result.contains_key(&id) {
+            order.push(id.clone());
+        }
+        if call.input_tokens + call.output_tokens + call.cache_read_tokens + call.cache_write_tokens
+            == 0
+        {
+            continue;
+        }
+        result
+            .entry(id)
+            .and_modify(|old| {
+                old.input_tokens = old.input_tokens.max(call.input_tokens);
+                old.output_tokens = old.output_tokens.max(call.output_tokens);
+                old.cache_write_tokens = old.cache_write_tokens.max(call.cache_write_tokens);
+                old.cache_read_tokens = old.cache_read_tokens.max(call.cache_read_tokens);
+            })
+            .or_insert(call);
+    }
+    order
+        .into_iter()
+        .rev()
+        .take(256)
+        .filter_map(|id| result.remove(&id))
+        .collect()
+}
 
 /// Cumulative token usage for one session, as reported by the harness's own
 /// transcript. An extractor returning `None` means "could not determine",
@@ -105,8 +248,8 @@ pub fn extract_claude_code_usage(transcript_path: &Path) -> Option<SessionUsage>
     any.then_some(totals)
 }
 
-/// Read the most recent `token_usage_record` from a Codex rollout JSONL
-/// file. Its `payload.thread_token_usage` is already the cumulative total
+/// Read the most recent legacy usage record or modern `token_count` event
+/// from a Codex rollout JSONL file. Its total usage is already cumulative
 /// for this rollout file, so — unlike Claude Code — this needs no summing,
 /// only the latest record. Scans backward from a bounded tail window rather
 /// than the whole file, since a long Codex session's rollout can reach
@@ -127,14 +270,24 @@ pub fn extract_codex_usage(transcript_path: &Path) -> Option<SessionUsage> {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
-        if value.get("type").and_then(serde_json::Value::as_str) != Some("token_usage_record") {
+        let record_type = value.get("type").and_then(serde_json::Value::as_str);
+        let modern = record_type == Some("event_msg")
+            && value
+                .pointer("/payload/type")
+                .and_then(serde_json::Value::as_str)
+                == Some("token_count");
+        if record_type != Some("token_usage_record") && !modern {
             continue;
         }
-        let Some(usage) = value.pointer("/payload/thread_token_usage") else {
+        let Some(usage) = value
+            .pointer("/payload/thread_token_usage")
+            .or_else(|| value.pointer("/payload/info/total_token_usage"))
+        else {
             continue;
         };
         return Some(SessionUsage {
-            input_tokens: u64_field(usage, "input_tokens"),
+            input_tokens: u64_field(usage, "input_tokens")
+                .saturating_sub(u64_field(usage, "cached_input_tokens")),
             // `reasoning_output_tokens` is a breakdown of `output_tokens`
             // (verified against real data: input_tokens + output_tokens ==
             // total_tokens exactly), not additive to it.
@@ -153,6 +306,7 @@ fn u64_field(value: &serde_json::Value, key: &str) -> u64 {
         .get(key)
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0)
+        .min(1_000_000_000)
 }
 
 /// Bound how many rollout files a Codex session-id lookup will stat before
@@ -180,6 +334,30 @@ pub fn locate_codex_rollout(codex_home: &Path, session_id: &str) -> Option<PathB
     }
     let suffix = format!("-{session_id}.jsonl");
     let root = codex_home.join("sessions");
+    // UUIDv7 carries the creation date; most current Codex sessions can be
+    // found in one day directory instead of walking years of rollouts.
+    if let Ok(id) = uuid::Uuid::parse_str(session_id)
+        && id.get_version_num() == 7
+    {
+        let mut ms = 0_i64;
+        for byte in &id.as_bytes()[..6] {
+            ms = (ms << 8) | i64::from(*byte);
+        }
+        if let Ok(time) = jiff::Timestamp::from_millisecond(ms) {
+            let day = root.join(
+                time.to_zoned(jiff::tz::TimeZone::UTC)
+                    .strftime("%Y/%m/%d")
+                    .to_string(),
+            );
+            if let Ok(entries) = std::fs::read_dir(day) {
+                for entry in entries.take(MAX_CODEX_ROLLOUT_SCAN).flatten() {
+                    if entry.file_name().to_string_lossy().ends_with(&suffix) {
+                        return Some(entry.path());
+                    }
+                }
+            }
+        }
+    }
     let mut scanned = 0usize;
     let mut stack = vec![root];
     while let Some(dir) = stack.pop() {
@@ -253,6 +431,43 @@ pub fn locate_claude_code_transcript(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_token_calls_merge_streaming_usage_and_skip_partial_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("transcript.jsonl");
+        std::fs::write(
+            &path,
+            format!(
+                "broken prefix\n{}\n{}\n{}\n{{partial",
+                claude_line("response-a", 50, 5, 10, 100),
+                claude_line("response-a", 50, 20, 10, 100),
+                claude_line("response-b", 70, 30, 0, 200)
+            ),
+        )
+        .unwrap();
+        let calls = extract_live_calls(&path, ai_memory_core::AgentKind::ClaudeCode);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].call_id, "response-b");
+        assert_eq!(calls[1].output_tokens, 20);
+    }
+
+    #[test]
+    fn live_token_codex_reads_modern_usage_without_counting_cached_input_twice() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("rollout.jsonl");
+        let record=serde_json::json!({"type":"event_msg","payload":{"type":"token_count","info":{
+            "total_token_usage":{"input_tokens":1000,"output_tokens":40,"cached_input_tokens":800},
+            "last_token_usage":{"input_tokens":1000,"output_tokens":40,"cached_input_tokens":800,"reasoning_output_tokens":30}
+        }}}).to_string();
+        std::fs::write(&path, format!("{record}\n{record}\n")).unwrap();
+        let calls = extract_live_calls(&path, ai_memory_core::AgentKind::Codex);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].input_tokens, 200);
+        assert_eq!(calls[0].output_tokens, 40);
+        assert_eq!(calls[0].cache_read_tokens, 800);
+        assert_eq!(extract_codex_usage(&path).unwrap().input_tokens, 200);
+    }
 
     fn claude_line(
         msg_id: &str,
@@ -353,7 +568,7 @@ mod tests {
         std::fs::write(&path, body).unwrap();
 
         let usage = extract_codex_usage(&path).unwrap();
-        assert_eq!(usage.input_tokens, 2_027_386);
+        assert_eq!(usage.input_tokens, 235_130);
         assert_eq!(
             usage.output_tokens, 1411,
             "reasoning tokens are a breakdown of output_tokens, not additive"
@@ -372,7 +587,7 @@ mod tests {
         std::fs::write(&path, body).unwrap();
 
         let usage = extract_codex_usage(&path).unwrap();
-        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.input_tokens, 90);
     }
 
     #[test]

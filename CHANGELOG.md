@@ -22,6 +22,8 @@ version in [`docs/changelog/`](docs/changelog/):
 
 
 ### Added
+- Added live, deduplicated response token accounting for Claude Code and Codex, with per-response input/output/cache diagnostics and investigation signals in the project dashboard (#722).
+- Added persistent light, dark and system theme controls with consistent dashboard palettes (#721).
 - The read-only human web home now presents a privacy-preserving memory
   dashboard: projects, sessions, sanitized capture events, compiled pages,
   open-session continuity signals, and last activity. Project cards now
@@ -70,6 +72,7 @@ version in [`docs/changelog/`](docs/changelog/):
 
 
 ### Fixed
+- Corrected Codex fresh-input accounting to exclude cached input and normalized historical Codex totals during upgrade (#722).
 - Prevented recovery snapshots from replaying work already covered by a handoff or mixing another live session's transcript into a delivered handoff (#722).
 - Reconciled the fork's session-usage migration with upstream migrations while preserving recorded token totals on upgrade (#722).
 

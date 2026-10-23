@@ -902,3 +902,30 @@ supersede-by-new-page instead of editing history. Ask an agent to "record this a
 decision" and the skill does the rest. The structured shape also
 retrieves noticeably better through `memory_query` than free-form
 prose.
+
+## Investigate token usage in the dashboard
+
+Open a project under `/web` to view **Token usage**. Updated native Claude Code
+and Codex hooks send measured response usage on `post-tool-use`, `stop`,
+`pre-compact` and `session-end`. A session can stay open: usage is stored as it
+arrives, and the panel and session totals refresh every ten seconds. Update the
+native client on each agent machine as well as the server to enable capture.
+
+Responses are deduplicated by their native identity; partial updates raise the
+stored counters instead of adding the same response again. Fresh input excludes
+cache reads. The largest fifty captured responses link to their session and show
+model, input, output, cache and total tokens. The panel flags contexts of at least
+100,000 tokens, outputs of at least 20,000 tokens, and responses above three times
+the project's captured-response average once five responses exist. These are
+investigation hints, not confirmed anomalies or currency costs.
+
+Live extraction reads a bounded 4 MiB transcript tail and reports at most 256
+responses per event. Capture starts with the updated hooks: historical calls
+outside that window are not reconstructed. Reports appear after the agent writes
+usage to its transcript; unsupported formats and missing reports remain unknown.
+Only token counters, response identities and model names are retained in this
+ledger. Project authorization and session-owner filters apply before ranking or
+aggregation. Existing session-end totals remain as a historical fallback.
+
+The header's **Light / Dark / System** control stores the preference locally in
+the browser. System follows operating-system changes; manual choices override it.

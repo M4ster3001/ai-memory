@@ -623,6 +623,10 @@ readable wiki pages; the next session starts with a handoff.
   and no user accounts (every fresh install), the browser asks for a username
   and password: any username, and the contents of
   `<data_dir>/auth-tokens/default` as the password.
+- Investigate Claude Code/Codex response-token usage in the project dashboard,
+  with persistent Light / Dark / System themes. See
+  [Investigate token usage](docs/usage.md#investigate-token-usage-in-the-dashboard)
+  for capture coverage, cache accounting and investigation signals.
 - Back up host-side harness configuration with
   `ai-memory backup-agents -o agent-assets.tar.gz`; inspect a restore with
   `ai-memory restore-agents -i agent-assets.tar.gz`, then add `--apply` only
