@@ -663,12 +663,34 @@ async fn operations_pending_mail_is_filtered_before_history_pagination() {
     let get = |uri| Request::builder().uri(uri).body(Body::empty()).unwrap();
     let all = text(
         app.clone()
-            .oneshot(get("/inbox?workspace=team&project=app"))
+            .oneshot(get("/inbox?workspace=team&project=app&state="))
             .await
             .unwrap(),
     )
     .await;
     assert!(!all.contains("Old pending request"));
+    assert!(
+        all.contains("offset=50&amp;state="),
+        "All-history pagination must preserve the explicit empty state filter"
+    );
+    let tail = text(
+        app.clone()
+            .oneshot(get("/inbox?workspace=team&project=app&state=&offset=50"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(tail.contains("Old pending request"));
+    let default = text(
+        app.clone()
+            .oneshot(get("/inbox?workspace=team&project=app"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(default.contains("Old pending request"));
+    assert!(!default.contains("Collected request"));
+
     let filtered = text(
         app.clone()
             .oneshot(get("/inbox?workspace=team&project=app&state=pending"))
@@ -1202,6 +1224,74 @@ async fn operations_legacy_login_requires_an_explicit_nonpersistent_write_token(
                     && input.contains("required")
             );
             assert!(!input.contains("value=") && !input.contains("name="));
+        }
+    }
+}
+
+#[tokio::test]
+async fn operations_response_search_and_pagination_cover_the_full_project_and_session() {
+    let (_tmp, store, wiki, _, _, sid) = fixture().await;
+    let calls = (0..57)
+        .map(|n| TokenCall {
+            call_id: format!("response-{n}"),
+            input_tokens: if n == 56 { 1 } else { 1000 },
+            output_tokens: 1,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            model: Some(if n == 56 {
+                "unique-tiny-model".into()
+            } else {
+                "bulk-model".into()
+            }),
+        })
+        .collect();
+    store.writer.upsert_token_calls(sid, calls).await.unwrap();
+    let app = router(store.reader.clone(), wiki);
+    for base in ["/w/team/app".into(), format!("/w/team/app/s/{sid}")] {
+        for (query, count, contains) in [
+            ("", 50, false),
+            ("?calls_q=unique-tiny-model", 1, true),
+            ("?calls_offset=50", 7, true),
+            ("?calls_signal=signals", 0, false),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("{base}{query}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let html = text(response).await;
+            assert_eq!(status, StatusCode::OK, "{base}{query}: {html}");
+            assert!(html.contains("Captured calls</span><strong>57</strong>"));
+            assert_eq!(html.matches("<tr data-call-row").count(), count);
+            let results = html
+                .split("<div class=\"usage-results\">")
+                .nth(1)
+                .unwrap()
+                .split("<p class=\"usage-note\">")
+                .next()
+                .unwrap();
+            assert_eq!(results.contains("unique-tiny-model"), contains);
+        }
+        for query in ["?calls_sort=unknown", "?calls_signal=unknown"] {
+            assert_eq!(
+                app.clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri(format!("{base}{query}"))
+                            .body(Body::empty())
+                            .unwrap()
+                    )
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::BAD_REQUEST
+            );
         }
     }
 }

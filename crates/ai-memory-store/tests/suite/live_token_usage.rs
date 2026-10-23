@@ -201,3 +201,167 @@ async fn token_calls_group_by_session_and_agent_without_merging_foreign_response
         .unwrap();
     assert_eq!((foreign.call_count, foreign.input), (1, 900));
 }
+
+#[tokio::test]
+async fn token_call_queries_search_and_order_before_pagination_with_scope_and_owner_guards() {
+    use ai_memory_store::{TokenCallOrder, TokenCallQuery};
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = store.writer.get_or_create_workspace("team").await.unwrap();
+    let project = store
+        .writer
+        .get_or_create_project(ws, "app", None)
+        .await
+        .unwrap();
+    let sid = session(&store, ws, project, AgentKind::Codex).await;
+    let mut rows = (0..56)
+        .map(|n| {
+            let mut c = call(1000 + n, 10);
+            c.call_id = format!("bulk-{n}");
+            c
+        })
+        .collect::<Vec<_>>();
+    let mut tiny = call(1, 1);
+    tiny.call_id = "tiny-newest".into();
+    tiny.model = Some("unique-tiny-model".into());
+    rows.push(tiny.clone());
+    store.writer.upsert_token_calls(sid, rows).await.unwrap();
+    let conn = rusqlite::Connection::open(tmp.path().join("db/memory.sqlite")).unwrap();
+    conn.execute("UPDATE token_calls SET observed_at=CASE WHEN call_id='tiny-newest' THEN 2000000 ELSE 1000000 END",[]).unwrap();
+    let read = |query, owner| {
+        store
+            .reader
+            .token_usage_report_page(ws, project, owner, Some(sid), query)
+    };
+    let largest = read(TokenCallQuery::default(), OwnerFilter::Any)
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            largest.call_count,
+            largest.matching_calls,
+            largest.calls.len()
+        ),
+        (57, 57, 50)
+    );
+    assert!(!largest.calls.iter().any(|c| c.call_id == "tiny-newest"));
+    let recent = read(
+        TokenCallQuery {
+            order: TokenCallOrder::Recent,
+            ..Default::default()
+        },
+        OwnerFilter::Any,
+    )
+    .await
+    .unwrap();
+    assert_eq!(recent.calls[0].call_id, "tiny-newest");
+    let q = TokenCallQuery {
+        search: "UNIQUE-tiny-model".into(),
+        ..Default::default()
+    };
+    let found = read(q.clone(), OwnerFilter::Any).await.unwrap();
+    assert_eq!(
+        (found.call_count, found.matching_calls, found.calls.len()),
+        (57, 1, 1)
+    );
+    assert_eq!(found.calls[0].call_id, "tiny-newest");
+    let tail = read(
+        TokenCallQuery {
+            offset: 50,
+            ..Default::default()
+        },
+        OwnerFilter::Any,
+    )
+    .await
+    .unwrap();
+    assert_eq!(tail.calls.len(), 7);
+    assert!(tail.calls.iter().any(|c| c.call_id == "tiny-newest"));
+    let signals = read(
+        TokenCallQuery {
+            signals_only: true,
+            ..Default::default()
+        },
+        OwnerFilter::Any,
+    )
+    .await
+    .unwrap();
+    assert!(signals.calls.is_empty());
+    let literal = read(
+        TokenCallQuery {
+            search: "%_".into(),
+            ..Default::default()
+        },
+        OwnerFilter::Any,
+    )
+    .await
+    .unwrap();
+    assert_eq!(literal.matching_calls, 0);
+    let hidden = SessionId::new();
+    store
+        .writer
+        .begin_session(NewSession {
+            id: hidden,
+            workspace_id: ws,
+            project_id: project,
+            agent_kind: AgentKind::Codex,
+            cwd: None,
+            actor_user: Some(ai_memory_core::IdentityKey::User("bob".into()).storage_key()),
+            occurred_at: None,
+        })
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_token_calls(hidden, vec![tiny.clone()])
+        .await
+        .unwrap();
+    let other = store
+        .writer
+        .get_or_create_project(ws, "other", None)
+        .await
+        .unwrap();
+    let foreign = session(&store, ws, other, AgentKind::Codex).await;
+    store
+        .writer
+        .upsert_token_calls(foreign, vec![tiny])
+        .await
+        .unwrap();
+    let mine = store
+        .reader
+        .token_usage_report_page(
+            ws,
+            project,
+            OwnerFilter::User(ai_memory_core::IdentityKey::User("alice".into()).storage_key()),
+            None,
+            q.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (mine.call_count, mine.matching_calls, mine.calls.len()),
+        (57, 1, 1)
+    );
+    let root = store
+        .reader
+        .token_usage_report_page(ws, project, OwnerFilter::Any, None, q.clone())
+        .await
+        .unwrap();
+    assert_eq!((root.call_count, root.matching_calls), (58, 2));
+    let wrong = store
+        .reader
+        .token_usage_report_page(ws, project, OwnerFilter::Any, Some(foreign), q)
+        .await
+        .unwrap();
+    assert_eq!((wrong.call_count, wrong.matching_calls), (0, 0));
+    let huge = read(
+        TokenCallQuery {
+            offset: usize::MAX,
+            ..Default::default()
+        },
+        OwnerFilter::Any,
+    )
+    .await
+    .unwrap();
+    assert!(huge.calls.is_empty());
+    assert_eq!(huge.matching_calls, 57);
+}

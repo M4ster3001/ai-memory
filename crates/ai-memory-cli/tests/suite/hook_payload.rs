@@ -27,6 +27,24 @@ fn run_hook_full_agent(
     payload: &[u8],
     capture_assistant: bool,
 ) -> Output {
+    run_hook_at(
+        data_dir,
+        agent,
+        event,
+        payload,
+        capture_assistant,
+        &ai_memory_test_support::dead_http_endpoint(),
+    )
+}
+
+fn run_hook_at(
+    data_dir: &Path,
+    agent: &str,
+    event: &str,
+    payload: &[u8],
+    capture_assistant: bool,
+    server: &str,
+) -> Output {
     let mut args = vec![
         "hook".to_string(),
         "--event".to_string(),
@@ -34,7 +52,7 @@ fn run_hook_full_agent(
         "--agent".to_string(),
         agent.to_string(),
         "--server-url".to_string(),
-        ai_memory_test_support::dead_http_endpoint(),
+        server.to_owned(),
     ];
     if capture_assistant {
         args.push("--capture-assistant".to_string());
@@ -89,6 +107,71 @@ fn spooled_entry(data_dir: &Path) -> serde_json::Value {
     assert_eq!(entries.len(), 1);
     serde_json::from_slice(&std::fs::read(entries[0].path()).expect("read spool entry"))
         .expect("parse spool entry")
+}
+
+#[test]
+fn native_hook_recovers_a_response_backlog_and_does_not_advance_on_spool_failure() {
+    for agent in ["claude-code", "codex"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let transcript = tmp.path().join("transcript.jsonl");
+        let text=(1..=300).map(|n| {
+            let row=if agent=="claude-code" {
+                serde_json::json!({"type":"assistant","message":{"id":format!("r-{n}"),"usage":{"input_tokens":100,"output_tokens":20}}})
+            } else {
+                serde_json::json!({"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100*n,"output_tokens":20*n}}}})
+            };
+            format!("{row}\n")
+        }).collect::<String>();
+        std::fs::write(&transcript, text).unwrap();
+        let payload=serde_json::json!({"session_id":"native-backlog","cwd":tmp.path(),"transcript_path":transcript,"tool_name":"Bash","tool_input":{"command":"echo test"},"tool_response":"test"}).to_string();
+        let endpoint = ai_memory_test_support::dead_http_endpoint();
+        std::fs::write(tmp.path().join("hook-spool"), "unwritable spool fixture").unwrap();
+        let failed = run_hook_at(
+            tmp.path(),
+            agent,
+            "post-tool-use",
+            payload.as_bytes(),
+            false,
+            &endpoint,
+        );
+        assert!(failed.status.success());
+        std::fs::remove_file(tmp.path().join("hook-spool")).unwrap();
+        let mut ids = std::collections::HashSet::new();
+        for expected in [256, 300, 300] {
+            let output = run_hook_at(
+                tmp.path(),
+                agent,
+                "post-tool-use",
+                payload.as_bytes(),
+                false,
+                &endpoint,
+            );
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            for entry in spool_entries(tmp.path()) {
+                let v: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(entry.path()).unwrap()).unwrap();
+                let body: serde_json::Value =
+                    serde_json::from_str(v["body"].as_str().unwrap()).unwrap();
+                if let Some(calls) = body["_ai_memory_usage_calls"].as_array() {
+                    assert!(calls.len() <= 256);
+                    ids.extend(
+                        calls
+                            .iter()
+                            .map(|c| c["call_id"].as_str().unwrap().to_owned()),
+                    );
+                }
+            }
+            assert_eq!(
+                ids.len(),
+                expected,
+                "{agent} must recover the backlog across separate hook processes"
+            );
+        }
+    }
 }
 
 #[test]

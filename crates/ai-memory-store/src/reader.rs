@@ -1558,13 +1558,38 @@ pub struct TokenCallView {
     pub observed_at: String,
 }
 
-/// Project usage coverage and its most expensive measured responses.
+/// Ordering applied to all matching measured responses before pagination.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TokenCallOrder {
+    /// Most tokens first, including cache.
+    #[default]
+    Largest,
+    /// Most recently captured first.
+    Recent,
+}
+
+/// Bounded, project/session-scoped response investigation query.
+#[derive(Debug, Clone, Default)]
+pub struct TokenCallQuery {
+    /// Literal substring of response id, model or harness (up to 256 chars).
+    pub search: String,
+    /// Restrict to the same investigation signals shown in the dashboard.
+    pub signals_only: bool,
+    /// Stable ordering before the fifty-row page is selected.
+    pub order: TokenCallOrder,
+    /// Matching responses to skip.
+    pub offset: usize,
+}
+
+/// Usage coverage and one filtered page of measured responses.
 #[derive(Debug, Clone, Default)]
 pub struct TokenUsageReport {
-    /// Largest fifty responses by input, cache and output combined.
+    /// Up to fifty responses after filtering and ordering.
     pub calls: Vec<TokenCallView>,
     /// All distinct measured responses, not only the displayed fifty.
     pub call_count: u64,
+    /// Responses matching the investigation query, before pagination.
+    pub matching_calls: u64,
     /// Fresh input across measured responses.
     pub input: u64,
     /// Output across measured responses.
@@ -5154,6 +5179,20 @@ impl ReaderPool {
         owner: OwnerFilter,
         session: Option<SessionId>,
     ) -> StoreResult<TokenUsageReport> {
+        self.token_usage_report_page(ws, proj, owner, session, TokenCallQuery::default())
+            .await
+    }
+
+    /// Search and order all authorized responses before selecting one bounded
+    /// page. Totals and signal averages always cover the whole authorized scope.
+    pub async fn token_usage_report_page(
+        &self,
+        ws: WorkspaceId,
+        proj: ProjectId,
+        owner: OwnerFilter,
+        session: Option<SessionId>,
+        query: TokenCallQuery,
+    ) -> StoreResult<TokenUsageReport> {
         self.with_conn(move |conn| {
             let (mode, actor) = match owner {
                 OwnerFilter::Any => (0, String::new()),
@@ -5183,17 +5222,32 @@ impl ReaderPool {
                         cache_write: r.get(3)?,
                         cache_read: r.get(4)?,
                         calls: Vec::new(),
+                        matching_calls: 0,
                     })
                 },
             )?;
+            let total = "(c.input_tokens + c.output_tokens + c.cache_write_tokens + c.cache_read_tokens)";
+            let context = "(c.input_tokens + c.cache_write_tokens + c.cache_read_tokens)";
+            let mean = (report.input + report.output + report.cache_write + report.cache_read)
+                .checked_div(report.call_count).unwrap_or(0);
+            let filtered = format!("{from} AND (?6 = '' OR instr(lower(c.call_id || ' ' || s.agent_kind || ' ' || COALESCE(c.model,'')), ?6) > 0) \
+                AND (?7 = 0 OR {context} >= 100000 OR c.output_tokens >= 20000 OR (?8 >= 5 AND {total} > ?9))");
+            let search = query.search.chars().take(256).collect::<String>().to_lowercase();
+            let filtered_params = rusqlite::params![ws.as_bytes(), proj.as_bytes(), mode, actor,
+                session_bytes, search, query.signals_only, report.call_count, mean.saturating_mul(3)];
+            report.matching_calls = conn.query_row(&format!("SELECT COUNT(*){filtered}"), filtered_params, |r| r.get(0))?;
+            let order = match query.order {
+                TokenCallOrder::Largest => format!("{total} DESC, c.observed_at DESC"),
+                TokenCallOrder::Recent => format!("c.observed_at DESC, {total} DESC"),
+            };
+            let offset = query.offset.min(i64::MAX as usize);
             let mut stmt = conn.prepare(&format!(
                 "SELECT c.call_id, s.id, s.agent_kind, COALESCE(c.model, 'Not reported'), \
                         c.input_tokens, c.output_tokens, c.cache_write_tokens, \
-                        c.cache_read_tokens, c.observed_at {from} \
-                 ORDER BY c.input_tokens + c.output_tokens + c.cache_write_tokens \
-                          + c.cache_read_tokens DESC, c.observed_at DESC, c.call_id LIMIT 50"
+                        c.cache_read_tokens, c.observed_at {filtered} \
+                 ORDER BY {order}, c.session_id, c.call_id LIMIT 50 OFFSET {offset}"
             ))?;
-            let rows = stmt.query_map(params, |r| {
+            let rows = stmt.query_map(filtered_params, |r| {
                 let sid: Vec<u8> = r.get(1)?;
                 Ok((
                     sid,

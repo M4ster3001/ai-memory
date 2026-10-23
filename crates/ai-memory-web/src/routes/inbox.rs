@@ -83,6 +83,7 @@ pub(crate) async fn handler(
     };
     let inbox = mailbox == MessageBox::Inbox;
     let message_state = match query.state.as_deref() {
+        None if inbox => Some(MessageState::Pending),
         None | Some("") => None,
         Some(raw) => match raw.parse::<MessageState>() {
             Ok(state) => Some(state),
@@ -94,6 +95,8 @@ pub(crate) async fn handler(
         if let Some(state) = message_state {
             href.push_str("&state=");
             href.push_str(state.as_str());
+        } else {
+            href.push_str("&state=");
         }
         href
     };

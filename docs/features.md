@@ -58,12 +58,16 @@ and agent type. **Enable:** update the native Claude Code or Codex client and
 reinstall its hooks as above. There is no separate dashboard token switch.
 The server records reports as they arrive; the session need not end.
 
-**Verify:** open project → agent → session and inspect **Token usage**. The project
-panel refreshes every ten seconds. Input, output and cache are separate, and
+**Verify:** open project → agent → session and inspect **Token usage**. Project
+and session usage panels refresh every ten seconds. Search, signal filters and
+ordering cover all captured responses; page controls show fifty at a time.
+Input, output and cache are separate, and
 repeated reports for one response are deduplicated. Agent cards show coverage.
 
 Missing reports mean unknown usage. Unsupported harnesses, older hooks, and
-historical responses outside the bounded transcript window can leave gaps.
+deleted or unsupported transcript records can leave gaps. Updated hooks resume
+readable history in bounded batches on subsequent events; a large backlog may
+need several hooks before all responses appear.
 Large-context, long-output and above-average signals are investigation hints;
 they are not confirmed failures or monetary costs. See [dashboard usage](usage.md#investigate-token-usage-in-the-dashboard).
 

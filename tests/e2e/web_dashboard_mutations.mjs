@@ -14,6 +14,8 @@ const faults = [
   ['ignore-recipient-project', 'recipients'],
   ['retain-write-token', 'delivery'],
   ['disable-live-refresh', 'live-usage'],
+  ['disable-session-live-refresh', 'session-live-usage'],
+  ['drop-usage-query', 'call-history'],
   ['forget-theme', 'themes'],
   ['steal-browser-shortcut', 'tabs'],
   ['enable-send-while-pending', 'delivery'],
@@ -42,7 +44,7 @@ async function run(mutation) {
 try {
   const baseline = await run();
   assert.equal(baseline.code, 0, 'Baseline must pass; inspect ' + baseline.directory);
-  assert(baseline.result.cases.length >= 10 && baseline.result.cases.every(c => c.passed));
+  assert(baseline.result.cases.length >= 13 && baseline.result.cases.every(c => c.passed));
   manifest.baseline = baseline.directory;
   console.log('PASS unmodified server and browser baseline');
   for (const [fault, name] of faults) {

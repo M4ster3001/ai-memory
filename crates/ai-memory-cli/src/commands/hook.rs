@@ -186,7 +186,9 @@ fn compute_live_calls(
     session_id: Option<&str>,
     runtime_env: &RuntimeEnv,
     home: Option<&Path>,
-) -> Vec<ai_memory_core::TokenCall> {
+    data_dir: &Path,
+    routing_key: &str,
+) -> Option<super::session_usage::LiveCallBatch> {
     let path = match agent {
         AgentKind::ClaudeCode => json
             .get("transcript_path")
@@ -208,8 +210,7 @@ fn compute_live_calls(
             }),
         _ => None,
     };
-    path.map(|p| super::session_usage::extract_live_calls(&p, agent))
-        .unwrap_or_default()
+    path.and_then(|p| super::session_usage::extract_live_calls(&p, agent, data_dir, routing_key))
 }
 
 /// A stale interrupted-session candidate found in the session-start handoff
@@ -1662,23 +1663,43 @@ where
         }
     }
 
+    let qs = policy_cwd.as_deref().map_or_else(
+        || {
+            cwd_query_suffix(
+                &args.agent,
+                &json,
+                args.project_strategy.and_then(|s| s.baked()),
+            )
+        },
+        |cwd| marker_query_suffix(cwd, args.project_strategy.and_then(|s| s.baked())),
+    );
+    let mut live_batch = None;
     if matches!(
         args.event.as_str(),
         "post-tool-use" | "stop" | "pre-compact" | "session-end"
     ) {
-        let calls = compute_live_calls(
+        live_batch = compute_live_calls(
             agent_kind,
             &json,
             canonical_session_id.as_deref(),
             &runtime_env,
             home.as_deref(),
+            &dd,
+            &format!(
+                "{}\n{qs}\n{}",
+                profile
+                    .as_ref()
+                    .map_or(args.server_url.as_str(), |p| p.url.as_str()),
+                canonical_session_id.as_deref().unwrap_or_default()
+            ),
         );
-        if !calls.is_empty()
+        if let Some(batch) = &live_batch
+            && !batch.calls.is_empty()
             && let Some(object) = json.as_object_mut()
         {
             object.insert(
                 "_ai_memory_usage_calls".into(),
-                serde_json::to_value(calls)?,
+                serde_json::to_value(&batch.calls)?,
             );
             payload = serde_json::to_string(&json)?;
         }
@@ -1709,16 +1730,6 @@ where
         payload = serde_json::to_string(&json)?;
     }
 
-    let qs = policy_cwd.as_deref().map_or_else(
-        || {
-            cwd_query_suffix(
-                &args.agent,
-                &json,
-                args.project_strategy.and_then(|s| s.baked()),
-            )
-        },
-        |cwd| marker_query_suffix(cwd, args.project_strategy.and_then(|s| s.baked())),
-    );
     // `GET /handoff` claims the newest open baton in whatever project the
     // server resolves. With no cwd the request names none, and the server
     // falls back to its default or the caller's last active project, so an
@@ -1820,6 +1831,8 @@ where
                 eprintln!(
                     "ai-memory hook warning: failed to spool lifecycle event; capture for this event was skipped"
                 );
+            } else if let Some(batch) = live_batch.take() {
+                batch.commit();
             }
         }
         if let Some(prompts) = antigravity_prompts {

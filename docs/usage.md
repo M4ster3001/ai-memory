@@ -917,16 +917,25 @@ native client on each agent machine as well as the server to enable capture.
 
 Responses are deduplicated by their native identity; partial updates raise the
 stored counters instead of adding the same response again. Fresh input excludes
-cache reads. The largest fifty captured responses link to their session and show
-model, input, output, cache and total tokens. The panel flags contexts of at least
+cache reads. Search, signal filtering and recent ordering query all captured
+responses before selecting fifty-row pages. Page links preserve those filters;
+search results and totals remain separate. Responses link to their session and
+show model, input, output, cache and total tokens. The panel flags contexts of at least
 100,000 tokens, outputs of at least 20,000 tokens, and responses above three times
 the project's captured-response average once five responses exist. These are
 investigation hints, not confirmed anomalies or currency costs.
 
-Live extraction reads a bounded 4 MiB transcript tail and reports at most 256
-responses per event. Capture starts with the updated hooks: historical calls
-outside that window are not reconstructed. Reports appear after the agent writes
-usage to its transcript; unsupported formats and missing reports remain unknown.
+Live extraction reads forward in bounded 4 MiB batches and reports at most 256
+responses per event. A cursor under the client's data directory advances only
+after durable local enqueue. Later hooks continue any backlog, including records
+outside the previous byte window; repeated responses remain deduplicated. A
+large backlog needs multiple events, and a session with no further hooks does
+not drain its transcript automatically. Incomplete lines wait for completion;
+individual lines over 4 MiB are skipped in bounded chunks. Truncation or changed
+checkpoint content restarts the scan. Update the native binary on each agent
+machine: updating only the server does not change transcript capture. Reports
+appear after the agent writes usage; missing/deleted records and unsupported
+formats remain unknown.
 Only token counters, response identities and model names are retained in this
 ledger. Response model labels are sanitized before their length limit is applied.
 Project authorization and session-owner filters apply before ranking or
@@ -960,15 +969,17 @@ exist without individual response records, so coverage and captured-call counts
 are shown separately.
 
 The response table supports model/agent/response search, an investigation-signal
-filter and sorting by token usage or capture time. These controls operate on the
-largest fifty captured responses in the current scope. Project refreshes keep
-filter controls and keyboard focus intact. A session's response ledger is a
-snapshot until the page is refreshed.
+filter and sorting by token usage or capture time. These controls query all
+captured responses in the current scope before selecting fifty-row pages.
+Project and session usage refresh every ten seconds while visible, keeping
+filter controls and keyboard focus intact.
 
 ### Coordinate work from the browser
 
 **Inbox** lists received and sent messages for a selected project, fifty per
-page, without claiming them. **Waiting for agents** shows real queued counts
+page, without claiming them. Received mail opens on pending messages; choose
+**All messages** or **Collected** to browse history. Page links preserve the
+selected state. **Waiting for agents** shows real queued counts
 and mailbox links for each workspace/project you can access. The default opens
 a project with queued messages, and the heading names the current mailbox.
 The sidebar refreshes pending counts every ten seconds on visible pages, with

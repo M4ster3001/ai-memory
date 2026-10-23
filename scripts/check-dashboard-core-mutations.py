@@ -21,6 +21,32 @@ REPORT = {"mutants": [], "complete": False}
 
 CASES = [
     {
+        "name": "rewind-live-response-cursor", "file": "crates/ai-memory-cli/src/commands/session_usage.rs",
+        "start": "pub fn extract_live_calls(", "end": "/// Cumulative token usage",
+        "before": "if cursor.offset > len", "after": "if true || cursor.offset > len",
+        "command": ["cargo", "test", "-p", "ai-memory-cli", "--lib", "live_token_cursor_replays_until_commit_then_recovers_every_response"],
+    },
+    {
+        "name": "advance-usage-before-enqueue", "file": "crates/ai-memory-cli/src/commands/hook.rs",
+        "start": "        if !antigravity_turn_only {", "end": "        if let Some(prompts) = antigravity_prompts {",
+        "before": "if hook_spool::enqueue_with_config(&spool, &entry, Some(&spool_policy)).is_err()",
+        "after": "if { if let Some(batch) = live_batch.take() { batch.commit(); } hook_spool::enqueue_with_config(&spool, &entry, Some(&spool_policy)) }.is_err()",
+        "command": ["cargo", "test", "-p", "ai-memory-cli", "--test", "suite", "native_hook_recovers_a_response_backlog_and_does_not_advance_on_spool_failure"],
+    },
+    {
+        "name": "ignore-response-search", "file": "crates/ai-memory-store/src/reader.rs",
+        "start": "pub async fn token_usage_report_page(", "end": "/// Total reported token usage",
+        "before": "(?6 = '' OR instr", "after": "(?6 = ?6 OR instr",
+        "command": ["cargo", "test", "-p", "ai-memory-store", "--lib", "token_call_queries_search_and_order_before_pagination_with_scope_and_owner_guards"],
+    },
+    {
+        "name": "expose-other-owners-response-search", "file": "crates/ai-memory-store/src/reader.rs",
+        "start": "pub async fn token_usage_report_page(", "end": "/// Total reported token usage",
+        "before": "OwnerFilter::User(a) => (1, a)", "after": "OwnerFilter::User(a) => (0, a)",
+        "command": ["cargo", "test", "-p", "ai-memory-store", "--lib", "token_call_queries_search_and_order_before_pagination_with_scope_and_owner_guards"],
+    },
+
+    {
         "name": "expose-private-notification-projects", "file": "crates/ai-memory-web/src/routes/notifications.rs",
         "start": "pub(crate) async fn handler(", "end": "let notifications =",
         "before": "pending_inbox_counts(viewer.map(|v| v.0.user()))", "after": "pending_inbox_counts(None)",

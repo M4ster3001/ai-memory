@@ -23,7 +23,18 @@ viewer's repository access. This protected, non-consuming response uses
 `Cache-Control: no-store` and contains no message body or subject. Notification
 links open `/web/inbox?workspace=...&project=...&state=pending`. The optional
 `state` filter (`pending`, `claimed`, `cancelled`, or empty for all) is applied
-before history pagination; unknown states are refused.
+before history pagination; unknown states are refused. Received mail defaults
+to `pending` when `state` is omitted; `state=` explicitly shows all history.
+Sent mail defaults to all states.
+
+Project and session HTML views accept `calls_q` (literal model/harness/response
+substring, at most 256 characters), `calls_sort=tokens|recent`,
+`calls_signal=all|signals`, and `calls_offset`. The database applies scope and
+ownership, search, signal filtering and ordering before the fifty-response page.
+Totals and signal averages still cover all authorized responses in that scope.
+These HTML query parameters are separate from observation pagination; they add
+no write capability or new `/api/v1` endpoint. Project and session usage refresh
+every ten seconds while visible, preserving search controls and focus.
 
 `/api/v1/*` and `/admin/*` are dual-auth surfaces:
 

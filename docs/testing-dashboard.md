@@ -50,11 +50,14 @@ Logs and originals are kept under `target/dashboard-core-mutations-*`.
 | Recipient filtering includes workspace and project, clears stale selection, disables empty projects and recovers | Browser `recipients`; Rust `operations_inbox_filters_initial_agents_by_both_project_coordinates` |
 | Inbox queue counts name each workspace/project, links and selectors open the matching mailbox, empty states do not claim new mail, reading leaves messages queued, collection reduces counts | Browser `mailbox-context`; Rust `operations_inbox_queue_context_hides_foreign_projects_and_preserves_mail` also refuses foreign/partial scopes and hides restricted project names with legitimate read/root controls |
 | Sidebar notifications appear for actual queued mail, refresh without reload, link to the right workspace/project, disappear after collection and clear on authorization loss | Browser `notifications`; Rust `operations_notifications_are_read_only_and_hide_restricted_projects` covers access-filtered totals, bounded links, zero state, no caching and non-consumption |
-| Pending notification links find older messages behind collected history | Rust `operations_pending_mail_is_filtered_before_history_pagination`; server state predicate runs before LIMIT/OFFSET |
+| Pending notification links and the default received mailbox find older messages behind collected history; explicit all/claimed filters retain history | Rust `operations_pending_mail_is_filtered_before_history_pagination`; server state predicate runs before LIMIT/OFFSET |
 | Resumed substantive work reopens scoped API/detail reads, leaves completed listings, refuses a foreign project and closes after another SessionEnd | Browser `resumed-session`; store `session_activity` tests preserve the persisted watermark and owner/project controls |
 | Legacy browser reads cannot send; invalid tokens are refused and cleared; authorized sends reach the chosen harness once | Browser `delivery`, against real HTTP auth and native CLI claims; Rust `operations_message_write_obeys_root_user_and_project_grants`, `operations_message_requires_write_access_to_both_project_coordinates`, store `addressed_messages_are_claimed_once_only_by_the_selected_harness` |
 | Sanitization, admission rejection, foreign origin and unknown recipients | Rust `operations_browser_messages_use_the_configured_sanitizer_and_admission`, `operations_browser_send_refuses_cross_origin_unknown_recipient_and_empty_body`; browser `delivery` checks escaped message text |
 | Usage reaches the server before session-end, repeated reports do not add calls, refresh preserves active tab/filter/focus | Browser `live-usage`; hooks `live_token_calls_update_open_sessions_without_an_end_event` |
+| More than 256 responses and a transcript larger than 4 MiB recover across successive hook processes, without advancing on enqueue failure or duplicating responses | Browser `capture-backlog` uses native hooks, spool drain, the real server and dashboard; CLI `native_hook_recovers_a_response_backlog_and_does_not_advance_on_spool_failure`, `live_token_cursor_replays_until_commit_then_recovers_every_response`, `live_token_cursor_crosses_byte_windows_and_retries_partial_usage` |
+| Search and recent ordering include small responses beyond the largest fifty; pagination and reload keep query state | Browser `call-history`; store `token_call_queries_search_and_order_before_pagination_with_scope_and_owner_guards`; web `operations_response_search_and_pagination_cover_the_full_project_and_session` |
+| Session usage updates without reload and preserves filter focus | Browser `session-live-usage` |
 | The native hook actually reads Claude/Codex transcripts for each supported event | CLI `native_hook_reports_live_usage_for_every_supported_event_and_harness` uses the built executable and inspects the delivered spool payload |
 | Streaming/replayed counters cannot decrease the displayed response or disagree with session totals | Store `token_calls_keep_partial_reports_monotonic_in_rows_and_aggregates` |
 | Reused response ids stay separate across sessions, agents and projects | Store `token_calls_group_by_session_and_agent_without_merging_foreign_responses`; web ownership/aggregate tests |
@@ -73,6 +76,12 @@ interception. The tested controller still runs in Chromium. A mutant counts
 only if the response was changed and the intended behavioral case failed.
 
 | Deliberate fault | Required failing case |
+| Reset the response cursor on every hook | Cursor backlog regression |
+| Advance the cursor before enqueue succeeds | Native-hook backlog/enqueue-failure regression |
+| Ignore response search before selecting the page | Full-history response query regression |
+| Remove response-owner filtering | Full-history query ownership regression with root control |
+| Disable periodic refresh on the session page | `session-live-usage` |
+| Drop server query fields from response controls | `call-history` |
 | --- | --- |
 | Display every tab panel | `tabs` |
 | Ignore recipient workspace | `recipients` |

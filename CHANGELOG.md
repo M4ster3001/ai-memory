@@ -75,6 +75,9 @@ version in [`docs/changelog/`](docs/changelog/):
 
 
 ### Fixed
+- Fixed live response capture after transcript gaps by resuming bounded batches from durable enqueue checkpoints, including across hook processes and transcript read windows (#722).
+- Fixed response search, signal filtering and recent ordering to query all authorized calls before pagination, with independent response pages and live usage refresh on session detail pages (#721).
+- Made received inboxes open on pending messages by default, keeping older queued requests visible behind collected history and retaining explicit history filters (#721).
 - Replaced the missing Inbox alert with live, access-filtered pending counts and project links throughout the web navigation; notification links opened pending-only mailboxes, with state filtering before pagination (#721).
 - Scoped session reads now treat substantive work after an old end as resumed,
   matching the activity feed without changing persisted lifecycle watermarks.

@@ -80,16 +80,97 @@ pub(crate) fn session_row(s: SessionSummary, workspace: &str, project: &str) -> 
     }
 }
 
+#[derive(Debug, Default, serde::Deserialize)]
+pub(crate) struct UsageQuery {
+    #[serde(default)]
+    pub calls_q: String,
+    #[serde(default)]
+    pub calls_sort: String,
+    #[serde(default)]
+    pub calls_signal: String,
+    #[serde(default, deserialize_with = "query_offset")]
+    pub calls_offset: usize,
+}
+
+// Flattened query values arrive as strings even for numeric fields.
+fn query_offset<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<usize, D::Error> {
+    let value = <String as serde::Deserialize>::deserialize(deserializer)?;
+    value.parse().map_err(serde::de::Error::custom)
+}
+
+impl UsageQuery {
+    pub fn store_query(&self) -> Result<ai_memory_store::TokenCallQuery, axum::http::StatusCode> {
+        use ai_memory_store::{TokenCallOrder, TokenCallQuery};
+        let order = match self.calls_sort.as_str() {
+            "" | "tokens" => TokenCallOrder::Largest,
+            "recent" => TokenCallOrder::Recent,
+            _ => return Err(axum::http::StatusCode::BAD_REQUEST),
+        };
+        let signals_only = match self.calls_signal.as_str() {
+            "" | "all" => false,
+            "signals" => true,
+            _ => return Err(axum::http::StatusCode::BAD_REQUEST),
+        };
+        if self.calls_q.chars().count() > 256 {
+            return Err(axum::http::StatusCode::BAD_REQUEST);
+        }
+        Ok(TokenCallQuery {
+            search: self.calls_q.trim().into(),
+            signals_only,
+            order,
+            offset: self.calls_offset,
+        })
+    }
+
+    fn page_href(&self, base: &str, offset: usize) -> String {
+        format!(
+            "{base}&calls_q={}&calls_sort={}&calls_signal={}&calls_offset={offset}#token-usage",
+            crate::templates::encode_segment(self.calls_q.trim()),
+            crate::templates::encode_segment(&self.calls_sort),
+            crate::templates::encode_segment(&self.calls_signal)
+        )
+    }
+}
+
 pub(crate) fn usage_panel(
     report: TokenUsageReport,
     workspace: &str,
     project: &str,
+    query: &UsageQuery,
+    base: &str,
 ) -> TokenUsagePanel {
     let input_total = report.input + report.cache_read + report.cache_write;
     let mean = (input_total + report.output)
         .checked_div(report.call_count)
         .unwrap_or(0);
+    let shown = report.calls.len() as u64;
     TokenUsagePanel {
+        search: query.calls_q.clone(),
+        recent: query.calls_sort == "recent",
+        signals_only: query.calls_signal == "signals",
+        matching: report.matching_calls,
+        shown_start: if shown == 0 {
+            0
+        } else {
+            query.calls_offset as u64 + 1
+        },
+        shown_end: if shown == 0 {
+            0
+        } else {
+            (query.calls_offset as u64).saturating_add(shown)
+        },
+        previous_href: if query.calls_offset > 0 {
+            query.page_href(base, query.calls_offset.saturating_sub(50))
+        } else {
+            String::new()
+        },
+        next_href: if (query.calls_offset as u64).saturating_add(shown) < report.matching_calls {
+            query.page_href(base, query.calls_offset.saturating_add(50))
+        } else {
+            String::new()
+        },
+        observation_offset: 0,
+        observation_limit: 50,
         count: report.call_count,
         input: fmt_tokens(report.input),
         output: fmt_tokens(report.output),

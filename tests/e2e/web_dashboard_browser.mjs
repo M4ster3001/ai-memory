@@ -28,6 +28,8 @@ const mutations = {
   'ignore-recipient-project': {test: 'recipients', from: 'option.dataset.project===scope.dataset.project', to: 'true'},
   'retain-write-token': {test: 'delivery', from: 'if(token)token.value=""', to: 'if(token)token.value=token.value'},
   'disable-live-refresh': {test: 'live-usage', from: 'timer=setTimeout(refresh,10000);', to: 'timer=0;'},
+  'disable-session-live-refresh': {test: 'session-live-usage', from: 'timer=setTimeout(refresh,10000);', to: 'timer=0;'},
+  'drop-usage-query': {test: 'call-history', from: 'new FormData(form).forEach(function(value,key){url.searchParams.set(key,value);});', to: 'void form;'},
   'forget-theme': {test: 'themes', from: 'localStorage.setItem(key,selected)', to: 'void selected'},
   'steal-browser-shortcut': {test: 'tabs', from: 'if(event.altKey||event.ctrlKey||event.metaKey)return;', to: ''},
   'enable-send-while-pending': {test: 'delivery', from: 'button.disabled=sending||!toAgent', to: 'button.disabled=!toAgent'},
@@ -311,12 +313,65 @@ async function main() {
       assert.equal(await cdp.evaluate('Number(document.querySelector(".usage-metrics strong").textContent)'), 5);
       assert(await cdp.evaluate(`Array.from(document.querySelectorAll('[data-call-row]')).some(r=>r.textContent.includes('Above 3× average'))`));
       await cdp.evaluate(`document.getElementById('call-filter').value='codex-fixture';document.getElementById('call-filter').dispatchEvent(new Event('input',{bubbles:true}));document.getElementById('call-filter').focus()`);
+      await until(()=>cdp.evaluate(`new URL(location.href).searchParams.get('calls_q')==='codex-fixture'&&!document.getElementById('call-query').hasAttribute('aria-busy')`),'Search must settle before testing the periodic refresh');
       const next = {...calls[0], call_id: 'response-live', input_tokens: 321};await usage([next]);await usage([next]);
       await until(() => cdp.evaluate('Number(document.querySelector(".usage-metrics strong").textContent)===6'), 'Live reports did not refresh exactly once', 18000);
       await selected('tokens');assert(await cdp.evaluate(`document.activeElement.id==='call-filter'&&document.getElementById('call-filter').value==='codex-fixture'`));
       await tab('agents');assert.equal(await cdp.evaluate(`Number(document.querySelector('[data-agent=codex] .agent-card-usage div:last-child strong').textContent)`), 6);
       await cdp.goto(project + '/s/' + id, '#token-usage');
       assert.equal(await cdp.evaluate('Number(document.querySelector(".usage-metrics strong").textContent)'), 6);
+    },
+    async 'capture-backlog'() {
+      const cwd=path.join(artifacts,'backlog-repository'),client=path.join(artifacts,'backlog-client'),transcript=path.join(artifacts,'backlog.jsonl'),sid=crypto.randomUUID();
+      fs.mkdirSync(cwd);fs.writeFileSync(path.join(cwd,'.ai-memory.toml'),'workspace = "backlog"\nproject = "capture"\n');
+      fs.writeFileSync(transcript,Array.from({length:300},(_,n)=>JSON.stringify({type:'assistant',message:{id:'backlog-'+n,model:'backlog-model',usage:{input_tokens:100,output_tokens:20}}})+'\n').join(''));
+      const options={cwd,env:{...env,AI_MEMORY_HOME:client},encoding:'utf8',timeout:15000};
+      for(const expected of [256,300,300]) {
+        const hook=spawnSync(binary,['--data-dir',client,'hook','--event','post-tool-use','--agent','claude-code','--server-url',base,'--auth-token',token],{...options,input:JSON.stringify({session_id:sid,cwd,transcript_path:transcript,tool_name:'Bash',tool_input:{command:'echo fixture'},tool_response:'fixture'})});
+        assert.equal(hook.status,0,'Native catch-up hook failed: '+hook.stderr);
+        const drain=spawnSync(binary,['--data-dir',client,'hook-drain'],options);assert.equal(drain.status,0,'Native catch-up drain failed: '+drain.stderr);
+        await until(async()=> (await (await request('/web/w/backlog/capture')).text()).includes('Captured calls</span><strong>'+expected+'</strong>'),'Native backlog did not reach '+expected+' distinct stored responses');
+      }
+      await cdp.goto(base+'/web/w/backlog/capture?tab=tokens','#token-usage');
+      assert.equal(await cdp.evaluate('Number(document.querySelector(".usage-metrics strong").textContent)'),300);
+      assert(await cdp.evaluate('document.querySelector(".usage-pagination").textContent.includes("300 matching responses")'));
+    },
+    async 'session-live-usage'() {
+      await cdp.goto(project+'/s/'+id,'#token-usage');
+      const before=await cdp.evaluate('Number(document.querySelector(".usage-metrics strong").textContent)');
+      await cdp.evaluate(`document.getElementById('call-filter').value='codex-fixture';document.getElementById('call-filter').dispatchEvent(new Event('input',{bubbles:true}));document.getElementById('call-filter').focus()`);
+      await until(()=>cdp.evaluate(`new URL(location.href).searchParams.get('calls_q')==='codex-fixture'&&!document.getElementById('call-query').hasAttribute('aria-busy')`),'Session search must settle before the new response');
+      await usage([{...calls[0],call_id:'session-live-response',input_tokens:123}]);
+      await until(()=>cdp.evaluate('Number(document.querySelector(".usage-metrics strong").textContent)==='+ (before+1)), 'Session usage did not refresh without reload',18000);
+      assert(await cdp.evaluate(`document.activeElement.id==='call-filter'&&document.getElementById('call-filter').value==='codex-fixture'`));
+      assert(await cdp.evaluate(`Array.from(document.querySelectorAll('[data-call-row]')).some(r=>r.textContent.includes('session-live-response'))`));
+    },
+    async 'call-history'() {
+      const workspace='history',name='app',sid=crypto.randomUUID(),href=base+'/web/w/history/app';
+      const hook='/hook?'+new URLSearchParams({workspace,project:name,agent:'codex',event:'post-tool-use'});
+      const publish=async rows=>request(hook,{session_id:sid,tool_name:'Bash',tool_input:{command:'echo synthetic'},tool_response:'synthetic',_ai_memory_usage_calls:rows.map(row=>({cache_read_tokens:0,cache_write_tokens:0,...row}))});
+      await request('/hook?'+new URLSearchParams({workspace,project:name,agent:'codex',event:'session-start'}),{session_id:sid});
+      await publish(Array.from({length:56},(_,n)=>({call_id:'bulk-'+n,input_tokens:1000+n,output_tokens:10,model:'bulk-model'})));
+      await until(async()=> (await (await request('/web/w/history/app')).text()).includes('Captured calls</span><strong>56</strong>'),'History fixture did not settle');
+      await publish([{call_id:'tiny-newest',input_tokens:1,output_tokens:1,model:'unique-tiny-model'}]);
+      await until(async()=> (await (await request('/web/w/history/app')).text()).includes('Captured calls</span><strong>57</strong>'),'Small response did not settle');
+      await cdp.goto(href+'?tab=tokens','#token-usage');await selected('tokens');
+      assert.equal(await cdp.evaluate('document.querySelectorAll("[data-call-row]").length'),50);
+      assert(!await cdp.evaluate('document.querySelector(".usage-results").textContent.includes("tiny-newest")'));
+      await cdp.evaluate(`document.getElementById('call-sort').value='recent';document.getElementById('call-sort').dispatchEvent(new Event('change',{bubbles:true}))`);
+      await until(()=>cdp.evaluate('document.querySelector("[data-call-row]")?.textContent.includes("tiny-newest")'),'Recent ordering omitted the small newest response');
+      await cdp.evaluate(`document.getElementById('call-filter').value='unique-tiny-model';document.getElementById('call-filter').dispatchEvent(new Event('input',{bubbles:true}))`);
+      await until(()=>cdp.evaluate('document.querySelectorAll("[data-call-row]").length===1&&document.querySelector("[data-call-row]")?.textContent.includes("tiny-newest")'),'Search did not cover calls outside the largest fifty');
+      assert.equal(await cdp.evaluate('Number(document.querySelector(".usage-metrics strong").textContent)'),57);
+      await cdp.evaluate(`document.getElementById('call-filter').value='';document.querySelector('#call-query').requestSubmit()`);
+      await until(()=>cdp.evaluate('document.querySelectorAll("[data-call-row]").length===50&&!!document.querySelector("[data-call-page]")'),'Clearing search did not restore the page');
+      await cdp.evaluate('document.querySelector("[data-call-page]").click()');
+      await until(()=>cdp.evaluate('document.querySelectorAll("[data-call-row]").length===7&&new URL(location.href).searchParams.get("calls_offset")==="50"'),'Response pagination lost results');
+      await cdp.reload();assert.equal(await cdp.evaluate('document.querySelectorAll("[data-call-row]").length'),7);
+      assert.equal(await cdp.evaluate('document.getElementById("call-sort").value'),'recent');
+      await cdp.goto(href+'/s/'+sid+'?calls_q=unique-tiny-model','#token-usage');
+      assert.equal(await cdp.evaluate('document.querySelectorAll("[data-call-row]").length'),1);
+      assert(await cdp.evaluate('document.querySelector("[data-call-row]").textContent.includes("tiny-newest")'));
     },
     async themes() {
       await cdp.goto(project, '#project-panel-overview');

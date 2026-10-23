@@ -1,7 +1,7 @@
 //! Client-side session token-usage extraction (token-cost visibility).
 //!
 //! Reads a harness's own transcript file to compute cumulative token totals
-//! for one session. Live capture reads a bounded tail on model/tool boundaries.
+//! for one session. Live capture reads bounded forward batches on model/tool boundaries.
 //! The legacy full-session fallback runs at `session-end`; it stays off
 //! the frequent `stop`/`post-tool-use` hot path. A
 //! bounded linear scan (Claude Code) or a bounded tail read (Codex, whose
@@ -20,38 +20,148 @@ use std::collections::HashSet;
 use std::io::{BufRead as _, Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 
-/// Read a bounded tail for live response usage. Replaying the window is safe:
-/// the store keys responses by native id and merges partial usage with MAX.
+/// One bounded transcript batch. Publish its cursor only after the lifecycle
+/// event has been durably spooled; a crash then causes safe response-id replay.
+pub struct LiveCallBatch {
+    /// Usage metadata to attach to this hook event.
+    pub calls: Vec<ai_memory_core::TokenCall>,
+    cursor_path: PathBuf,
+    next: LiveCursor,
+}
+
+impl LiveCallBatch {
+    /// Persist progress after enqueue. Concurrent writers may rewind progress,
+    /// but can never skip unspooled records; response ids make replay safe.
+    pub fn commit(self) {
+        if let Ok(bytes) = serde_json::to_vec(&self.next) {
+            if ai_memory_wiki::write_atomic(&self.cursor_path, &bytes).is_err() {
+                return;
+            }
+            // Eviction only causes idempotent replay on the next hook.
+            if let Some(dir) = self.cursor_path.parent()
+                && let Ok(entries) = std::fs::read_dir(dir)
+            {
+                let mut cursors = entries
+                    .take(1024)
+                    .filter_map(Result::ok)
+                    .filter(|e| {
+                        e.path().extension().is_some_and(|s| s == "json")
+                            && e.path() != self.cursor_path
+                    })
+                    .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
+                    .collect::<Vec<_>>();
+                cursors.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+                for (_, stale) in cursors.into_iter().skip(511) {
+                    let _ = std::fs::remove_file(stale);
+                }
+            }
+        }
+    }
+}
+
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct LiveCursor {
+    offset: u64,
+    previous: Option<[u64; 4]>,
+    model: Option<String>,
+    prefix: String,
+    anchor: String,
+    skipping_long_line: bool,
+}
+
+const LIVE_BATCH_CALLS: usize = 256;
+const LIVE_CURSOR_BYTES: u64 = 16 * 1024;
+
+fn fingerprint(file: &mut std::fs::File, start: u64, len: u64) -> std::io::Result<String> {
+    use sha2::{Digest as _, Sha256};
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::new();
+    file.take(len).read_to_end(&mut bytes)?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+/// Read forward in bounded batches, including after a capture gap. The routing
+/// key includes server, project and native session so progress is never shared
+/// between independent destinations. No transcript text is stored in the cursor.
 pub fn extract_live_calls(
     path: &Path,
     agent: ai_memory_core::AgentKind,
-) -> Vec<ai_memory_core::TokenCall> {
-    let read = || -> Option<(String, bool)> {
-        let mut file = std::fs::File::open(path).ok()?;
-        let len = file.metadata().ok()?.len();
-        let start = len.saturating_sub(CODEX_TAIL_SCAN_BYTES);
-        file.seek(SeekFrom::Start(start)).ok()?;
-        let mut bytes = Vec::new();
-        file.take(CODEX_TAIL_SCAN_BYTES)
-            .read_to_end(&mut bytes)
-            .ok()?;
-        Some((String::from_utf8_lossy(&bytes).into_owned(), start == 0))
-    };
-    let Some((text, from_start)) = read() else {
-        return Vec::new();
-    };
+    data_dir: &Path,
+    routing_key: &str,
+) -> Option<LiveCallBatch> {
+    use sha2::{Digest as _, Sha256};
+    let key = serde_json::to_vec(&(path, agent.as_str(), routing_key)).ok()?;
+    let cursor_path = data_dir
+        .join("hook-state")
+        .join("token-usage")
+        .join(format!("{:x}.json", Sha256::digest(key)));
+    let mut cursor = std::fs::File::open(&cursor_path)
+        .ok()
+        .and_then(|file| {
+            let mut bytes = Vec::new();
+            file.take(LIVE_CURSOR_BYTES + 1)
+                .read_to_end(&mut bytes)
+                .ok()?;
+            (bytes.len() as u64 <= LIVE_CURSOR_BYTES)
+                .then(|| serde_json::from_slice::<LiveCursor>(&bytes).ok())
+                .flatten()
+        })
+        .unwrap_or_default();
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let prefix = fingerprint(&mut file, 0, len.min(64)).ok()?;
+    let anchor_start = cursor.offset.saturating_sub(64);
+    if cursor.offset > len
+        || cursor.prefix != prefix
+        || cursor.anchor
+            != fingerprint(&mut file, anchor_start, cursor.offset - anchor_start).ok()?
+    {
+        cursor = LiveCursor::default();
+    }
+    file.seek(SeekFrom::Start(cursor.offset)).ok()?;
+    let mut bytes = Vec::new();
+    file.by_ref()
+        .take(CODEX_TAIL_SCAN_BYTES)
+        .read_to_end(&mut bytes)
+        .ok()?;
     let mut result = std::collections::BTreeMap::<String, ai_memory_core::TokenCall>::new();
     let mut order = Vec::new();
-    let mut previous: Option<[u64; 4]> = from_start.then_some([0; 4]);
-    let mut model = None;
-    for line in text.lines() {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+    let mut previous = if cursor.offset == 0 {
+        Some([0; 4])
+    } else {
+        cursor.previous
+    };
+    let mut model = cursor.model.take();
+    let mut consumed = 0;
+    for line in bytes.split_inclusive(|b| *b == b'\n') {
+        if !line.ends_with(b"\n") {
+            // Retry an incomplete record. An oversized line is skipped in
+            // bounded chunks, rather than blocking every subsequent record.
+            if consumed == 0 && bytes.len() as u64 == CODEX_TAIL_SCAN_BYTES {
+                cursor.skipping_long_line = true;
+                previous = None;
+                model = None;
+                consumed += line.len();
+            }
+            break;
+        }
+        consumed += line.len();
+        if cursor.skipping_long_line {
+            cursor.skipping_long_line = false;
+            continue;
+        }
+        if result.len() >= LIVE_BATCH_CALLS {
+            consumed -= line.len();
+            break;
+        }
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(line) else {
             continue;
         };
         if v.get("type").and_then(|v| v.as_str()) == Some("turn_context") {
             model = v
                 .pointer("/payload/model")
                 .and_then(|v| v.as_str())
+                .filter(|s| s.len() <= 512)
                 .map(str::to_owned);
         }
         let (id, usage, current_model, codex) = if agent == ai_memory_core::AgentKind::ClaudeCode {
@@ -71,6 +181,7 @@ pub fn extract_live_calls(
                 u.clone(),
                 v.pointer("/message/model")
                     .and_then(|v| v.as_str())
+                    .filter(|s| s.len() <= 512)
                     .map(str::to_owned),
                 false,
             )
@@ -136,13 +247,17 @@ pub fn extract_live_calls(
             cache_read_tokens: cached,
             model: current_model,
         };
-        if !result.contains_key(&id) {
-            order.push(id.clone());
-        }
-        if call.input_tokens + call.output_tokens + call.cache_read_tokens + call.cache_write_tokens
+        if call
+            .input_tokens
+            .saturating_add(call.output_tokens)
+            .saturating_add(call.cache_read_tokens)
+            .saturating_add(call.cache_write_tokens)
             == 0
         {
             continue;
+        }
+        if !result.contains_key(&id) {
+            order.push(id.clone());
         }
         result
             .entry(id)
@@ -154,12 +269,20 @@ pub fn extract_live_calls(
             })
             .or_insert(call);
     }
-    order
-        .into_iter()
-        .rev()
-        .take(256)
-        .filter_map(|id| result.remove(&id))
-        .collect()
+    cursor.offset += consumed as u64;
+    cursor.previous = previous;
+    cursor.model = model;
+    cursor.prefix = prefix;
+    let anchor_start = cursor.offset.saturating_sub(64);
+    cursor.anchor = fingerprint(&mut file, anchor_start, cursor.offset - anchor_start).ok()?;
+    Some(LiveCallBatch {
+        calls: order
+            .into_iter()
+            .filter_map(|id| result.remove(&id))
+            .collect(),
+        cursor_path,
+        next: cursor,
+    })
 }
 
 /// Cumulative token usage for one session, as reported by the harness's own
@@ -446,10 +569,17 @@ mod tests {
             ),
         )
         .unwrap();
-        let calls = extract_live_calls(&path, ai_memory_core::AgentKind::ClaudeCode);
+        let calls = extract_live_calls(
+            &path,
+            ai_memory_core::AgentKind::ClaudeCode,
+            tmp.path(),
+            "fixture",
+        )
+        .unwrap()
+        .calls;
         assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].call_id, "response-b");
-        assert_eq!(calls[1].output_tokens, 20);
+        assert_eq!(calls[1].call_id, "response-b");
+        assert_eq!(calls[0].output_tokens, 20);
     }
 
     #[test]
@@ -461,12 +591,131 @@ mod tests {
             "last_token_usage":{"input_tokens":1000,"output_tokens":40,"cached_input_tokens":800,"reasoning_output_tokens":30}
         }}}).to_string();
         std::fs::write(&path, format!("{record}\n{record}\n")).unwrap();
-        let calls = extract_live_calls(&path, ai_memory_core::AgentKind::Codex);
+        let calls = extract_live_calls(
+            &path,
+            ai_memory_core::AgentKind::Codex,
+            tmp.path(),
+            "fixture",
+        )
+        .unwrap()
+        .calls;
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].input_tokens, 200);
         assert_eq!(calls[0].output_tokens, 40);
         assert_eq!(calls[0].cache_read_tokens, 800);
         assert_eq!(extract_codex_usage(&path).unwrap().input_tokens, 200);
+    }
+
+    #[test]
+    fn live_token_cursor_replays_until_commit_then_recovers_every_response() {
+        for agent in [
+            ai_memory_core::AgentKind::ClaudeCode,
+            ai_memory_core::AgentKind::Codex,
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("transcript.jsonl");
+            let mut text = String::from(
+                "{\"type\":\"turn_context\",\"payload\":{\"model\":\"cursor-model\"}}\n",
+            );
+            for n in 1..=300 {
+                let line = if agent == ai_memory_core::AgentKind::ClaudeCode {
+                    claude_line(&format!("r-{n}"), 100, 20, 0, 10)
+                } else {
+                    serde_json::json!({"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100*n,"output_tokens":20*n,"cached_input_tokens":80*n}}}}).to_string()
+                };
+                text.push_str(&line);
+                text.push('\n');
+            }
+            std::fs::write(&path, text).unwrap();
+            let read =
+                || extract_live_calls(&path, agent, tmp.path(), "server/project/session").unwrap();
+            let first = read();
+            assert_eq!(first.calls.len(), 256);
+            assert_eq!(
+                read().calls[0].call_id,
+                first.calls[0].call_id,
+                "Uncommitted data must replay"
+            );
+            first.commit();
+            let rest = read();
+            assert_eq!(rest.calls.len(), 44);
+            if agent == ai_memory_core::AgentKind::Codex {
+                assert!(rest.calls.iter().all(|c| c.input_tokens == 20
+                    && c.output_tokens == 20
+                    && c.cache_read_tokens == 80
+                    && c.model.as_deref() == Some("cursor-model")));
+            }
+            rest.commit();
+            assert!(read().calls.is_empty());
+            assert_eq!(
+                extract_live_calls(&path, agent, tmp.path(), "other/project/session")
+                    .unwrap()
+                    .calls
+                    .len(),
+                256,
+                "Routes must not share progress"
+            );
+            std::fs::write(
+                &path,
+                format!("{}\n", claude_line("replacement", 1, 2, 0, 0)),
+            )
+            .unwrap();
+            if agent == ai_memory_core::AgentKind::ClaudeCode {
+                assert_eq!(read().calls[0].call_id, "replacement");
+            }
+        }
+    }
+
+    #[test]
+    fn live_token_cursor_crosses_byte_windows_and_retries_partial_usage() {
+        use std::io::Write as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("transcript.jsonl");
+        let mut file = std::fs::File::create(&path).unwrap();
+        // Ordinary large records cross the 4 MiB read window; none may be
+        // skipped merely because it was outside the latest tail.
+        for n in 0..3 {
+            writeln!(file, "{}", claude_line(&format!("before-{n}"), 10, 1, 0, 0)).unwrap();
+            writeln!(
+                file,
+                "{}",
+                serde_json::json!({"type":"tool","body":"x".repeat(2*1024*1024)})
+            )
+            .unwrap();
+        }
+        let last = claude_line("after-gap", 20, 5, 0, 0);
+        write!(file, "{last}").unwrap();
+        drop(file);
+        let read = || {
+            extract_live_calls(
+                &path,
+                ai_memory_core::AgentKind::ClaudeCode,
+                tmp.path(),
+                "route",
+            )
+            .unwrap()
+        };
+        let mut ids = std::collections::HashSet::new();
+        for _ in 0..4 {
+            let batch = read();
+            ids.extend(batch.calls.iter().map(|c| c.call_id.clone()));
+            batch.commit();
+        }
+        assert_eq!(ids.len(), 3);
+        assert!(!ids.contains("after-gap"));
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(file).unwrap();
+        let batch = read();
+        assert_eq!(batch.calls[0].call_id, "after-gap");
+        batch.commit();
+        writeln!(file, "{}", claude_line("after-gap", 20, 25, 0, 0)).unwrap();
+        let batch = read();
+        assert_eq!(batch.calls[0].output_tokens, 25);
+        batch.commit();
+        assert!(read().calls.is_empty());
     }
 
     fn claude_line(

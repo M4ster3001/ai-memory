@@ -1173,6 +1173,16 @@ pub(crate) struct ChangePasswordView {
 }
 /// Metadata-only operational view of measured responses.
 pub(crate) struct TokenUsagePanel {
+    pub search: String,
+    pub recent: bool,
+    pub signals_only: bool,
+    pub matching: u64,
+    pub shown_start: u64,
+    pub shown_end: u64,
+    pub previous_href: String,
+    pub next_href: String,
+    pub observation_offset: usize,
+    pub observation_limit: usize,
     pub count: u64,
     pub input: String,
     pub output: String,
