@@ -79,9 +79,13 @@ On small screens, open the menu for projects, inbox, search and documentation.
 as Codex or Claude Code. **Prerequisite:** the recipient must have a captured
 session in that project to appear in the browser selector.
 
-Open **Inbox**, choose the source project and recipient, write the request, and
-select **Queue message**. Sending requires write access to both projects. A
-human login uses its browser session and CSRF protection. The older GET-only
+Open **Inbox** and choose **From project**. **To project** defaults to the same
+project; change it explicitly to send across projects. **To agent** lists only
+harnesses registered in that destination, and changing either project clears
+the chosen agent. Projects without captured sessions show an empty state and
+disable sending. Write the request and select **Queue message**. Sending
+requires write access to both projects. A human login uses its browser session
+and CSRF protection. The older GET-only
 login requires explicitly entering a write token for each send; the composer
 clears it after the request and does not persist it.
 

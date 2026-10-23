@@ -75,6 +75,7 @@ version in [`docs/changelog/`](docs/changelog/):
 
 
 ### Fixed
+- Filtered the inbox agent selector by the destination workspace and project, reset stale recipients on project changes, and added an explicit destination project selector for cross-project messages (#721).
 - Enabled inbox sends from the legacy read-only browser login using an explicit write token for one request, cleared immediately without browser persistence (#721).
 - Preserved inbox claims from session-aware clients whose routing metadata arrived before their session-start event was persisted (#721).
 - Corrected Codex fresh-input accounting to exclude cached input and normalized historical Codex totals during upgrade (#722).

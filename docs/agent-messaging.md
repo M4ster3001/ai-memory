@@ -305,8 +305,12 @@ paged at fifty messages, shows queued/collected/cancelled states, and expands
 bodies as escaped plain text. Reading never claims or cancels a message.
 “Collected” means an agent won the claim, not that it finished the request.
 
-The composer selects a source project and a recipient harness from existing
-sessions in visible projects. Both coordinates are resolved without creating
+The composer defaults **To project** to **From project**, and **To agent** lists
+only harnesses with captured sessions in that destination workspace and project.
+Changing the source resets the destination to that project; choose another
+**To project** explicitly to send across projects. Changing either project clears
+the selected agent. A project without registered agents disables sending and
+explains how to register one. Both coordinates are resolved without creating
 projects. The sender needs write on both projects; the configured sanitizer,
 `message_send` admission webhooks, audit and bounded writer queue apply before
 success. Cookie-authenticated browser writes use the existing CSRF token;

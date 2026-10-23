@@ -69,6 +69,146 @@ async fn text(response: axum::response::Response) -> String {
 }
 
 #[tokio::test]
+async fn operations_inbox_filters_initial_agents_by_both_project_coordinates() {
+    let (_tmp, store, wiki, ws, _, _) = fixture().await;
+    let other_ws = store.writer.get_or_create_workspace("other").await.unwrap();
+    for (workspace, name, agent) in [
+        (ws, "different", Some(AgentKind::ClaudeCode)),
+        (other_ws, "app", Some(AgentKind::GeminiCli)),
+        (ws, "empty", None),
+    ] {
+        let project = store
+            .writer
+            .get_or_create_project(workspace, name, None)
+            .await
+            .unwrap();
+        if let Some(agent_kind) = agent {
+            store
+                .writer
+                .begin_session(NewSession {
+                    id: SessionId::new(),
+                    workspace_id: workspace,
+                    project_id: project,
+                    agent_kind,
+                    cwd: None,
+                    actor_user: None,
+                    occurred_at: None,
+                })
+                .await
+                .unwrap();
+        }
+    }
+    let app = router(store.reader.clone(), wiki);
+    for (workspace, project, agent) in [
+        ("team", "app", Some("codex")),
+        ("team", "different", Some("claude-code")),
+        ("other", "app", Some("gemini-cli")),
+        ("team", "empty", None),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/inbox?workspace={workspace}&project={project}&agent={}",
+                        agent.unwrap_or("codex")
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = text(response).await;
+        let select = html
+            .split("<select id=\"message-to\"")
+            .nth(1)
+            .unwrap()
+            .split("</select>")
+            .next()
+            .unwrap();
+        assert_eq!(
+            select.matches("data-agent=").count(),
+            usize::from(agent.is_some())
+        );
+        for candidate in ["codex", "claude-code", "gemini-cli"] {
+            assert_eq!(
+                select.contains(&format!("data-agent=\"{candidate}\"")),
+                agent == Some(candidate),
+                "{workspace}/{project}: {select}"
+            );
+        }
+        let button = html
+            .split("<button class=\"primary-button send-button\"")
+            .nth(1)
+            .unwrap()
+            .split('>')
+            .next()
+            .unwrap();
+        assert_eq!(button.contains("disabled"), agent.is_none());
+        if agent.is_some() {
+            assert!(select.contains(&format!("data-workspace=\"{workspace}\"")));
+            assert!(select.contains(&format!("data-project=\"{project}\"")));
+            assert!(select.contains("selected"));
+            assert!(!select.split('>').next().unwrap().contains("disabled"));
+        } else {
+            assert!(select.split('>').next().unwrap().contains("disabled"));
+            assert!(select.contains("No registered agents in this project"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn operations_browser_can_send_to_an_explicit_other_project() {
+    let (_tmp, store, wiki, ws, source, _) = fixture().await;
+    let target_ws = store.writer.get_or_create_workspace("other").await.unwrap();
+    let target = store
+        .writer
+        .get_or_create_project(target_ws, "app", None)
+        .await
+        .unwrap();
+    store
+        .writer
+        .begin_session(NewSession {
+            id: SessionId::new(),
+            workspace_id: target_ws,
+            project_id: target,
+            agent_kind: AgentKind::ClaudeCode,
+            cwd: None,
+            actor_user: None,
+            occurred_at: None,
+        })
+        .await
+        .unwrap();
+    let app = router(store.reader.clone(), wiki);
+    let mut value = body();
+    value["to_workspace"] = json!("other");
+    value["to_agent"] = json!("claude-code");
+    let response = app
+        .oneshot(send().body(Body::from(value.to_string())).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let mail = store
+        .reader
+        .list_messages(target_ws, target, MessageBox::Inbox, 50)
+        .await
+        .unwrap();
+    assert_eq!(mail.len(), 1);
+    assert_eq!(mail[0].to_agent, Some(AgentKind::ClaudeCode));
+    assert_eq!(mail[0].origin.from_workspace_id, ws);
+    assert_eq!(mail[0].origin.from_project_id, source);
+    assert_eq!(
+        store
+            .reader
+            .pending_message_count(ws, source)
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
 async fn operations_browser_send_and_inbox_reads_preserve_pending_state() {
     let (_tmp, store, wiki, ws, project, _) = fixture().await;
     let app = router(store.reader.clone(), wiki);
