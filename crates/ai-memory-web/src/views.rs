@@ -56,6 +56,7 @@ pub(crate) struct InboxView {
     pub recipients: Vec<RecipientOption>,
     pub rows: Vec<MessageRow>,
     pub inbox: bool,
+    pub state: String,
     pub inbox_href: String,
     pub outbox_href: String,
     pub previous: String,

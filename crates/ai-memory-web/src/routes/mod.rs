@@ -17,6 +17,7 @@ mod history;
 mod inbox;
 mod index;
 mod login;
+mod notifications;
 mod page;
 mod pending;
 mod project;
@@ -120,6 +121,7 @@ pub(crate) fn build(state: Arc<WebState>) -> Router {
         .route("/docs", get(documentation::index))
         .route("/docs/{slug}", get(documentation::page))
         .route("/inbox", get(inbox::handler))
+        .route("/inbox/notifications", get(notifications::handler))
         .route("/messages", post(inbox::send))
         .route(
             "/w/{workspace}/{project}/agents/{agent}",

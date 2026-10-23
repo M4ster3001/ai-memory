@@ -28,6 +28,7 @@ pub(crate) struct InboxQuery {
     offset: usize,
     #[serde(default, rename = "box")]
     mailbox: Option<String>,
+    state: Option<String>,
 }
 
 fn mailbox_href(workspace: &str, project: &str, outbox: bool, offset: usize) -> String {
@@ -81,6 +82,21 @@ pub(crate) async fn handler(
         _ => return StatusCode::BAD_REQUEST.into_response(),
     };
     let inbox = mailbox == MessageBox::Inbox;
+    let message_state = match query.state.as_deref() {
+        None | Some("") => None,
+        Some(raw) => match raw.parse::<MessageState>() {
+            Ok(state) => Some(state),
+            Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+        },
+    };
+    let filtered_href = |outbox, offset| {
+        let mut href = mailbox_href(&workspace, &project, outbox, offset);
+        if let Some(state) = message_state {
+            href.push_str("&state=");
+            href.push_str(state.as_str());
+        }
+        href
+    };
     let scope = if workspace.is_empty() && project.is_empty() {
         None
     } else {
@@ -116,10 +132,11 @@ pub(crate) async fn handler(
     let mut messages = match scope {
         Some(scope) => match state
             .reader
-            .message_history(
+            .message_history_filtered(
                 scope.workspace_id,
                 scope.project_id,
                 mailbox,
+                message_state,
                 51,
                 query.offset,
             )
@@ -176,7 +193,10 @@ pub(crate) async fn handler(
                 .get(&(p.workspace_name.clone(), p.project_name.clone()))
                 .copied()
                 .unwrap_or(0),
-            inbox_href: mailbox_href(&p.workspace_name, &p.project_name, false, 0),
+            inbox_href: format!(
+                "{}&state=pending",
+                mailbox_href(&p.workspace_name, &p.project_name, false, 0)
+            ),
             selected: p.workspace_name == workspace && p.project_name == project,
             workspace: p.workspace_name,
             project: p.project_name,
@@ -188,25 +208,16 @@ pub(crate) async fn handler(
             .fold(0_u64, |total, s| total.saturating_add(s.pending)),
         pending_projects: scopes.iter().filter(|s| s.pending > 0).count(),
         scopes,
-        inbox_href: mailbox_href(&workspace, &project, false, 0),
-        outbox_href: mailbox_href(&workspace, &project, true, 0),
+        inbox_href: filtered_href(false, 0),
+        outbox_href: filtered_href(true, 0),
+        state: message_state.map_or("", |s| s.as_str()).into(),
         previous: if query.offset > 0 {
-            mailbox_href(
-                &workspace,
-                &project,
-                !inbox,
-                query.offset.saturating_sub(50),
-            )
+            filtered_href(!inbox, query.offset.saturating_sub(50))
         } else {
             String::new()
         },
         next: if more {
-            mailbox_href(
-                &workspace,
-                &project,
-                !inbox,
-                query.offset.saturating_add(50),
-            )
+            filtered_href(!inbox, query.offset.saturating_add(50))
         } else {
             String::new()
         },

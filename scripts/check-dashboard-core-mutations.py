@@ -21,6 +21,24 @@ REPORT = {"mutants": [], "complete": False}
 
 CASES = [
     {
+        "name": "expose-private-notification-projects", "file": "crates/ai-memory-web/src/routes/notifications.rs",
+        "start": "pub(crate) async fn handler(", "end": "let notifications =",
+        "before": "pending_inbox_counts(viewer.map(|v| v.0.user()))", "after": "pending_inbox_counts(None)",
+        "command": ["cargo", "test", "-p", "ai-memory-web", "--lib", "operations_notifications_are_read_only_and_hide_restricted_projects"],
+    },
+    {
+        "name": "ignore-message-state-before-pagination", "file": "crates/ai-memory-store/src/dashboard.rs",
+        "start": "pub async fn message_history_filtered(", "end": "/// Read this session",
+        "before": "(?5 IS NULL OR state=?5)", "after": "(?5 IS NULL OR ?5 IS NOT NULL)",
+        "command": ["cargo", "test", "-p", "ai-memory-web", "--lib", "operations_pending_mail_is_filtered_before_history_pagination"],
+    },
+    {
+        "name": "hide-resumed-session-activity", "file": "crates/ai-memory-store/src/reader.rs",
+        "start": "fn sessions_for_scope_sql(", "end": "fn handoff_listing_sql(",
+        "before": "AND resumed.created_at > s.ended_at", "after": "AND resumed.created_at > s.ended_at AND 0",
+        "command": ["cargo", "test", "-p", "ai-memory-store", "--lib", "resumed_summary_is_open_and_preserves_the_persisted_end"],
+    },
+    {
         "name": "expose-restricted-mailbox-projects", "file": "crates/ai-memory-web/src/routes/inbox.rs",
         "start": "pub(crate) async fn handler(", "end": "#[derive(Deserialize)]",
         "before": "list_projects_with_stats(viewer)", "after": "list_projects_with_stats(None)",

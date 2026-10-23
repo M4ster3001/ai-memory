@@ -49,6 +49,9 @@ Logs and originals are kept under `target/dashboard-core-mutations-*`.
 | Only the selected tab is visible/accessibility-exposed; keyboard, history, reload and old section links work | `web_dashboard_browser.mjs`: `tabs`; Rust `operations_project_tabs_have_one_default_panel_and_matching_controls` |
 | Recipient filtering includes workspace and project, clears stale selection, disables empty projects and recovers | Browser `recipients`; Rust `operations_inbox_filters_initial_agents_by_both_project_coordinates` |
 | Inbox queue counts name each workspace/project, links and selectors open the matching mailbox, empty states do not claim new mail, reading leaves messages queued, collection reduces counts | Browser `mailbox-context`; Rust `operations_inbox_queue_context_hides_foreign_projects_and_preserves_mail` also refuses foreign/partial scopes and hides restricted project names with legitimate read/root controls |
+| Sidebar notifications appear for actual queued mail, refresh without reload, link to the right workspace/project, disappear after collection and clear on authorization loss | Browser `notifications`; Rust `operations_notifications_are_read_only_and_hide_restricted_projects` covers access-filtered totals, bounded links, zero state, no caching and non-consumption |
+| Pending notification links find older messages behind collected history | Rust `operations_pending_mail_is_filtered_before_history_pagination`; server state predicate runs before LIMIT/OFFSET |
+| Resumed substantive work reopens scoped API/detail reads, leaves completed listings, refuses a foreign project and closes after another SessionEnd | Browser `resumed-session`; store `session_activity` tests preserve the persisted watermark and owner/project controls |
 | Legacy browser reads cannot send; invalid tokens are refused and cleared; authorized sends reach the chosen harness once | Browser `delivery`, against real HTTP auth and native CLI claims; Rust `operations_message_write_obeys_root_user_and_project_grants`, `operations_message_requires_write_access_to_both_project_coordinates`, store `addressed_messages_are_claimed_once_only_by_the_selected_harness` |
 | Sanitization, admission rejection, foreign origin and unknown recipients | Rust `operations_browser_messages_use_the_configured_sanitizer_and_admission`, `operations_browser_send_refuses_cross_origin_unknown_recipient_and_empty_body`; browser `delivery` checks escaped message text |
 | Usage reaches the server before session-end, repeated reports do not add calls, refresh preserves active tab/filter/focus | Browser `live-usage`; hooks `live_token_calls_update_open_sessions_without_an_end_event` |
@@ -85,6 +88,11 @@ only if the response was changed and the intended behavioral case failed.
 | Show a fabricated new-message alert with no queued mail | `mailbox-context` |
 | Ignore the workspace when selecting a mailbox | `mailbox-context` |
 | Expose restricted projects in the mailbox overview | Mailbox context isolation regression |
+| Stop loading sidebar notifications | `notifications` |
+| Ignore a notification's workspace | `notifications` |
+| Expose restricted notification totals or project names | Notification isolation regression |
+| Apply history pagination before its state filter | Pending-mail pagination regression |
+| Treat resumed substantive session work as ended | Store `resumed_summary_is_open_and_preserves_the_persisted_end` |
 | Capture usage only on session-end | Native-hook event/harness integration test |
 | Count Codex cache as fresh input | Codex transcript parser regression |
 | Overwrite a response with lower replayed counters | Response/session consistency regression |

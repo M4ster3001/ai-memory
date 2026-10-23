@@ -34,8 +34,10 @@ const mutations = {
   'enable-send-for-empty-project-after-request': {test: 'delivery', from: 'sending=false;updateSendButton();result.focus()', to: 'sending=false;button.disabled=false;result.focus()'},
   'disable-release-auto-submit': {test: 'documentation', from: 'releaseSelect.form.requestSubmit();', to: 'void releaseSelect;'},
   'restore-stale-release-on-history': {test: 'documentation', from: 'releaseSelect.form.reset();', to: 'void releaseSelect;'},
-  'show-false-inbox-alert': {test: 'mailbox-context', from: 'data-nav="inbox"><span aria-hidden="true">✉</span>Inbox</a>', to: 'data-nav="inbox"><span aria-hidden="true">✉</span>Inbox <small>NEW MESSAGE</small></a>'},
+  'show-false-inbox-alert': {test: 'mailbox-context', from: 'Inbox <span id="inbox-pending-count"', to: 'Inbox <small>NEW MESSAGE</small> <span id="inbox-pending-count"'},
   'ignore-mailbox-workspace': {test: 'mailbox-context', from: 'url.searchParams.set("workspace",o.dataset.workspace);', to: 'url.searchParams.set("workspace","team");'},
+  'disable-inbox-notifications': {test: 'notifications', from: '  refreshInboxNotifications();\n})();', to: '  void refreshInboxNotifications;\n})();'},
+  'ignore-notification-workspace': {test: 'notifications', from: 'url.searchParams.set("workspace",project.workspace);', to: 'url.searchParams.set("workspace","team");'},
 };
 assert(!mutation || mutations[mutation], 'Unknown mutation');
 const report = {mutation: mutation || null, mutationApplied: 0, cases: []};
@@ -174,6 +176,9 @@ async function main() {
     const change = mutation && mutations[mutation];
     cdp.listeners.set('Fetch.requestPaused', async message => {
       const p = message.params;
+      if (cdp.notificationStatus && p.responseStatusCode && new URL(p.request.url).pathname === '/web/inbox/notifications') {
+        await cdp.send('Fetch.fulfillRequest', {requestId:p.requestId,responseCode:cdp.notificationStatus,responseHeaders:[{name:'Content-Type',value:'application/json'}],body:Buffer.from('{}').toString('base64')});return;
+      }
       if (cdp.delayMessages && !p.responseStatusCode && new URL(p.request.url).pathname === '/web/messages') {
         cdp.pausedMessage = p.requestId;return;
       }
@@ -184,7 +189,7 @@ async function main() {
         await cdp.send('Fetch.fulfillRequest', {requestId: p.requestId, responseCode: 200, responseHeaders: p.responseHeaders.filter(h => !['content-length','content-encoding'].includes(h.name.toLowerCase())), body: Buffer.from(html).toString('base64')});
       } else await cdp.send('Fetch.continueRequest', {requestId: p.requestId});
     });
-    await cdp.send('Fetch.enable', {patterns: [...(mutation ? [{urlPattern: '*', requestStage: 'Response'}] : []), {urlPattern: base + '/web/messages', requestStage: 'Request'}]});
+    await cdp.send('Fetch.enable', {patterns: [...(mutation ? [{urlPattern: '*', requestStage: 'Response'}] : [{urlPattern:base+'/web/inbox/notifications',requestStage:'Response'}]), {urlPattern: base + '/web/messages', requestStage: 'Request'}]});
   }
   const project = base + '/web/w/team/app';
   const tab = async name => {
@@ -199,6 +204,46 @@ async function main() {
   const recipients = () => cdp.evaluate(`Array.from(document.getElementById('message-to').options).filter(o=>o.dataset.agent).map(o=>[o.dataset.workspace,o.dataset.project,o.dataset.agent])`);
   const chooseAgent = agent => cdp.evaluate(`(()=>{const s=document.getElementById('message-to');s.value=Array.from(s.options).find(o=>o.dataset.agent===${JSON.stringify(agent)}).value;})()`);
   const cases = {
+    async notifications() {
+      await cdp.goto(base+'/web/docs','.docs-search');
+      await until(()=>cdp.evaluate('document.getElementById("inbox-notification-status").textContent==="No messages waiting for agents."'),'Initial notification check failed');
+      assert(await cdp.evaluate('getComputedStyle(document.getElementById("inbox-pending-count")).display==="none"'));
+      const anonymous=await fetch(base+'/web/inbox/notifications',{headers:{Accept:'application/json'},redirect:'manual'});assert.equal(anonymous.status,401);
+      const sent=await (await request('/web/messages',{from_workspace:'team',from_project:'other',to_workspace:'other',to_project:'app',to_agent:'gemini-cli',subject:'Notification fixture',body:'Synthetic pending message.'})).json();
+      await until(()=>cdp.evaluate('!document.getElementById("inbox-pending-count").hidden&&document.getElementById("inbox-pending-count").textContent==="1"'),'New message never reached the sidebar without reload',18000);
+      assert.equal(await cdp.evaluate('location.pathname'),'/web/docs');
+      const href=await cdp.evaluate('document.querySelector("[data-notification-project]").href');
+      assert.equal(new URL(href).searchParams.get('workspace'),'other');assert.equal(new URL(href).searchParams.get('project'),'app');assert.equal(new URL(href).searchParams.get('state'),'pending');
+      assert(await cdp.evaluate('document.getElementById("inbox-notifications").textContent.includes("other / app")'));
+      cdp.notificationStatus=403;await cdp.evaluate('document.dispatchEvent(new Event("visibilitychange"))');
+      await until(()=>cdp.evaluate('document.getElementById("inbox-pending-count").hidden&&document.getElementById("inbox-notification-projects").children.length===0'),'Authorization loss must clear stale counts and projects');
+      cdp.notificationStatus=0;await cdp.evaluate('document.dispatchEvent(new Event("visibilitychange"))');
+      await until(()=>cdp.evaluate('!document.getElementById("inbox-pending-count").hidden'),'Notifications did not recover');
+      await cdp.goto(href,'.mail-row');assert.equal(await cdp.evaluate('document.querySelector(".page-heading strong").textContent'),'other / app');
+      assert(await cdp.evaluate('document.querySelector(".mail-row").textContent.includes("Notification fixture")'));
+      const popped=spawnSync(binary,['message','pop','--workspace','other','--project','app','--agent','gemini-cli','--id',sent.message_id,'--json'],{env:{...env,AI_MEMORY_SERVER_URL:base,AI_MEMORY_DATA_DIR:path.join(artifacts,'client')},encoding:'utf8',timeout:15000});
+      assert.equal(popped.status,0);assert.equal(JSON.parse(popped.stdout).message.id,sent.message_id);
+      await until(()=>cdp.evaluate('document.getElementById("inbox-pending-count").hidden&&document.getElementById("inbox-notifications").hidden'),'Collected mail must clear the notification without reload',18000);
+      await cdp.evaluate('document.getElementById("mail-state").value="claimed";document.getElementById("mail-state").dispatchEvent(new Event("change",{bubbles:true}))');
+      await until(()=>cdp.evaluate('new URL(location.href).searchParams.get("state")==="claimed"&&!!document.querySelector(".mail-row[data-state=claimed]")'),'State selector did not load collected history');
+      assert.equal(new URL(await cdp.evaluate('document.querySelector(".segmented-tabs a[aria-current]").href')).searchParams.get('state'),'claimed');
+      await cdp.goto(base+'/web/docs','.docs-search');await cdp.reload();
+      await until(()=>cdp.evaluate('document.getElementById("inbox-notification-status").textContent==="No messages waiting for agents."'),'Notifications did not survive navigation and reload');
+    },
+    async 'resumed-session'() {
+      const resumedId=crypto.randomUUID(),endpoint='/api/v1/workspaces/team/projects/app/sessions';
+      const capture=event=>request('/hook?'+new URLSearchParams({workspace:'team',project:'app',agent:'codex',event}),{session_id:resumedId,cwd:path.join(artifacts,'team/app'),tool_name:'Bash',tool_input:{command:'echo synthetic-resume'},tool_response:'synthetic'});
+      const recorded=async includeOpen=>(await (await request(endpoint+'?include_open='+includeOpen)).json()).sessions.find(s=>s.session_id===resumedId);
+      await capture('session-start');await capture('post-tool-use');await capture('session-end');
+      await until(async()=>!!(await recorded(false))?.ended_at,'Session end was not recorded');
+      await capture('post-tool-use');
+      await until(async()=>{const row=await recorded(true);return !!row&&!row.ended_at;},'New scoped work must reopen the read view');
+      assert.equal(await recorded(false),undefined,'Completed listing must exclude resumed work before pagination');
+      await cdp.goto(project+'/s/'+resumedId,'#scrubber');assert(await cdp.evaluate('document.querySelector("main").textContent.includes("still open")'));
+      const foreign=await fetch(base+'/web/w/team/other/s/'+resumedId,{headers:{Authorization:'Bearer '+token}});assert.equal(foreign.status,404);
+      await capture('session-end');await until(async()=>!!(await recorded(false))?.ended_at,'A later SessionEnd must close resumed work');
+      await cdp.reload();assert.equal(await cdp.evaluate('document.querySelector("main").textContent.includes("still open")'),false);
+    },
     async tabs() {
       await cdp.goto(project, '#project-panel-overview');await selected('overview');
       for (const name of ['agents','tokens','sessions','knowledge']) {await tab(name);assert.equal(new URL(await cdp.evaluate('location.href')).searchParams.get('tab'), name);}

@@ -75,6 +75,7 @@ version in [`docs/changelog/`](docs/changelog/):
 
 
 ### Fixed
+- Replaced the missing Inbox alert with live, access-filtered pending counts and project links throughout the web navigation; notification links opened pending-only mailboxes, with state filtering before pagination (#721).
 - Scoped session reads now treat substantive work after an old end as resumed,
   matching the activity feed without changing persisted lifecycle watermarks.
   Completed-only listings exclude those resumed sessions (#721).

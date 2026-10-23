@@ -16,6 +16,15 @@
 
 ## 2. Auth model
 
+The built-in web navigation also reads `GET /web/inbox/notifications` (replace
+`/web` with the configured mount). It returns `pending`, `project_count` and up
+to five `projects` with `workspace`, `project` and `pending`, filtered by the
+viewer's repository access. This protected, non-consuming response uses
+`Cache-Control: no-store` and contains no message body or subject. Notification
+links open `/web/inbox?workspace=...&project=...&state=pending`. The optional
+`state` filter (`pending`, `claimed`, `cancelled`, or empty for all) is applied
+before history pagination; unknown states are refused.
+
 `/api/v1/*` and `/admin/*` are dual-auth surfaces:
 
 - Human operators authenticate with `POST /auth/login`. The engine returns an

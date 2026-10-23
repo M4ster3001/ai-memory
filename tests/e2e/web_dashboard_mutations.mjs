@@ -22,6 +22,8 @@ const faults = [
   ['restore-stale-release-on-history', 'documentation'],
   ['show-false-inbox-alert', 'mailbox-context'],
   ['ignore-mailbox-workspace', 'mailbox-context'],
+  ['disable-inbox-notifications', 'notifications'],
+  ['ignore-notification-workspace', 'notifications'],
 ];
 
 async function run(mutation) {
@@ -40,7 +42,7 @@ async function run(mutation) {
 try {
   const baseline = await run();
   assert.equal(baseline.code, 0, 'Baseline must pass; inspect ' + baseline.directory);
-  assert(baseline.result.cases.length >= 8 && baseline.result.cases.every(c => c.passed));
+  assert(baseline.result.cases.length >= 10 && baseline.result.cases.every(c => c.passed));
   manifest.baseline = baseline.directory;
   console.log('PASS unmodified server and browser baseline');
   for (const [fault, name] of faults) {

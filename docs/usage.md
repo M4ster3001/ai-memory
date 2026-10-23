@@ -971,6 +971,10 @@ snapshot until the page is refreshed.
 page, without claiming them. **Waiting for agents** shows real queued counts
 and mailbox links for each workspace/project you can access. The default opens
 a project with queued messages, and the heading names the current mailbox.
+The sidebar refreshes pending counts every ten seconds on visible pages, with
+project links that open **Awaiting collection**. Collected mail leaves the count;
+this is a queue indicator rather than human read/unread tracking. **Message state**
+filters the history before pagination. Reading through a notification does not claim mail.
 Expand a row to read its plain text. **New message**
 selects a source project and a recipient harness from the agents that already
 have sessions in visible projects. Sending requires write access to both

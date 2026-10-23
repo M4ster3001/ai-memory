@@ -91,7 +91,11 @@ session in that project to appear in the browser selector.
 Open **Inbox** to see queued counts by workspace and project, with a direct link
 to each mailbox. With no project in the URL, a mailbox with waiting messages is
 selected first. The heading identifies the open mailbox; opening it does not
-collect messages. The sidebar label is navigation, not a new-message alert.
+collect messages. The sidebar checks for pending messages immediately and every
+ten seconds while the page is visible. A count and up to five project links
+appear only when mail is waiting for an agent; they disappear after collection.
+Links open **Awaiting collection**, so older pending mail is not buried behind
+collected history. Use **Message state** to switch back to all messages or another state.
 
 To compose, choose **From project**. **To project** defaults to the same
 project; change it explicitly to send across projects. **To agent** lists only
