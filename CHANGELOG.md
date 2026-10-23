@@ -74,6 +74,7 @@ version in [`docs/changelog/`](docs/changelog/):
 
 
 ### Fixed
+- Preserved inbox claims from session-aware clients whose routing metadata arrived before their session-start event was persisted (#721).
 - Corrected Codex fresh-input accounting to exclude cached input and normalized historical Codex totals during upgrade (#722).
 - Prevented recovery snapshots from replaying work already covered by a handoff or mixing another live session's transcript into a delivered handoff (#722).
 - Reconciled the fork's session-usage migration with upstream migrations while preserving recorded token totals on upgrade (#722).

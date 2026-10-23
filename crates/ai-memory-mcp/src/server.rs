@@ -6412,8 +6412,8 @@ impl AiMemoryServer {
                 }
             })
             .transpose()?;
-        let claiming_session = aps_actor.session_id.as_deref().map(SessionId::from_native);
-        let recorded_agent = match claiming_session {
+        let candidate_session = aps_actor.session_id.as_deref().map(SessionId::from_native);
+        let recorded_agent = match candidate_session {
             Some(sid) => self
                 .reader
                 .session_agent_kind(sid)
@@ -6421,6 +6421,9 @@ impl AiMemoryServer {
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?,
             None => None,
         };
+        // Routing metadata can arrive before the lifecycle hook inserts a session.
+        // Only persisted sessions may be used as the claim's foreign key.
+        let claiming_session = candidate_session.filter(|_| recorded_agent.is_some());
         let claiming_agent = recorded_agent
             .or(declared_agent)
             .or_else(|| caller.agent.as_deref().map(AgentKind::from_wire))

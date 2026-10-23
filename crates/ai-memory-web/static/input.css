@@ -65,3 +65,5 @@ body.dashboard-shell { margin:0; min-height:100vh; background:var(--dash-bg); co
 
 .capture-health { margin:24px 0; padding:20px 24px; border:1px solid var(--dash-line); border-radius:10px; background:var(--dash-surface); }.memory-hook-health-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:16px; }.memory-hook-health-grid>div { border-left:2px solid var(--dash-line); padding-left:12px; }
 @media(max-width:640px) { .capture-health { padding:18px; }.memory-hook-health-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } }
+
+.knowledge-search { grid-column:1/-1; display:flex; gap:10px; min-width:0; }.knowledge-search .field-input { flex:1; min-width:0; }.knowledge-search button { flex-shrink:0; }

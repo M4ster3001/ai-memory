@@ -99,7 +99,8 @@ Pass `workspace` + `project` for pop and cancel, and `from_workspace` +
 `memory_briefing`'s `scope` gives, not one derived from the folder or the git
 remote; the server may know the project under a different name. A caller bound
 to its own hook session (`session`) and an explicit scope (`explicit`) proceed
-as before.
+as before. Routing metadata can arrive before the session row; a claim records
+its session attribution only when that row already exists.
 
 `memory_message_list` stays read-only and still answers an inferred scope, but
 then always adds `resolved_scope` (workspace and project names), `scope_source`,

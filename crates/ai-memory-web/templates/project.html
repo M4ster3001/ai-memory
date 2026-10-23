@@ -36,6 +36,10 @@
 {% include "_dashboard_refresh.html" %}
 
 <div id="knowledge" class="surface knowledge-layout">
+  <form action="search" method="get" class="knowledge-search">
+    <input type="hidden" name="workspace" value="{{ workspace }}"><input type="hidden" name="project" value="{{ project }}">
+    <label for="project-search-q" class="sr-only">Search this project's memory</label><input id="project-search-q" name="q" type="search" class="field-input" placeholder="Search project memory…"><button type="submit" class="secondary-button">Search</button>
+  </form>
   <!-- Sidebar: folder tree -->
   <aside aria-label="Project pages">
     <h2 class="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-3">Pages</h2>
