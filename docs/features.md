@@ -73,6 +73,15 @@ they are not confirmed failures or monetary costs. See [dashboard usage](usage.m
 is saved locally in that browser. No server setting or restart is required.
 On small screens, open the menu for projects, inbox, search and documentation.
 
+Inside a project, **Overview**, **Agents**, **Token usage**, **Sessions** and
+**Knowledge** are separate tabs: only the selected section is shown. Overview
+contains the summary and pending messages; the other tabs hold their respective
+cards, response diagnostics, session list and compiled pages. The URL preserves
+the selected tab for sharing, reloads and browser back/forward. Use Left/Right,
+Home or End while focused on the tabs to navigate by keyboard. **Inbox** and
+**Link graph** open their own pages. The tabs wrap on mobile without hiding
+destinations off-screen.
+
 ## Agent inbox and directed messages
 
 **Purpose:** queue a request for a project, optionally targeting a harness such

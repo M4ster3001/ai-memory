@@ -75,6 +75,7 @@ version in [`docs/changelog/`](docs/changelog/):
 
 
 ### Fixed
+- Replaced project anchor navigation with accessible tabs that show one section at a time, preserve selection in shared URLs and browser history, and wrap on mobile (#721).
 - Filtered the inbox agent selector by the destination workspace and project, reset stale recipients on project changes, and added an explicit destination project selector for cross-project messages (#721).
 - Enabled inbox sends from the legacy read-only browser login using an explicit write token for one request, cleared immediately without browser persistence (#721).
 - Preserved inbox claims from session-aware clients whose routing metadata arrived before their session-start event was persisted (#721).

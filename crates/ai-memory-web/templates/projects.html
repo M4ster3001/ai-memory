@@ -140,7 +140,7 @@
   <div class="project-card-top"><span class="project-icon" aria-hidden="true">▧</span><div class="project-card-title"><span>{{ card.workspace }}</span><h3><a aria-label="Open {{ card.workspace }}/{{ card.project }}" href="{{ card.href }}">{{ card.project }}</a></h3></div>{% if card.pending_inbox > 0 %}<a href="{{ card.inbox_href }}" class="status-pill status-open" title="Messages waiting for an agent">{{ card.pending_inbox }} inbox</a>{% endif %}</div>
   <p class="card-hint">{% if card.agent_summary != "" %}{{ card.agent_summary }}{% else %}No agent sessions yet{% endif %}</p>
   <div class="project-card-metrics"><div class="project-card-metric"><span>Sessions</span><strong>{{ card.session_count }}</strong></div><div class="project-card-metric"><span>Captured events</span><strong>{{ card.observation_count }}</strong></div><div class="project-card-metric"><span>Compiled pages</span><strong>{{ card.page_count }} <small>page{% if card.page_count != 1 %}s{% endif %}</small></strong></div><div class="project-card-metric"><span>Open sessions</span><strong>{{ card.open_session_count }}</strong></div></div>
-  <div class="project-card-footer"><span>{% if card.last_updated_relative != "" %}Last capture {{ card.last_updated_relative }}{% else %}No capture yet{% endif %}</span><a href="{{ card.href }}#agents">Explore agents ↗</a></div>
+  <div class="project-card-footer"><span>{% if card.last_updated_relative != "" %}Last capture {{ card.last_updated_relative }}{% else %}No capture yet{% endif %}</span><a href="{{ card.href }}?tab=agents">Explore agents ↗</a></div>
 </article>
 {% endfor %}
 </div>

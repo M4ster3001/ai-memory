@@ -69,6 +69,92 @@ async fn text(response: axum::response::Response) -> String {
 }
 
 #[tokio::test]
+async fn operations_project_tabs_have_one_default_panel_and_matching_controls() {
+    let (_tmp, store, wiki, _, _, _) = fixture().await;
+    let response = router(store.reader.clone(), wiki)
+        .oneshot(
+            Request::builder()
+                .uri("/w/team/app")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = text(response).await;
+    assert_eq!(
+        html.matches("class=\"project-panel\" role=\"tabpanel\"")
+            .count(),
+        5
+    );
+    assert_eq!(html.matches("<a id=\"project-tab-").count(), 5);
+    for tab in ["overview", "agents", "tokens", "sessions", "knowledge"] {
+        let panel = html
+            .split(&format!("<section id=\"project-panel-{tab}\""))
+            .nth(1)
+            .unwrap()
+            .split('>')
+            .next()
+            .unwrap();
+        assert_eq!(panel.contains("hidden"), tab != "overview");
+        assert!(panel.contains(&format!("aria-labelledby=\"project-tab-{tab}\"")));
+        let control = html
+            .split(&format!("<a id=\"project-tab-{tab}\""))
+            .nth(1)
+            .unwrap()
+            .split('>')
+            .next()
+            .unwrap();
+        assert!(control.contains(&format!("href=\"w/team/app?tab={tab}\"")));
+        assert!(control.contains(&format!("aria-controls=\"project-panel-{tab}\"")));
+        assert!(control.contains(&format!("aria-selected=\"{}\"", tab == "overview")));
+        assert_eq!(control.contains("tabindex=\"-1\""), tab != "overview");
+    }
+    let overview = html
+        .split("id=\"project-panel-overview\"")
+        .nth(1)
+        .unwrap()
+        .split("id=\"project-panel-agents\"")
+        .next()
+        .unwrap();
+    assert!(overview.contains("Project capture summary") && overview.contains("Mailbox"));
+    for detail in [
+        "id=\"agents\"",
+        "id=\"token-usage\"",
+        "id=\"knowledge\"",
+        "id=\"session-token-table\"",
+    ] {
+        assert!(!overview.contains(detail));
+    }
+    let Ok(mut child) = std::process::Command::new("node")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/project_tabs.cjs"
+        ))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    else {
+        eprintln!("Node is unavailable; browser-behavior assertions skipped.");
+        return;
+    };
+    use std::io::Write;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(html.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test]
 async fn operations_inbox_filters_initial_agents_by_both_project_coordinates() {
     let (_tmp, store, wiki, ws, _, _) = fixture().await;
     let other_ws = store.writer.get_or_create_workspace("other").await.unwrap();

@@ -909,7 +909,7 @@ prose.
 
 ## Investigate token usage in the dashboard
 
-Open a project under `/web` to view **Token usage**. Updated native Claude Code
+Open a project under `/web` and select the **Token usage** tab. Updated native Claude Code
 and Codex hooks send measured response usage on `post-tool-use`, `stop`,
 `pre-compact` and `session-end`. A session can stay open: usage is stored as it
 arrives, and the panel and session totals refresh every ten seconds. Update the
@@ -942,7 +942,16 @@ show recorded harnesses and can be filtered by name, open sessions or queued
 messages. An open session means its end event has not arrived; it is not proof
 that an agent is online.
 
-Within a project, agent cards aggregate reported usage across sessions and show
+Project tabs show one section at a time: **Overview** summarizes capture and
+pending messages, **Agents** groups harnesses, **Token usage** investigates
+responses, **Sessions** lists recent sessions, and **Knowledge** browses saved
+pages. The selected tab is kept in the URL (`?tab=agents`, for example), so
+reload, shared links and browser back/forward keep the same section. Existing
+section bookmarks such as `#agents` still open the corresponding tab. The tab
+bar supports Left/Right, Home and End keys and wraps on narrow screens.
+**Inbox** and **Link graph** open separate views.
+
+In **Agents**, agent cards aggregate reported usage across sessions and show
 how many sessions actually reported it. Follow **Explore sessions** to page
 through one harness's sessions, then open a session for its response ledger and
 captured event timeline. Missing usage stays unknown. Legacy session totals can
