@@ -70,7 +70,7 @@ pub(crate) async fn handler(
             scope.workspace_id,
             scope.project_id,
             session_id,
-            owner_filter_for(actor),
+            owner_filter_for(actor.clone()),
         )
         .await
     {
@@ -135,7 +135,21 @@ pub(crate) async fn handler(
         .collect();
     let page_href = |offset: usize| format!("{base}?offset={offset}&limit={limit}");
     let last_offset = total_usize.saturating_sub(1) / limit * limit;
+    let report = match state
+        .reader
+        .session_token_usage(
+            scope.workspace_id,
+            scope.project_id,
+            session_id,
+            owner_filter_for(actor),
+        )
+        .await
+    {
+        Ok(report) => report,
+        Err(error) => return internal(error),
+    };
     let view = SessionView {
+        token_usage: crate::operations::usage_panel(report, &workspace, &project),
         workspace: workspace.clone(),
         project: project.clone(),
         project_href: project_href(&workspace, &project),

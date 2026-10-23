@@ -22,6 +22,8 @@ version in [`docs/changelog/`](docs/changelog/):
 
 
 ### Added
+- Redesigned the responsive dashboard with persistent workspace navigation, searchable project cards, per-agent consumption and coverage, session response drilldowns, and filterable token investigation signals (#721).
+- Added a browser inbox with non-consuming received/sent history and an authorized composer for registered project agents; addressed messages now route to the selected harness through MCP or CLI while existing shared mail remains compatible (#721).
 - Added live, deduplicated response token accounting for Claude Code and Codex, with per-response input/output/cache diagnostics and investigation signals in the project dashboard (#722).
 - Added persistent light, dark and system theme controls with consistent dashboard palettes (#721).
 - The read-only human web home now presents a privacy-preserving memory

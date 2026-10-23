@@ -1,0 +1,26 @@
+<section id="token-usage" class="usage-panel section-block" aria-labelledby="token-heading">
+  <div class="usage-heading"><div><p class="eyebrow">FOLLOW THE CONSUMPTION</p><h2 id="token-heading">Token usage</h2><p>Measured model responses · updates every 10 seconds on the project overview</p></div><span class="usage-status">During sessions</span></div>
+  <div class="usage-metrics">
+    <div><span>Captured calls</span><strong>{{ token_usage.count }}</strong></div><div><span>Fresh input</span><strong>{{ token_usage.input }}</strong></div><div><span>Output</span><strong>{{ token_usage.output }}</strong></div><div><span>Cache read</span><strong>{{ token_usage.cache_read }}</strong></div><div><span>Cache write</span><strong>{{ token_usage.cache_write }}</strong></div><div><span>Input from cache</span><strong>{{ token_usage.hit_rate }}</strong></div>
+  </div>
+  <div class="usage-controls"><label for="call-filter" class="sr-only">Filter calls by model, agent or response</label><input id="call-filter" type="search" placeholder="Find a model, agent, or response…" data-filter-calls><label for="call-signal" class="sr-only">Filter investigation signals</label><select id="call-signal" data-filter-calls><option value="all">All responses</option><option value="signals">Investigation signals</option></select><label for="call-sort" class="sr-only">Sort calls</label><select id="call-sort" data-filter-calls><option value="tokens">Largest usage first</option><option value="recent">Recently captured first</option></select></div>
+  <div class="usage-results">
+  {% if token_usage.rows.is_empty() %}<div class="empty-state" style="border:0"><span aria-hidden="true">⌁</span><h3>No response usage reported yet</h3><p>Updated Claude Code and Codex clients report usage during tool calls and completed turns. A session does not need to end.</p><p>Existing session totals remain visible in the session table.</p></div>{% else %}
+  <div class="usage-scroll" tabindex="0" role="region" aria-label="Captured response usage"><table class="usage-table"><thead><tr><th>Response / session</th><th>Model</th><th>Fresh input</th><th>Output</th><th>Cache</th><th>Total</th><th>Signal</th></tr></thead><tbody>
+  {% for row in token_usage.rows %}<tr data-call-row data-total="{{ row.total_value }}" data-observed="{{ row.observed_at }}" data-signal="{% if row.signal != "—" %}yes{% else %}no{% endif %}"><td><a href="{{ row.href }}" title="{{ row.id }}">{{ row.agent }} ↗</a><small class="usage-response-id" title="{{ row.id }}">{{ row.id }}</small><small>{{ row.when }}</small></td><td>{{ row.model }}</td><td>{{ row.input }}</td><td>{{ row.output }}</td><td>{{ row.cache }}</td><td title="{{ row.total_value }} tokens"><strong>{{ row.total }}</strong></td><td><span class="{% if row.signal != "—" %}usage-alert{% endif %}">{{ row.signal }}</span></td></tr>{% endfor %}
+  </tbody></table></div><p class="usage-filter-empty" hidden>No captured responses match these filters.</p>{% endif %}
+  </div>
+  <p class="usage-note">Largest 50 captured responses, including cache. Signals flag context ≥100k, output ≥20k, or usage above 3× the captured average after five calls. They are investigation hints, not confirmed errors or monetary costs. Missing usage is unknown, never zero.</p>
+  <p class="usage-note" id="token-refresh-status" role="status" aria-live="polite"></p>
+</section>
+<script>
+(function(){
+  function apply(){var panel=document.getElementById("token-usage");if(!panel)return;var input=panel.querySelector("#call-filter"),signal=panel.querySelector("#call-signal"),sort=panel.querySelector("#call-sort"),rows=Array.from(panel.querySelectorAll("[data-call-row]")),term=input.value.toLocaleLowerCase().trim(),visible=0;
+    rows.sort(function(a,b){return sort.value==="recent"?Date.parse(b.dataset.observed)-Date.parse(a.dataset.observed):Number(b.dataset.total)-Number(a.dataset.total);});
+    rows.forEach(function(row){row.hidden=!(row.textContent.toLocaleLowerCase().includes(term)&&(signal.value!=="signals"||row.dataset.signal==="yes"));if(!row.hidden)visible++;row.parentElement.appendChild(row);});var empty=panel.querySelector(".usage-filter-empty");if(empty)empty.hidden=visible!==0;
+  }
+  document.addEventListener("input",function(e){if(e.target.matches("[data-filter-calls]"))apply();});
+  document.addEventListener("change",function(e){if(e.target.matches("[data-filter-calls]"))apply();});
+  document.addEventListener("usage:updated",apply);
+})();
+</script>

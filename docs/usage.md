@@ -929,3 +929,45 @@ aggregation. Existing session-end totals remain as a historical fallback.
 
 The header's **Light / Dark / System** control stores the preference locally in
 the browser. System follows operating-system changes; manual choices override it.
+
+### Explore agents and sessions
+
+The workspace sidebar keeps projects, the inbox, workstreams, knowledge graph,
+learning review and server health reachable on desktop and mobile. Project cards
+show recorded harnesses and can be filtered by name, open sessions or queued
+messages. An open session means its end event has not arrived; it is not proof
+that an agent is online.
+
+Within a project, agent cards aggregate reported usage across sessions and show
+how many sessions actually reported it. Follow **Explore sessions** to page
+through one harness's sessions, then open a session for its response ledger and
+captured event timeline. Missing usage stays unknown. Legacy session totals can
+exist without individual response records, so coverage and captured-call counts
+are shown separately.
+
+The response table supports model/agent/response search, an investigation-signal
+filter and sorting by token usage or capture time. These controls operate on the
+largest fifty captured responses in the current scope. Project refreshes keep
+filter controls and keyboard focus intact. A session's response ledger is a
+snapshot until the page is refreshed.
+
+### Coordinate work from the browser
+
+**Inbox** lists received and sent messages for a selected project, fifty per
+page, without claiming them. Expand a row to read its plain text. **New message**
+selects a source project and a recipient harness from the agents that already
+have sessions in visible projects. Sending requires write access to both
+projects and passes the configured sanitizer and message admission policy.
+Browser sessions use the existing CSRF checks.
+
+A queued request is not an agent launch. The addressed harness collects it when
+it next checks its inbox; “Collected” records that claim, not successful task
+completion. Static MCP clients pass their harness in `memory_message_pop`'s
+`agent` argument. See [agent messaging](agent-messaging.md).
+
+The navigation and drilldowns use the overview-to-detail approach described by
+[Grafana](https://grafana.com/docs/grafana/latest/visualizations/dashboards/build-dashboards/best-practices/)
+and the session grouping documented by
+[Langfuse](https://langfuse.com/docs/observability/features/sessions). These are
+interaction references; the built-in interface remains Cargo-built HTML/CSS
+with small vanilla JavaScript enhancements.

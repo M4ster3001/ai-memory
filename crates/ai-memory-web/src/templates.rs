@@ -229,6 +229,8 @@ pub(crate) fn duration_between(started: &str, ended: Option<&str>) -> String {
 
 /// One card on the project-list page.
 pub(crate) struct ProjectCard {
+    pub agent_summary: String,
+    pub inbox_href: String,
     /// Workspace name.
     pub workspace: String,
     /// Project name.
@@ -381,6 +383,9 @@ pub(crate) struct Folder {
 #[derive(Template)]
 #[template(path = "project.html")]
 pub(crate) struct ProjectView {
+    pub agents: Vec<crate::operations::AgentCard>,
+    pub inbox_href: String,
+    pub project_href: String,
     pub token_usage: TokenUsagePanel,
     /// Workspace name.
     pub workspace: String,
@@ -749,6 +754,7 @@ pub(crate) struct SessionObservationRow {
 #[derive(Template)]
 #[template(path = "session.html")]
 pub(crate) struct SessionView {
+    pub token_usage: TokenUsagePanel,
     /// Workspace name.
     pub workspace: String,
     /// Project name.
@@ -1176,6 +1182,8 @@ pub(crate) struct TokenUsagePanel {
     pub rows: Vec<TokenUsageRow>,
 }
 pub(crate) struct TokenUsageRow {
+    pub total_value: u64,
+    pub observed_at: String,
     pub href: String,
     pub id: String,
     pub model: String,

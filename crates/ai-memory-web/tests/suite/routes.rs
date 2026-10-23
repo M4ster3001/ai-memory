@@ -3693,8 +3693,9 @@ async fn project_view_separates_machinery_from_knowledge() {
 
     // The sidebar still reaches everything: machinery sits in the
     // collapsed System section.
-    let sidebar =
-        &text[text.find("<aside").expect("sidebar")..text.find("Recent Activity").unwrap()];
+    let sidebar = &text[text
+        .find("<aside aria-label=\"Project pages\"")
+        .expect("sidebar")..text.find("Recent Activity").unwrap()];
     let system = &sidebar[sidebar.find("System").expect("system section")..];
     assert!(system.contains("Lint report 2026-09-02"));
     assert!(system.contains("Session abc123"));
@@ -5009,6 +5010,7 @@ async fn send_mail(
             from_owner_user: None,
             to_workspace_id: to.0,
             to_project_id: to.1,
+            to_agent: None,
             subject: Some(subject.to_owned()),
             body: body.to_owned(),
         })
