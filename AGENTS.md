@@ -417,6 +417,13 @@ Additional boundary rules:
 
 - Add focused regression tests for every bug fix and behavior change.
   Parsers, ID derivation, and retention/decay math especially.
+- Dashboard regressions must be protected by behavior tests in the repository,
+  including the real-browser CI gate for interactions. Local screenshots and
+  scripts under ignored `target/` are additional evidence, not regression
+  coverage. Prove critical guards with deliberate faults: a passing baseline
+  must become a failing assertion, never a compiler error or a missing-tool skip.
+  Tests protect observable behavior; equivalent refactors need not fail.
+  See `docs/testing-dashboard.md` for the Rust/browser gates and mutation probes.
 - Filesystem tests use temp dirs or injected roots (`tempfile`); never
   depend on the real user home directory being writable.
 - Tests that build throwaway git repos must not inherit the contributor's

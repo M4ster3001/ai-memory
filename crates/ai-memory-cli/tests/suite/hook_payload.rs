@@ -92,6 +92,60 @@ fn spooled_entry(data_dir: &Path) -> serde_json::Value {
 }
 
 #[test]
+fn native_hook_reports_live_usage_for_every_supported_event_and_harness() {
+    for agent in ["claude-code", "codex"] {
+        for event in [
+            "post-tool-use",
+            "stop",
+            "pre-compact",
+            "session-end",
+            "pre-tool-use",
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let transcript = tmp.path().join("transcript.jsonl");
+            let row = if agent == "claude-code" {
+                serde_json::json!({"type":"assistant","message":{"id":"response-1","model":"fixture-model","usage":{"input_tokens":100,"output_tokens":20,"cache_read_input_tokens":80,"cache_creation_input_tokens":10}}})
+            } else {
+                serde_json::json!({"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"output_tokens":20,"cached_input_tokens":800},"last_token_usage":{"input_tokens":1000,"output_tokens":20,"cached_input_tokens":800}}}})
+            };
+            std::fs::write(&transcript, format!("{row}\n{row}\n")).unwrap();
+            let payload = serde_json::json!({"session_id":"live-native-hook","cwd":tmp.path(),"transcript_path":transcript,"tool_name":"Bash","tool_input":{"command":"echo fixture"},"tool_response":"fixture"});
+            let output = run_hook_full_agent(
+                tmp.path(),
+                agent,
+                event,
+                payload.to_string().as_bytes(),
+                false,
+            );
+            assert!(
+                output.status.success(),
+                "{agent}/{event}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let delivered: serde_json::Value =
+                serde_json::from_str(&spooled_body(tmp.path())).unwrap();
+            if event == "pre-tool-use" {
+                assert!(delivered.get("_ai_memory_usage_calls").is_none());
+                continue;
+            }
+            let calls = delivered["_ai_memory_usage_calls"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{agent}/{event} did not report live usage"));
+            assert_eq!(calls.len(), 1, "A replay is not a second response");
+            assert_eq!(
+                calls[0]["input_tokens"],
+                if agent == "codex" { 200 } else { 100 }
+            );
+            assert_eq!(
+                calls[0]["cache_read_tokens"],
+                if agent == "codex" { 800 } else { 80 }
+            );
+            assert_eq!(calls[0]["output_tokens"], 20);
+        }
+    }
+}
+
+#[test]
 fn native_hook_accepts_plain_and_bom_prefixed_json() {
     let payload = br#"{"session_id":"windows-test","cwd":"C:\\dev\\project","tool_name":"Read","tool_input":{"file_path":"README.md"}}"#;
 

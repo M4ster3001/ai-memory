@@ -75,6 +75,7 @@ version in [`docs/changelog/`](docs/changelog/):
 
 
 ### Fixed
+- Sanitized token model labels before truncation so the size limit cannot expose a prefix of private text; added real-browser and mutation regression gates for the dashboard (#722).
 - Replaced project anchor navigation with accessible tabs that show one section at a time, preserve selection in shared URLs and browser history, and wrap on mobile (#721).
 - Filtered the inbox agent selector by the destination workspace and project, reset stale recipients on project changes, and added an explicit destination project selector for cross-project messages (#721).
 - Enabled inbox sends from the legacy read-only browser login using an explicit write token for one request, cleared immediately without browser persistence (#721).

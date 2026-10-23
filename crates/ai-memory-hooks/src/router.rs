@@ -4840,7 +4840,10 @@ async fn process_authorized(
                 call.model = call.model.map(|m| {
                     state
                         .sanitizer
-                        .scrub(&m.trim().chars().take(64).collect::<String>())
+                        .scrub(m.trim())
+                        .chars()
+                        .take(64)
+                        .collect::<String>()
                 });
                 Some(call)
             })
@@ -23556,6 +23559,70 @@ pub(crate) mod tests {
         assert!(is_acknowledgment("谢谢"));
         assert!(!is_acknowledgment("fix the bug in main.rs"));
         assert!(!is_acknowledgment("what is the return type?"));
+    }
+
+    #[tokio::test]
+    async fn live_token_calls_scrub_private_labels_before_truncating() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.sanitizer = Sanitizer::new(&SanitizeConfig {
+            extra_patterns: vec!["SENSITIVE_FIXTURE".into()],
+            allowlist: Vec::new(),
+        })
+        .unwrap();
+        let call = |id: &str, model: String, input: u64| {
+            serde_json::json!({
+                "call_id":id,"model":model,"input_tokens":input,"output_tokens":10,"cache_read_tokens":0,"cache_write_tokens":0
+            })
+        };
+        let envelope = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "user-prompt".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({"session_id":"private-usage-label","prompt":"fixture","_ai_memory_usage_calls":[
+                call("clean-model",format!("{}SENSITIVE_FIXTURE","m".repeat(60)),100),
+                call("SENSITIVE_FIXTURE","fixture-public".into(),900),
+                call("invalid id","fixture-public".into(),900),
+                call("public-response","fixture-public".into(),200)
+            ]}),
+        );
+        process(&state, envelope, None, Vec::new()).await.unwrap();
+        let report = state
+            .reader
+            .token_usage_report(
+                state.workspace_id,
+                state.project_id,
+                ai_memory_core::OwnerFilter::Any,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            (report.call_count, report.input),
+            (2, 300),
+            "Private and malformed response ids must be refused"
+        );
+        let bounded = report
+            .calls
+            .iter()
+            .find(|c| c.call_id == "clean-model")
+            .unwrap();
+        assert!(bounded.model.starts_with(&"m".repeat(60)));
+        assert!(bounded.model.chars().count() <= 64);
+        assert!(
+            !bounded.model.contains("SENS"),
+            "Truncation must not expose a prefix of a private label"
+        );
+        let public = report
+            .calls
+            .iter()
+            .find(|c| c.call_id == "public-response")
+            .unwrap();
+        assert_eq!(
+            public.model, "fixture-public",
+            "Public labels remain readable"
+        );
     }
 
     #[tokio::test]

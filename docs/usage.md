@@ -928,7 +928,8 @@ responses per event. Capture starts with the updated hooks: historical calls
 outside that window are not reconstructed. Reports appear after the agent writes
 usage to its transcript; unsupported formats and missing reports remain unknown.
 Only token counters, response identities and model names are retained in this
-ledger. Project authorization and session-owner filters apply before ranking or
+ledger. Response model labels are sanitized before their length limit is applied.
+Project authorization and session-owner filters apply before ranking or
 aggregation. Existing session-end totals remain as a historical fallback.
 
 The header's **Light / Dark / System** control stores the preference locally in

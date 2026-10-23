@@ -757,6 +757,7 @@ diagram, crate breakdown, schema notes, and invariants.
 
 | File | What it is |
 |---|---|
+| [`docs/testing-dashboard.md`](docs/testing-dashboard.md) | Dashboard behavior tests, real-browser CI and mutation probes that prove regression guards fail. |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Operational summary: data flow, crate layout, cross-cutting invariants, schema. |
 | [`docs/design-decisions.md`](docs/design-decisions.md) | The full v1 spec. |
 | [`docs/managed-harness-contributions.md`](docs/managed-harness-contributions.md) | Protocol and acceptance bar for adding managed resume, transcript import, and startup context delivery to another harness. |

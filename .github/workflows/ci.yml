@@ -146,6 +146,19 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         with:
           node-version: "24"
+      # Browser tooling is test-only. Building/distributing the Rust server
+      # and its embedded web UI still needs Cargo alone.
+      - name: Install pinned Chromium for dashboard regression tests
+        if: matrix.os == 'ubuntu-latest'
+        run: npx --yes playwright@1.63.0 install --with-deps --only-shell chromium
+      - name: Real dashboard browser tests and mutation checks
+        if: matrix.os == 'ubuntu-latest'
+        env:
+          AI_MEMORY_BIN: ${{ github.workspace }}/target/debug/ai-memory
+        run: node tests/e2e/web_dashboard_mutations.mjs
+      - name: Dashboard Rust mutation checks
+        if: matrix.os == 'ubuntu-latest'
+        run: python3 scripts/check-dashboard-core-mutations.py
       - name: Generated capture-policy TypeScript runtime evidence
         if: matrix.os == 'ubuntu-latest'
         # `--workspace` reuses the test binaries built above instead of
