@@ -75,6 +75,9 @@ version in [`docs/changelog/`](docs/changelog/):
 
 
 ### Fixed
+- Scoped session reads now treat substantive work after an old end as resumed,
+  matching the activity feed without changing persisted lifecycle watermarks.
+  Completed-only listings exclude those resumed sessions (#721).
 - Replaced the static Inbox notification label with real queued-message counts by workspace and project, direct mailbox links, and explicit current-project context (#721).
 - Updated changelog content immediately when a release was selected, keeping the URL, outline and Markdown reference in sync while preserving manual submission without JavaScript (#721).
 - Sanitized token model labels before truncation so the size limit cannot expose a prefix of private text; added real-browser and mutation regression gates for the dashboard (#722).

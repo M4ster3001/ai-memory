@@ -581,7 +581,11 @@ row is anchored in the project OR at least one of its observations landed
 there, so a session that changed repositories mid-flight shows up in both.
 `observation_count` counts only this project's rows. `limit` clamped
 `1..=100`, default `20`; `offset` default `0`; `include_open` default
-`false` (only sessions with `ended_at` set). Owner-filtered like handoffs: a
+`false` (only effectively ended sessions). Substantive observations in the
+requested project after the persisted end make the read view open again:
+`ended_at` is `null`, and `include_open=false` excludes it. Lifecycle-only
+observations do not reopen it. The stored end remains the writer's finalization
+watermark; this read does not modify history or handoff admission. Owner-filtered like handoffs: a
 caller the server can name sees their own sessions plus unattributed ones;
 an unnamed caller sees unattributed ones only. Never cached (`no-store`).
 

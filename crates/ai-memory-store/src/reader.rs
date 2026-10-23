@@ -13929,13 +13929,23 @@ fn sessions_for_scope_sql(
         OwnerFilter::User(_) => " AND (s.actor_user IS NULL OR s.actor_user = :actor)",
         OwnerFilter::Unattributed => " AND s.actor_user IS NULL",
     };
+    // Keep the persisted end as the writer's finalization watermark. New
+    // substantive work in this scope reopens only the read view, matching
+    // recent_session_activity without changing lifecycle or handoff admission.
+    let effective_end = "CASE WHEN EXISTS (\
+        SELECT 1 FROM observations resumed INDEXED BY idx_observations_session \
+        WHERE resumed.session_id = s.id \
+          AND resumed.workspace_id = :ws AND resumed.project_id = :proj \
+          AND resumed.created_at > s.ended_at \
+          AND resumed.kind NOT IN ('session-start', 'session-end')\
+        ) THEN NULL ELSE s.ended_at END";
     let ended_clause = if include_open {
-        ""
+        String::new()
     } else {
-        " AND s.ended_at IS NOT NULL"
+        format!(" AND ({effective_end}) IS NOT NULL")
     };
     format!(
-        "SELECT s.id, s.cwd, s.agent_kind, s.started_at, s.ended_at, s.actor_user, \
+        "SELECT s.id, s.cwd, s.agent_kind, s.started_at, {effective_end} AS ended_at, s.actor_user, \
                 (SELECT COUNT(*) FROM observations o INDEXED BY idx_observations_session \
                  WHERE o.session_id = s.id \
                    AND o.workspace_id = :ws AND o.project_id = :proj) AS n, \
