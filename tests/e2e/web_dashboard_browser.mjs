@@ -32,6 +32,8 @@ const mutations = {
   'steal-browser-shortcut': {test: 'tabs', from: 'if(event.altKey||event.ctrlKey||event.metaKey)return;', to: ''},
   'enable-send-while-pending': {test: 'delivery', from: 'button.disabled=sending||!toAgent', to: 'button.disabled=!toAgent'},
   'enable-send-for-empty-project-after-request': {test: 'delivery', from: 'sending=false;updateSendButton();result.focus()', to: 'sending=false;button.disabled=false;result.focus()'},
+  'disable-release-auto-submit': {test: 'documentation', from: 'releaseSelect.form.requestSubmit();', to: 'void releaseSelect;'},
+  'restore-stale-release-on-history': {test: 'documentation', from: 'releaseSelect.form.reset();', to: 'void releaseSelect;'},
 };
 assert(!mutation || mutations[mutation], 'Unknown mutation');
 const report = {mutation: mutation || null, mutationApplied: 0, cases: []};
@@ -300,6 +302,27 @@ async function main() {
       }
       const release = await (await request('/api/v1/docs/changelog?release=3.2.2')).json();
       assert(release.markdown.startsWith('## [3.2.2]'));assert(!release.markdown.includes('## [3.2.1]'));
+      await cdp.goto(base + '/web/docs/changelog', '#release-version');
+      assert.equal(await cdp.evaluate('document.querySelector(".docs-release button")'), null, 'JavaScript users should not need a submit button');
+      const selectedRelease = async version => {
+        await until(() => cdp.evaluate(`new URL(location.href).searchParams.get('release')===${JSON.stringify(version)}&&document.readyState==='complete'&&document.getElementById('release-version')?.value===${JSON.stringify(version)}&&document.querySelector('.docs-article h2')?.textContent.startsWith(${JSON.stringify('[' + version + ']')})`), 'Release selection did not load ' + version);
+        assert.equal(await cdp.evaluate('document.getElementById("release-version").value'), version);
+        assert(await cdp.evaluate(`new URL(document.querySelector('.page-heading a').href).searchParams.get('release')===${JSON.stringify(version)}&&Array.from(document.querySelectorAll('.docs-outline a')).every(a=>new URL(a.href).searchParams.get('release')===${JSON.stringify(version)})`), 'Release links must match the displayed content');
+      };
+      for (const version of ['3.2.2', '3.2.0', 'Unreleased']) {
+        await cdp.evaluate(`(()=>{const select=document.getElementById('release-version');select.value=${JSON.stringify(version)};select.dispatchEvent(new Event('change',{bubbles:true}));})()`);
+        await selectedRelease(version);
+      }
+      await cdp.reload();await selectedRelease('Unreleased');
+      await cdp.evaluate('history.back()');await selectedRelease('3.2.0');
+      await cdp.evaluate('history.forward()');await selectedRelease('Unreleased');
+      await cdp.send('Emulation.setScriptExecutionDisabled', {value: true});
+      try {
+        await cdp.goto(base + '/web/docs/changelog?release=3.2.2', '.docs-release button');
+        assert(await cdp.evaluate('getComputedStyle(document.querySelector(".docs-release button")).display!=="none"'), 'No-JavaScript release submission must remain available');
+        await cdp.evaluate(`document.getElementById('release-version').value='3.2.0';document.querySelector('.docs-release button').click()`);
+        await selectedRelease('3.2.0');
+      } finally {await cdp.send('Emulation.setScriptExecutionDisabled', {value: false});}
       const missing = await fetch(base + '/web/docs/.env.md', {headers: {Authorization: 'Bearer ' + token}});assert.equal(missing.status, 404);
     },
     async responsive() {

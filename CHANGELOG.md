@@ -75,6 +75,7 @@ version in [`docs/changelog/`](docs/changelog/):
 
 
 ### Fixed
+- Updated changelog content immediately when a release was selected, keeping the URL, outline and Markdown reference in sync while preserving manual submission without JavaScript (#721).
 - Sanitized token model labels before truncation so the size limit cannot expose a prefix of private text; added real-browser and mutation regression gates for the dashboard (#722).
 - Replaced project anchor navigation with accessible tabs that show one section at a time, preserve selection in shared URLs and browser history, and wrap on mobile (#721).
 - Filtered the inbox agent selector by the destination workspace and project, reset stale recipients on project changes, and added an explicit destination project selector for cross-project messages (#721).

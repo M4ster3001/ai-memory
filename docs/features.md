@@ -299,6 +299,9 @@ For Markdown, use `/web/docs/features.md` or
 `/web/docs/changelog.md?release=Unreleased`. Change `/web` to your configured
 web slug. The changelog defaults to one release; request `release=all` for its
 whole major series, or choose an archived series in the catalog.
+In the web changelog, selecting a release immediately loads its notes and updates
+the shareable URL, outline and Markdown link. Without JavaScript, use **Show
+release** to submit the selection.
 
 [Changelog](../CHANGELOG.md) separates Unreleased work from tagged releases.
 Guides and notes are bundled with this binary; references outside the embedded

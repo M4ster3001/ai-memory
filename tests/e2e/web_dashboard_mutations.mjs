@@ -18,6 +18,8 @@ const faults = [
   ['steal-browser-shortcut', 'tabs'],
   ['enable-send-while-pending', 'delivery'],
   ['enable-send-for-empty-project-after-request', 'delivery'],
+  ['disable-release-auto-submit', 'documentation'],
+  ['restore-stale-release-on-history', 'documentation'],
 ];
 
 async function run(mutation) {

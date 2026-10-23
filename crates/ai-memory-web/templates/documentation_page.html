@@ -5,11 +5,19 @@
 {% block content %}
 <nav class="breadcrumbs" aria-label="Breadcrumb"><a href="docs">Documentation</a><span>/</span><span aria-current="page">{{ doc.title }}</span></nav>
 <div class="page-heading"><div><p class="eyebrow">{{ doc.category }} · v{{ crate::templates::VERSION }}</p><h1>{{ doc.title }}</h1><p>{{ doc.description }}</p></div><a href="{{ markdown_href }}" class="secondary-button">Read Markdown ↗</a></div>
-{% if !releases.is_empty() %}<form action="docs/{{ doc.id }}" method="get" class="docs-release"><label for="release-version">Release</label><select id="release-version" name="release" class="field-input">{% for release in releases %}<option value="{{ release.id }}" {% if release.selected %}selected{% endif %}>{{ release.label }}</option>{% endfor %}</select><button type="submit" class="secondary-button">Show release</button><span class="section-note">{% if selected_release == "Unreleased" %}Changes not yet assigned to a tagged release.{% else %}Historical release notes from this build's documentation.{% endif %}</span></form>{% endif %}
+{% if !releases.is_empty() %}<form action="docs/{{ doc.id }}" method="get" class="docs-release"><label for="release-version">Release</label><select id="release-version" name="release" class="field-input">{% for release in releases %}<option value="{{ release.id }}" {% if release.selected %}selected{% endif %}>{{ release.label }}</option>{% endfor %}</select><noscript><button type="submit" class="secondary-button">Show release</button></noscript><span class="section-note">{% if selected_release == "Unreleased" %}Changes not yet assigned to a tagged release.{% else %}Historical release notes from this build's documentation.{% endif %}</span></form>{% endif %}
 <div class="docs-layout">
 <aside class="surface docs-sidebar" aria-label="Documentation guides"><details open><summary>Browse guides</summary><nav>{% for item in sidebar %}<a href="docs/{{ item.id }}" {% if item.id == doc.id %}aria-current="page"{% endif %}>{{ item.title }}</a>{% endfor %}</nav></details></aside>
 {% if !outline.is_empty() %}<aside class="docs-outline" aria-label="On this page"><details open><summary>On this page</summary><nav>{% for entry in outline %}{% if entry.level <= 3 %}<a href="{{ current_href }}#{{ entry.id }}" class="toc-level-{{ entry.level }}">{{ entry.text }}</a>{% endif %}{% endfor %}</nav></details></aside>{% endif %}
 <article class="surface docs-article"><p class="docs-source">Source: <code>{{ doc.source }}</code> · included in this server build</p><div class="markdown-body">{{ html|safe }}</div><a class="secondary-button" href="docs">← All documentation</a></article>
 </div>
-<script>if(window.matchMedia("(max-width:700px)").matches){document.querySelectorAll(".docs-sidebar details,.docs-outline details").forEach(function(details){details.open=false;});}</script>
+<script>
+const releaseSelect=document.getElementById("release-version");
+if(releaseSelect){
+releaseSelect.addEventListener("change",function(){releaseSelect.form.requestSubmit();});
+// History restoration can replay the choice that navigated away from these notes.
+window.addEventListener("pageshow",function(){setTimeout(function(){releaseSelect.form.reset();},0);});
+}
+if(window.matchMedia("(max-width:700px)").matches){document.querySelectorAll(".docs-sidebar details,.docs-outline details").forEach(function(details){details.open=false;});}
+</script>
 {% endblock %}

@@ -57,6 +57,7 @@ Logs and originals are kept under `target/dashboard-core-mutations-*`.
 | Light/dark selection persists; system mode follows OS changes; palettes differ | Browser `themes` |
 | Navigation remains visible with usable targets and no page overflow at 320, 390 and 768 px | Browser `responsive` |
 | Bundled guide HTML/Markdown/JSON, search, release selection, mount prefixes, traversal refusal | `tests/suite/documentation.rs`; browser `documentation` uses the real authenticated server |
+| Changing a release loads its notes without a button, keeps links/history/reload consistent and works with manual submission without JavaScript | Browser `documentation` |
 
 ## Prove the guards detect faults
 
@@ -76,6 +77,8 @@ only if the response was changed and the intended behavioral case failed.
 | Disable automatic usage refresh | `live-usage` |
 | Stop saving the selected theme | `themes` |
 | Capture browser navigation shortcuts in the tab controller | `tabs` |
+| Disable automatic release submission | `documentation` |
+| Restore a stale release selection on browser history navigation | `documentation` |
 | Capture usage only on session-end | Native-hook event/harness integration test |
 | Count Codex cache as fresh input | Codex transcript parser regression |
 | Overwrite a response with lower replayed counters | Response/session consistency regression |
