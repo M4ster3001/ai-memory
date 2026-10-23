@@ -34,6 +34,8 @@ const mutations = {
   'enable-send-for-empty-project-after-request': {test: 'delivery', from: 'sending=false;updateSendButton();result.focus()', to: 'sending=false;button.disabled=false;result.focus()'},
   'disable-release-auto-submit': {test: 'documentation', from: 'releaseSelect.form.requestSubmit();', to: 'void releaseSelect;'},
   'restore-stale-release-on-history': {test: 'documentation', from: 'releaseSelect.form.reset();', to: 'void releaseSelect;'},
+  'show-false-inbox-alert': {test: 'mailbox-context', from: 'data-nav="inbox"><span aria-hidden="true">✉</span>Inbox</a>', to: 'data-nav="inbox"><span aria-hidden="true">✉</span>Inbox <small>NEW MESSAGE</small></a>'},
+  'ignore-mailbox-workspace': {test: 'mailbox-context', from: 'url.searchParams.set("workspace",o.dataset.workspace);', to: 'url.searchParams.set("workspace","team");'},
 };
 assert(!mutation || mutations[mutation], 'Unknown mutation');
 const report = {mutation: mutation || null, mutationApplied: 0, cases: []};
@@ -324,6 +326,43 @@ async function main() {
         await selectedRelease('3.2.0');
       } finally {await cdp.send('Emulation.setScriptExecutionDisabled', {value: false});}
       const missing = await fetch(base + '/web/docs/.env.md', {headers: {Authorization: 'Bearer ' + token}});assert.equal(missing.status, 404);
+    },
+    async 'mailbox-context'() {
+      await cdp.goto(base + '/web/inbox?workspace=team&project=empty', '#mail-project');
+      assert.equal(await cdp.evaluate('document.querySelector("[data-nav=inbox]").textContent.includes("NEW MESSAGE")'), false, 'Navigation must not show a fabricated new-message alert');
+      assert.equal(await cdp.evaluate('document.querySelectorAll(".mailbox-link").length'), 0);
+      assert(await cdp.evaluate('document.querySelector(".mail-overview").textContent.includes("No messages waiting")'));
+      const ids = [];
+      for (const [workspace, agent] of [['team','codex'], ['other','gemini-cli'], ['other','gemini-cli']]) {
+        const sent = await request('/web/messages', {from_workspace:'team',from_project:'other',to_workspace:workspace,to_project:'app',to_agent:agent,subject:'Mailbox context fixture',body:'Synthetic context check.'});
+        ids.push((await sent.json()).message_id);
+      }
+      await cdp.reload();
+      const cards = await cdp.evaluate(`Array.from(document.querySelectorAll('.mailbox-link')).map(a=>({workspace:a.dataset.mailboxWorkspace,project:a.dataset.mailboxProject,href:a.href,text:a.textContent}))`);
+      assert.equal(cards.length, 2);
+      for (const [workspace, count] of [['team',1], ['other',2]]) {
+        const card = cards.find(c => c.workspace === workspace && c.project === 'app');assert(card);
+        assert(card.text.includes(count + ' queued'));assert.equal(new URL(card.href).searchParams.get('workspace'), workspace);assert.equal(new URL(card.href).searchParams.get('project'), 'app');
+      }
+      assert(await cdp.evaluate('document.querySelector(".mail-overview").textContent.includes("3 queued")'));
+      assert.equal(await cdp.evaluate('document.querySelector(".page-heading strong").textContent'), 'team / empty');
+      await changeScope('mail-project', 'other', 'app');
+      await until(() => cdp.evaluate(`new URL(location.href).searchParams.get('workspace')==='other'&&document.querySelector('.page-heading strong')?.textContent==='other / app'&&document.querySelectorAll('.mail-row[data-state=pending]').length===2`), 'Mailbox selector must include workspace and project');
+      assert(await cdp.evaluate(`Array.from(document.querySelectorAll('.mail-preview small')).every(e=>e.textContent.includes('Gemini CLI'))`));
+      await cdp.evaluate('document.getElementById("compose-shortcut").click()');
+      assert.equal(new URL(await cdp.evaluate('location.href')).searchParams.get('workspace'), 'other');
+      await cdp.evaluate(`document.querySelector('[data-mailbox-workspace="team"][data-mailbox-project="app"]').click()`);
+      await until(() => cdp.evaluate(`document.querySelector('.page-heading strong')?.textContent==='team / app'&&document.querySelectorAll('.mail-row[data-state=pending]').length===1`), 'Queue link must open the named project');
+      for (const width of [320,390,768]) {
+        await cdp.send('Emulation.setDeviceMetricsOverride', {width,height:960,deviceScaleFactor:1,mobile:width<640});
+        assert(await cdp.evaluate(`document.documentElement.scrollWidth<=innerWidth&&Array.from(document.querySelectorAll('.mailbox-link')).every(a=>{const r=a.getBoundingClientRect();return r.left>=0&&r.right<=innerWidth&&r.height>=44;})`), 'Mailbox links overflow or are too small');
+      }
+      await cdp.goto(base + '/web/inbox', '#mail-project');
+      assert.equal(await cdp.evaluate('document.getElementById("mail-project").selectedOptions[0].dataset.project'), 'app', 'Default should prefer a project with queued mail');
+      const claimed = spawnSync(binary, ['message','pop','--workspace','other','--project','app','--agent','gemini-cli','--id',ids[1],'--json'], {env:{...env,AI_MEMORY_SERVER_URL:base,AI_MEMORY_DATA_DIR:path.join(artifacts,'client')},encoding:'utf8',timeout:15000});
+      assert.equal(claimed.status, 0);assert.equal(JSON.parse(claimed.stdout).message.id, ids[1], 'Reading must leave the queued message available to its agent');
+      await cdp.reload();
+      assert(await cdp.evaluate(`document.querySelector('.mail-overview').textContent.includes('2 queued')&&document.querySelector('[data-mailbox-workspace="other"]').textContent.includes('1 queued')`), 'Collected messages must leave the queued counts');
     },
     async responsive() {
       await cdp.goto(project, '#project-panel-overview');

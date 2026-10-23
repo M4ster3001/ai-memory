@@ -75,6 +75,7 @@ version in [`docs/changelog/`](docs/changelog/):
 
 
 ### Fixed
+- Replaced the static Inbox notification label with real queued-message counts by workspace and project, direct mailbox links, and explicit current-project context (#721).
 - Updated changelog content immediately when a release was selected, keeping the URL, outline and Markdown reference in sync while preserving manual submission without JavaScript (#721).
 - Sanitized token model labels before truncation so the size limit cannot expose a prefix of private text; added real-browser and mutation regression gates for the dashboard (#722).
 - Replaced project anchor navigation with accessible tabs that show one section at a time, preserve selection in shared URLs and browser history, and wrap on mobile (#721).

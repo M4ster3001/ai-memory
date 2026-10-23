@@ -16,6 +16,8 @@ npx --yes playwright@1.63.0 install --with-deps --only-shell chromium
 node tests/e2e/web_dashboard_browser.mjs
 node tests/e2e/web_dashboard_mutations.mjs
 python3 scripts/check-dashboard-core-mutations.py
+# Focused mailbox isolation probe (the CI gate runs every case).
+python3 scripts/check-dashboard-core-mutations.py --case expose-restricted-mailbox-projects
 ```
 
 Use `AI_MEMORY_BIN` for another built executable and `AI_MEMORY_BROWSER` for an
@@ -46,6 +48,7 @@ Logs and originals are kept under `target/dashboard-core-mutations-*`.
 | --- | --- |
 | Only the selected tab is visible/accessibility-exposed; keyboard, history, reload and old section links work | `web_dashboard_browser.mjs`: `tabs`; Rust `operations_project_tabs_have_one_default_panel_and_matching_controls` |
 | Recipient filtering includes workspace and project, clears stale selection, disables empty projects and recovers | Browser `recipients`; Rust `operations_inbox_filters_initial_agents_by_both_project_coordinates` |
+| Inbox queue counts name each workspace/project, links and selectors open the matching mailbox, empty states do not claim new mail, reading leaves messages queued, collection reduces counts | Browser `mailbox-context`; Rust `operations_inbox_queue_context_hides_foreign_projects_and_preserves_mail` also refuses foreign/partial scopes and hides restricted project names with legitimate read/root controls |
 | Legacy browser reads cannot send; invalid tokens are refused and cleared; authorized sends reach the chosen harness once | Browser `delivery`, against real HTTP auth and native CLI claims; Rust `operations_message_write_obeys_root_user_and_project_grants`, `operations_message_requires_write_access_to_both_project_coordinates`, store `addressed_messages_are_claimed_once_only_by_the_selected_harness` |
 | Sanitization, admission rejection, foreign origin and unknown recipients | Rust `operations_browser_messages_use_the_configured_sanitizer_and_admission`, `operations_browser_send_refuses_cross_origin_unknown_recipient_and_empty_body`; browser `delivery` checks escaped message text |
 | Usage reaches the server before session-end, repeated reports do not add calls, refresh preserves active tab/filter/focus | Browser `live-usage`; hooks `live_token_calls_update_open_sessions_without_an_end_event` |
@@ -79,6 +82,9 @@ only if the response was changed and the intended behavioral case failed.
 | Capture browser navigation shortcuts in the tab controller | `tabs` |
 | Disable automatic release submission | `documentation` |
 | Restore a stale release selection on browser history navigation | `documentation` |
+| Show a fabricated new-message alert with no queued mail | `mailbox-context` |
+| Ignore the workspace when selecting a mailbox | `mailbox-context` |
+| Expose restricted projects in the mailbox overview | Mailbox context isolation regression |
 | Capture usage only on session-end | Native-hook event/harness integration test |
 | Count Codex cache as fresh input | Codex transcript parser regression |
 | Overwrite a response with lower replayed counters | Response/session consistency regression |

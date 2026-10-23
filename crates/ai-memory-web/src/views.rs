@@ -20,6 +20,8 @@ pub(crate) struct ScopeOption {
     pub workspace: String,
     pub project: String,
     pub selected: bool,
+    pub pending: u64,
+    pub inbox_href: String,
 }
 
 pub(crate) struct RecipientOption {
@@ -49,6 +51,8 @@ pub(crate) struct InboxView {
     pub project: String,
     pub project_href: String,
     pub scopes: Vec<ScopeOption>,
+    pub pending_total: u64,
+    pub pending_projects: usize,
     pub recipients: Vec<RecipientOption>,
     pub rows: Vec<MessageRow>,
     pub inbox: bool,

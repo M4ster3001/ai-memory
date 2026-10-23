@@ -88,7 +88,12 @@ destinations off-screen.
 as Codex or Claude Code. **Prerequisite:** the recipient must have a captured
 session in that project to appear in the browser selector.
 
-Open **Inbox** and choose **From project**. **To project** defaults to the same
+Open **Inbox** to see queued counts by workspace and project, with a direct link
+to each mailbox. With no project in the URL, a mailbox with waiting messages is
+selected first. The heading identifies the open mailbox; opening it does not
+collect messages. The sidebar label is navigation, not a new-message alert.
+
+To compose, choose **From project**. **To project** defaults to the same
 project; change it explicitly to send across projects. **To agent** lists only
 harnesses registered in that destination, and changing either project clears
 the chosen agent. Projects without captured sessions show an empty state and

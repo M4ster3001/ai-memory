@@ -46,14 +46,24 @@ pub(crate) async fn handler(
     Query(query): Query<InboxQuery>,
 ) -> Response {
     let viewer = viewer.map(|v| v.0.user());
-    let projects = match state.reader.list_projects_with_stats(viewer).await {
-        Ok(p) => p,
+    let (projects, counts, directory) = match tokio::try_join!(
+        state.reader.list_projects_with_stats(viewer),
+        state.reader.pending_inbox_counts(viewer),
+        state.reader.registered_agents(viewer),
+    ) {
+        Ok(data) => data,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
+    let pending: HashMap<_, _> = counts
+        .into_iter()
+        .map(|c| ((c.workspace_name, c.project_name), c.pending))
+        .collect();
     let requested = match (query.workspace, query.project) {
         (Some(w), Some(p)) => (w, p),
         (None, None) => projects
-            .first()
+            .iter()
+            .find(|p| pending.contains_key(&(p.workspace_name.clone(), p.project_name.clone())))
+            .or_else(|| projects.first())
             .map(|p| (p.workspace_name.clone(), p.project_name.clone()))
             .unwrap_or_default(),
         _ => {
@@ -78,10 +88,6 @@ pub(crate) async fn handler(
             Ok(s) => Some(s),
             Err(e) => return super::page::refusal_response(&e),
         }
-    };
-    let directory = match state.reader.registered_agents(viewer).await {
-        Ok(d) => d,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
     let recipients = directory
         .into_iter()
@@ -163,15 +169,25 @@ pub(crate) async fn handler(
             }
         })
         .collect();
+    let scopes: Vec<_> = projects
+        .into_iter()
+        .map(|p| ScopeOption {
+            pending: pending
+                .get(&(p.workspace_name.clone(), p.project_name.clone()))
+                .copied()
+                .unwrap_or(0),
+            inbox_href: mailbox_href(&p.workspace_name, &p.project_name, false, 0),
+            selected: p.workspace_name == workspace && p.project_name == project,
+            workspace: p.workspace_name,
+            project: p.project_name,
+        })
+        .collect();
     let view = InboxView {
-        scopes: projects
-            .into_iter()
-            .map(|p| ScopeOption {
-                selected: p.workspace_name == workspace && p.project_name == project,
-                workspace: p.workspace_name,
-                project: p.project_name,
-            })
-            .collect(),
+        pending_total: scopes
+            .iter()
+            .fold(0_u64, |total, s| total.saturating_add(s.pending)),
+        pending_projects: scopes.iter().filter(|s| s.pending > 0).count(),
+        scopes,
         inbox_href: mailbox_href(&workspace, &project, false, 0),
         outbox_href: mailbox_href(&workspace, &project, true, 0),
         previous: if query.offset > 0 {

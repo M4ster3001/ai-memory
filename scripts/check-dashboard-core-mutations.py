@@ -5,6 +5,7 @@ Run alone, with no concurrent builds. This touches only clean tracked source
 files, backs up their exact bytes, and never writes production data. A compiler
 error, a failed baseline or a timeout does not count as a killed mutation.
 """
+import argparse
 import json
 import os
 from pathlib import Path
@@ -19,6 +20,12 @@ LOCK = TARGET / "dashboard-core-mutations.lock"
 REPORT = {"mutants": [], "complete": False}
 
 CASES = [
+    {
+        "name": "expose-restricted-mailbox-projects", "file": "crates/ai-memory-web/src/routes/inbox.rs",
+        "start": "pub(crate) async fn handler(", "end": "#[derive(Deserialize)]",
+        "before": "list_projects_with_stats(viewer)", "after": "list_projects_with_stats(None)",
+        "command": ["cargo", "test", "-p", "ai-memory-web", "--lib", "operations_inbox_queue_context_hides_foreign_projects_and_preserves_mail"],
+    },
     {
         "name": "capture-only-at-session-end", "file": "crates/ai-memory-cli/src/commands/hook.rs",
         "start": 'if matches!(\n        args.event.as_str(),',
@@ -45,6 +52,12 @@ CASES = [
         "command": ["cargo", "test", "-p", "ai-memory-store", "--lib", "addressed_messages_are_claimed_once_only_by_the_selected_harness"],
     },
 ]
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--case", choices=[case["name"] for case in CASES])
+selected = parser.parse_args().case
+if selected:
+    CASES = [case for case in CASES if case["name"] == selected]
 
 
 def run(case, label):

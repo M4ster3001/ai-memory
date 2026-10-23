@@ -968,7 +968,10 @@ snapshot until the page is refreshed.
 ### Coordinate work from the browser
 
 **Inbox** lists received and sent messages for a selected project, fifty per
-page, without claiming them. Expand a row to read its plain text. **New message**
+page, without claiming them. **Waiting for agents** shows real queued counts
+and mailbox links for each workspace/project you can access. The default opens
+a project with queued messages, and the heading names the current mailbox.
+Expand a row to read its plain text. **New message**
 selects a source project and a recipient harness from the agents that already
 have sessions in visible projects. Sending requires write access to both
 projects and passes the configured sanitizer and message admission policy.
