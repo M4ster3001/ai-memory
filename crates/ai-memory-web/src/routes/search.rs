@@ -192,7 +192,12 @@ pub(crate) async fn handler(
                 for (position, (hit, details)) in result.hits.into_iter().take(limit).enumerate() {
                     let path = hit.path.as_str().to_owned();
                     hits.push(SearchHit {
-                        href: page_href(workspace, project, &path),
+                        href: context_href(
+                            &page_href(workspace, project, &path),
+                            &params,
+                            false,
+                            limit,
+                        ),
                         workspace: workspace.clone(),
                         project: project.clone(),
                         path,
@@ -231,7 +236,12 @@ pub(crate) async fn handler(
             for h in raw.into_iter().take(limit) {
                 let path = h.path.as_str().to_owned();
                 hits.push(SearchHit {
-                    href: page_href(&h.workspace_name, &h.project_name, &path),
+                    href: context_href(
+                        &page_href(&h.workspace_name, &h.project_name, &path),
+                        &params,
+                        true,
+                        limit,
+                    ),
                     workspace: h.workspace_name,
                     project: h.project_name,
                     path,
@@ -362,7 +372,7 @@ fn fmt_rrf(value: f64) -> String {
 }
 
 /// One hit's trace rows, in the stream order `streams_active` uses.
-fn hit_trace(position: usize, rank: f64, d: &SearchExplain) -> HitTrace {
+pub(crate) fn hit_trace(position: usize, rank: f64, d: &SearchExplain) -> HitTrace {
     let mut streams = vec![
         StreamTraceRow {
             stream: "fts",
@@ -438,4 +448,21 @@ fn timing_rows(t: &StreamTimings) -> Vec<TimingRow> {
         })
     })
     .collect()
+}
+
+fn context_href(base: &str, params: &SearchParams, global: bool, limit: usize) -> String {
+    let mut href = format!(
+        "{base}?recall_q={}&recall_limit={limit}&recall_global={}",
+        encode_segment(params.q.trim()),
+        if global { "1" } else { "0" }
+    );
+    for (key, value) in [
+        ("recall_kind", params.kind.as_deref()),
+        ("recall_tier", params.tier.as_deref()),
+    ] {
+        if let Some(value) = non_empty(value) {
+            href.push_str(&format!("&{key}={}", encode_segment(value)));
+        }
+    }
+    href
 }

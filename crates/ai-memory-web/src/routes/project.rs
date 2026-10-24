@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use askama::Template;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
 
@@ -49,6 +49,7 @@ pub(crate) async fn handler(
     viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
     actor: Option<axum::Extension<ai_memory_core::ActorContext>>,
     Path((workspace, project)): Path<(String, String)>,
+    Query(query): Query<crate::operations::UsageQuery>,
 ) -> Response {
     let viewer_id = viewer.as_ref().map(|axum::Extension(viewer)| viewer.user());
     let authorized = match super::authorize_read(&state, viewer, &workspace, &project).await {
@@ -56,9 +57,11 @@ pub(crate) async fn handler(
         Err(refusal) => return super::page::refusal_response(&refusal),
     };
     let owner = super::api::owner_filter_for(actor);
-    render(&state, workspace, project, viewer_id, authorized, owner)
-        .await
-        .into_response()
+    render(
+        &state, workspace, project, viewer_id, authorized, owner, query,
+    )
+    .await
+    .into_response()
 }
 
 async fn render(
@@ -68,7 +71,9 @@ async fn render(
     viewer: Option<ai_memory_core::UserId>,
     authorized: Option<ResolvedScope>,
     owner: ai_memory_core::OwnerFilter,
+    query: crate::operations::UsageQuery,
 ) -> Result<Html<String>, StatusCode> {
+    let calls_query = query.store_query()?;
     let (pages, (mailbox, mailbox_total), sessions) = tokio::try_join!(
         async {
             state
@@ -242,12 +247,24 @@ async fn render(
     let report = match &scope {
         Some(scope) => state
             .reader
-            .token_usage_report(scope.workspace_id, scope.project_id, owner.clone())
+            .token_usage_report_page(
+                scope.workspace_id,
+                scope.project_id,
+                owner.clone(),
+                None,
+                calls_query,
+            )
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
         None => ai_memory_store::TokenUsageReport::default(),
     };
-    let token_usage = crate::operations::usage_panel(report, &workspace, &project);
+    let token_usage = crate::operations::usage_panel(
+        report,
+        &workspace,
+        &project,
+        &query,
+        &format!("{}?tab=tokens", project_href(&workspace, &project)),
+    );
     let agents = match &scope {
         Some(scope) => state
             .reader

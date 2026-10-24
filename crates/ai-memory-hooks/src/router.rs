@@ -4828,20 +4828,47 @@ async fn process_authorized(
             .filter_map(|value| {
                 let mut call: ai_memory_core::TokenCall =
                     serde_json::from_value(value.clone()).ok()?;
-                if call.call_id.is_empty()
-                    || call.call_id.len() > 128
-                    || !call.call_id.bytes().all(|b| {
-                        b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b':' | b'.')
-                    })
-                    || state.sanitizer.scrub(&call.call_id) != call.call_id
-                {
+                let safe_id = |id: &str| {
+                    !id.is_empty()
+                        && id.len() <= 128
+                        && id.bytes().all(|b| {
+                            b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b':' | b'.')
+                        })
+                        && state.sanitizer.scrub(id) == id
+                };
+                if !safe_id(&call.call_id) {
                     return None;
                 }
                 call.model = call.model.map(|m| {
                     state
                         .sanitizer
-                        .scrub(&m.trim().chars().take(64).collect::<String>())
+                        .scrub(m.trim())
+                        .chars()
+                        .take(64)
+                        .collect::<String>()
                 });
+                if let Some(context) = call.context.as_mut() {
+                    context.turn_id = context.turn_id.take().filter(|id| safe_id(id));
+                    context.response_id = context.response_id.take().filter(|id| safe_id(id));
+                    context.recorded_at = context
+                        .recorded_at
+                        .take()
+                        .and_then(|s| s.parse::<jiff::Timestamp>().ok())
+                        .map(|t| t.to_string());
+                    context.tools.truncate(16);
+                    context.tools.retain_mut(|tool| {
+                        if !safe_id(&tool.id) {
+                            return false;
+                        }
+                        tool.name = state
+                            .sanitizer
+                            .scrub(tool.name.trim())
+                            .chars()
+                            .take(64)
+                            .collect();
+                        !tool.name.is_empty()
+                    });
+                }
                 Some(call)
             })
             .collect();
@@ -23556,6 +23583,92 @@ pub(crate) mod tests {
         assert!(is_acknowledgment("谢谢"));
         assert!(!is_acknowledgment("fix the bug in main.rs"));
         assert!(!is_acknowledgment("what is the return type?"));
+    }
+
+    #[tokio::test]
+    async fn live_token_calls_scrub_private_labels_before_truncating() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.sanitizer = Sanitizer::new(&SanitizeConfig {
+            extra_patterns: vec!["SENSITIVE_FIXTURE".into()],
+            allowlist: Vec::new(),
+        })
+        .unwrap();
+        let call = |id: &str, model: String, input: u64| {
+            serde_json::json!({
+                "call_id":id,"model":model,"input_tokens":input,"output_tokens":10,"cache_read_tokens":0,"cache_write_tokens":0,
+                "context":{"turn_id":"SENSITIVE_FIXTURE","response_id":"invalid id","recorded_at":"invalid timestamp","tools":[
+                    {"id":"SENSITIVE_FIXTURE","name":"private","relation":"turn"},
+                    {"id":"tool-safe","name":format!("{}SENSITIVE_FIXTURE","t".repeat(60)),"relation":"requested","is_error":true}
+                ]}
+            })
+        };
+        let envelope = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "user-prompt".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({"session_id":"private-usage-label","prompt":"fixture","_ai_memory_usage_calls":[
+                call("clean-model",format!("{}SENSITIVE_FIXTURE","m".repeat(60)),100),
+                call("SENSITIVE_FIXTURE","fixture-public".into(),900),
+                call("invalid id","fixture-public".into(),900),
+                call("public-response","fixture-public".into(),200)
+            ]}),
+        );
+        process(&state, envelope, None, Vec::new()).await.unwrap();
+        let report = state
+            .reader
+            .token_usage_report(
+                state.workspace_id,
+                state.project_id,
+                ai_memory_core::OwnerFilter::Any,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            (report.call_count, report.input),
+            (2, 300),
+            "Private and malformed response ids must be refused"
+        );
+        let bounded = report
+            .calls
+            .iter()
+            .find(|c| c.call_id == "clean-model")
+            .unwrap();
+        assert!(bounded.model.starts_with(&"m".repeat(60)));
+        assert!(bounded.model.chars().count() <= 64);
+        assert!(
+            !bounded.model.contains("SENS"),
+            "Truncation must not expose a prefix of a private label"
+        );
+        let public = report
+            .calls
+            .iter()
+            .find(|c| c.call_id == "public-response")
+            .unwrap();
+        assert_eq!(
+            public.model, "fixture-public",
+            "Public labels remain readable"
+        );
+        assert!(
+            public.turn_id.is_none()
+                && public.response_id.is_none()
+                && public.response_at.is_none()
+        );
+        assert_eq!(
+            public.tools.len(),
+            1,
+            "Private tool identities must be refused"
+        );
+        assert_eq!(public.tools[0].id, "tool-safe");
+        assert_eq!(public.tools[0].is_error, Some(true));
+        assert!(public.tools[0].name.starts_with(&"t".repeat(60)));
+        assert!(
+            !public.tools[0].name.contains("SENS"),
+            "Scrub the complete label before bounding it"
+        );
+        assert!(public.tools[0].name.chars().count() <= 64);
     }
 
     #[tokio::test]

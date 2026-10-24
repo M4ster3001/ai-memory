@@ -16,6 +16,27 @@
 
 ## 2. Auth model
 
+The built-in web navigation also reads `GET /web/inbox/notifications` (replace
+`/web` with the configured mount). It returns `pending`, `project_count` and up
+to five `projects`, each with `workspace`, `project` and `pending`, filtered by
+the viewer's repository access. The response is protected and non-consuming,
+uses `Cache-Control: no-store`, and contains no message body or subject.
+Notification links open `/web/inbox?workspace=...&project=...&state=pending`.
+The optional `state` filter (`pending`, `claimed`, `cancelled`, or empty for
+all) is applied before history pagination, and unknown states are refused.
+Received mail defaults to `pending` when `state` is omitted, and an empty
+`state=` shows all history. Sent mail defaults to all states.
+
+Project and session HTML views accept `calls_q` (a literal model, harness or
+response substring, at most 256 characters), `calls_sort=tokens|recent`,
+`calls_signal=all|signals` and `calls_offset`. The database applies scope and
+ownership, search, signal filtering and ordering before it selects the
+fifty-response page. Totals and signal averages still cover all authorized
+responses in that scope. These HTML query parameters are separate from
+observation pagination, and they add no write capability or new `/api/v1`
+endpoint. Project and session usage refresh every ten seconds while visible,
+and the search controls and focus stay in place.
+
 `/api/v1/*` and `/admin/*` are dual-auth surfaces:
 
 - Human operators authenticate with `POST /auth/login`. The engine returns an
@@ -581,7 +602,12 @@ row is anchored in the project OR at least one of its observations landed
 there, so a session that changed repositories mid-flight shows up in both.
 `observation_count` counts only this project's rows. `limit` clamped
 `1..=100`, default `20`; `offset` default `0`; `include_open` default
-`false` (only sessions with `ended_at` set). Owner-filtered like handoffs: a
+`false` (only effectively ended sessions). Substantive observations in the
+requested project after the persisted end make the read view open the session
+again: `ended_at` is `null`, and `include_open=false` excludes it.
+Lifecycle-only observations do not reopen it. The stored end stays the writer's
+finalization watermark, and this read changes neither history nor handoff
+admission. Owner-filtered like handoffs: a
 caller the server can name sees their own sessions plus unattributed ones;
 an unnamed caller sees unattributed ones only. Never cached (`no-store`).
 
