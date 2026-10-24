@@ -382,6 +382,7 @@ pub(crate) struct Folder {
 #[derive(Template)]
 #[template(path = "project.html")]
 pub(crate) struct ProjectView {
+    pub token_usage: TokenUsagePanel,
     /// Workspace name.
     pub workspace: String,
     /// Project name.
@@ -1165,6 +1166,29 @@ pub(crate) struct ChangePasswordView {
     /// Sanitised post-change redirect target (absolute path under the wiki root).
     pub next: String,
 }
+/// Metadata-only operational view of measured responses.
+pub(crate) struct TokenUsagePanel {
+    pub count: u64,
+    pub input: String,
+    pub output: String,
+    pub cache_write: String,
+    pub cache_read: String,
+    pub hit_rate: String,
+    pub rows: Vec<TokenUsageRow>,
+}
+pub(crate) struct TokenUsageRow {
+    pub href: String,
+    pub id: String,
+    pub model: String,
+    pub agent: String,
+    pub input: String,
+    pub output: String,
+    pub cache: String,
+    pub total: String,
+    pub when: String,
+    pub signal: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

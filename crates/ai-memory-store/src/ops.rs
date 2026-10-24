@@ -2851,6 +2851,59 @@ pub fn upsert_session_usage(conn: &Connection, usage: &NewSessionUsage) -> Store
     Ok(())
 }
 
+/// Persist one bounded batch and its derived session totals in one transaction.
+pub fn upsert_token_calls(
+    conn: &mut Connection,
+    session_id: SessionId,
+    calls: &[ai_memory_core::TokenCall],
+) -> StoreResult<()> {
+    let tx = conn.transaction()?;
+    let now = Timestamp::now().as_microsecond();
+    for call in calls.iter().take(256) {
+        tx.execute(
+            "INSERT INTO token_calls \
+                 (session_id, call_id, model, input_tokens, output_tokens, \
+                  cache_write_tokens, cache_read_tokens, observed_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+             ON CONFLICT(session_id, call_id) DO UPDATE SET \
+                 model = COALESCE(excluded.model, model), \
+                 input_tokens = MAX(input_tokens, excluded.input_tokens), \
+                 output_tokens = MAX(output_tokens, excluded.output_tokens), \
+                 cache_write_tokens = MAX(cache_write_tokens, excluded.cache_write_tokens), \
+                 cache_read_tokens = MAX(cache_read_tokens, excluded.cache_read_tokens)",
+            params![
+                session_id.as_bytes(),
+                call.call_id,
+                call.model,
+                call.input_tokens.min(1_000_000_000) as i64,
+                call.output_tokens.min(1_000_000_000) as i64,
+                call.cache_write_tokens.min(1_000_000_000) as i64,
+                call.cache_read_tokens.min(1_000_000_000) as i64,
+                now,
+            ],
+        )?;
+    }
+    let usage = tx.query_row(
+        "SELECT SUM(input_tokens), SUM(output_tokens), \
+                SUM(cache_write_tokens), SUM(cache_read_tokens) \
+         FROM token_calls WHERE session_id = ?1",
+        params![session_id.as_bytes()],
+        |r| {
+            Ok(NewSessionUsage {
+                session_id,
+                input_tokens: r.get::<_, Option<u64>>(0)?.unwrap_or(0),
+                output_tokens: r.get::<_, Option<u64>>(1)?.unwrap_or(0),
+                cache_write_tokens: r.get::<_, Option<u64>>(2)?.unwrap_or(0),
+                cache_read_tokens: r.get::<_, Option<u64>>(3)?.unwrap_or(0),
+                model: calls.iter().take(256).find_map(|c| c.model.clone()),
+            })
+        },
+    )?;
+    upsert_session_usage(&tx, &usage)?;
+    tx.commit()?;
+    Ok(())
+}
+
 /// A candidate correction for one session's `started_at`/`ended_at`, as
 /// computed by the CLI from the operator's local transcripts and posted to
 /// `POST /admin/repair-session-times` (`ai-memory repair-backfill-timestamps`).
@@ -8842,6 +8895,47 @@ pub(crate) mod tests {
             rename_workspace(&mut conn, &ws, "   ").unwrap_err(),
             StoreError::InvalidWorkspaceName(_)
         ));
+    }
+
+    #[test]
+    fn token_calls_are_atomic_idempotent_and_follow_session_deletion() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let sid = SessionId::new();
+        begin_session(&mut conn, &hook_session(sid, ws, proj, None)).unwrap();
+        let mut call = ai_memory_core::TokenCall {
+            call_id: "response-1".into(),
+            input_tokens: 100,
+            output_tokens: 10,
+            cache_read_tokens: 20,
+            cache_write_tokens: 0,
+            model: Some("test-model".into()),
+        };
+        upsert_token_calls(&mut conn, sid, &[call.clone(), call.clone()]).unwrap();
+        call.output_tokens = 30;
+        upsert_token_calls(&mut conn, sid, &[call.clone()]).unwrap();
+        call.output_tokens = 5;
+        upsert_token_calls(&mut conn, sid, &[call.clone()]).unwrap();
+        let totals:(u64,u64,u64)=conn.query_row("SELECT input_tokens,output_tokens,(SELECT COUNT(*) FROM token_calls) FROM session_usage WHERE session_id=?1",params![sid.as_bytes()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+        assert_eq!(totals, (100, 30, 1));
+        assert!(upsert_token_calls(&mut conn, SessionId::new(), &[call]).is_err());
+        let rows: u64 = conn
+            .query_row("SELECT COUNT(*) FROM token_calls", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 1);
+        purge_session(
+            &mut conn,
+            ws,
+            proj,
+            sid,
+            None,
+            Compaction::Skip,
+            PurgeMode::Commit,
+        )
+        .unwrap();
+        let rows: u64 = conn
+            .query_row("SELECT COUNT(*) FROM token_calls", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
     }
 
     fn fresh_db() -> (

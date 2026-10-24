@@ -227,3 +227,20 @@ mod tests {
         );
     }
 }
+
+/// Content-free usage of one model response, keyed by its native identity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenCall {
+    /// Stable response identity; retries update the same row.
+    pub call_id: String,
+    /// Fresh input tokens (cached input excluded).
+    pub input_tokens: u64,
+    /// Output tokens, including reasoning when reported within output.
+    pub output_tokens: u64,
+    /// Input tokens written to cache.
+    pub cache_write_tokens: u64,
+    /// Input tokens read from cache.
+    pub cache_read_tokens: u64,
+    /// Reported model, if available.
+    pub model: Option<String>,
+}
