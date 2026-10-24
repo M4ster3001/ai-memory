@@ -317,8 +317,12 @@ body as escaped plain text when you expand the row. Reading never claims or
 cancels a message. "Collected" means an agent won the claim. It does not mean
 the agent finished the request.
 
-The composer picks a source project and a recipient harness from existing
-sessions in visible projects. Neither coordinate is created if it is missing.
+The composer sets To project to the From project by default, and To agent lists
+only harnesses with captured sessions in the destination workspace and project.
+Changing the source resets the destination to that project, so pick another To
+project explicitly to send across projects. Changing either project clears the
+selected agent. A project without registered agents disables sending and
+explains how to register one. Neither coordinate is created if it is missing.
 The sender needs write access to both projects. The configured sanitizer, the
 `message_send` admission webhooks, the audit and the bounded writer queue all
 apply before a send succeeds. Cookie-authenticated browser writes use the

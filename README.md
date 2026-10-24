@@ -786,6 +786,11 @@ Written by users; not maintained here, so check them against the version you run
 - [Installing and configuring ai-memory on Linux](https://www.linuxpro.com.br/2026/09/ai-memory-instalar-configurar-agentes-linux/) (pt-BR, LinuxPro, covers v2.6.3)
 - [ai-memory from v2.4 to v2.6.3](https://www.linuxpro.com.br/2026/10/ai-memory-a-evolucao-da-2-4-a-2-6-3/) (pt-BR, LinuxPro)
 
+The built-in web UI also has Documentation at `/web/docs` and a Changelog at
+`/web/docs/changelog`. The [feature activation guide](docs/features.md) covers
+prerequisites and verification. Agents can read the same bundled guides through
+authenticated `/api/v1/docs` JSON or each guide's Markdown link.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).

@@ -90,7 +90,7 @@ pub(crate) async fn handler(
                 && r.project == project
                 && query.agent.as_deref() == Some(r.agent.as_str());
             RecipientOption {
-                label: format!("{} / {} · {}", r.workspace, r.project, agent_label(r.agent)),
+                label: agent_label(r.agent).into(),
                 workspace: r.workspace,
                 project: r.project,
                 agent: r.agent.as_str().into(),
@@ -194,7 +194,9 @@ pub(crate) async fn handler(
         } else {
             String::new()
         },
-        can_send: !recipients.is_empty(),
+        can_send: recipients
+            .iter()
+            .any(|r| r.workspace == workspace && r.project == project),
         needs_write_token: legacy.is_some(),
         project_href: project_href(&workspace, &project),
         workspace,

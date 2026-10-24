@@ -933,7 +933,7 @@ prose.
 
 ## Investigate token usage in the dashboard
 
-Open a project under `/web` to see Token usage. Updated native Claude Code and
+Open a project under `/web` and select the Token usage tab. Updated native Claude Code and
 Codex hooks send measured response usage on `post-tool-use`, `stop`,
 `pre-compact` and `session-end`. A session can stay open: usage is stored as it
 arrives, and the panel and the session totals refresh every ten seconds. To
@@ -968,12 +968,20 @@ Project cards show the recorded harnesses and can be filtered by name, open
 sessions or queued messages. An open session only means its end event has not
 arrived. It does not prove that an agent is online.
 
-Inside a project, agent cards add up reported usage across sessions and show how
-many sessions reported it. "Explore sessions" pages through one harness's
-sessions, and a session opens to its response ledger and captured event
-timeline. Missing usage stays unknown. Legacy session totals can exist without
-individual response records, so coverage and captured-call counts are shown
-separately.
+Project tabs show one section at a time. Overview summarizes capture and pending
+messages, Agents groups harnesses, Token usage investigates responses, Sessions
+lists recent sessions, and Knowledge browses saved pages. The selected tab is
+kept in the URL (`?tab=agents`, for example), so reload, shared links and
+browser back and forward keep the same section. Section bookmarks such as
+`#agents` still open the matching tab. The tab bar supports Left and Right,
+Home and End, and wraps on narrow screens. Inbox and Link graph open separate
+views.
+
+In Agents, agent cards add up reported usage across sessions and show how many
+sessions reported it. "Explore sessions" pages through one harness's sessions,
+and a session opens to its response ledger and captured event timeline. Missing
+usage stays unknown. Legacy session totals can exist without individual
+response records, so coverage and captured-call counts are shown separately.
 
 The response table can be searched by model, agent or response, filtered by
 investigation signal, and sorted by token usage or capture time. These controls
