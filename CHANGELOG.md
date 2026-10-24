@@ -54,6 +54,27 @@ version in [`docs/changelog/`](docs/changelog/):
   growing. It attaches no usage and starts no consolidation, because the
   server cannot read a client's transcript outside a live hook request (#NNN).
 
+- Added live, deduplicated response token accounting for Claude Code and Codex.
+  The native hooks now send measured response usage on `post-tool-use`, `stop`,
+  `pre-compact` and `session-end` instead of only at the end of a session, so
+  an open session's totals stay current. Each response is stored once by its
+  native identity in a new `token_calls` ledger (V90). A partial or replayed
+  delivery raises the stored counters column by column and never adds the same
+  response twice. Live extraction reads a bounded 4 MiB transcript tail and
+  reports at most 256 responses per event. Fresh input excludes cache reads, so
+  Codex, whose reports included cached input, is normalized once during the
+  upgrade. The project page has a Token usage panel listing the fifty largest
+  captured responses. It flags contexts of at least 100,000 tokens, outputs of
+  at least 20,000 tokens and responses above three times the project average.
+  Only counters, response identities and model names are kept, and project
+  authorization and session-owner filters apply before ranking or aggregation
+  (#NNN).
+
+- Added Light, Dark and System theme controls to the web UI. The choice is
+  stored in the browser and System follows the operating system. Tailwind's
+  dark variant now uses the `dark` class instead of the media query, so a
+  manual choice overrides the system setting (#NNN).
+
 ### Fixed
 
 - Updated tokio to 1.54.1 in the server, relay, importer and wikisync

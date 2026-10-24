@@ -239,7 +239,68 @@ async fn render(
 
     let mailbox_capped = mailbox_total > mailbox.len() as u64;
     let graph_href = crate::templates::graph_href(&workspace, &project);
+    let report = match &scope {
+        Some(scope) => state
+            .reader
+            .token_usage_report(scope.workspace_id, scope.project_id, owner.clone())
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+        None => ai_memory_store::TokenUsageReport::default(),
+    };
+    let input_total = report.input + report.cache_read + report.cache_write;
+    let mean = (input_total + report.output)
+        .checked_div(report.call_count)
+        .unwrap_or(0);
+    let token_usage = crate::templates::TokenUsagePanel {
+        count: report.call_count,
+        input: fmt_tokens(report.input),
+        output: fmt_tokens(report.output),
+        cache_read: fmt_tokens(report.cache_read),
+        cache_write: fmt_tokens(report.cache_write),
+        hit_rate: if input_total > 0 {
+            format!(
+                "{:.0}%",
+                report.cache_read as f64 / input_total as f64 * 100.0
+            )
+        } else {
+            "—".into()
+        },
+        rows: report
+            .calls
+            .into_iter()
+            .map(|c| {
+                let context = c.input + c.cache_read + c.cache_write;
+                let total = context + c.output;
+                let signal = if report.call_count >= 5 && total > mean.saturating_mul(3) {
+                    "Above 3× average"
+                } else if context >= 100_000 {
+                    "Large context"
+                } else if c.output >= 20_000 {
+                    "Long output"
+                } else {
+                    "—"
+                };
+                crate::templates::TokenUsageRow {
+                    href: session_href(&workspace, &project, &c.session_id),
+                    id: c.call_id,
+                    model: c.model,
+                    agent: c.agent,
+                    input: fmt_tokens(c.input),
+                    output: fmt_tokens(c.output),
+                    cache: format!(
+                        "{} read / {} write",
+                        fmt_tokens(c.cache_read),
+                        fmt_tokens(c.cache_write)
+                    ),
+                    total: fmt_tokens(total),
+                    when: humanize(&c.observed_at),
+                    signal: signal.into(),
+                }
+            })
+            .collect(),
+    };
     let html = ProjectView {
+        token_usage,
         workspace,
         project,
         stats,
