@@ -1064,6 +1064,19 @@ transaction complete finishes any interrupted wiki commit, durable provider
 enqueue, and ingest-key completion without adding a second handoff. Those
 incomplete effects remain at-least-once until the server marks the event
 complete.
+
+If the harness is terminated before it can send `SessionEnd` (including an API
+quota or 429 cutoff), the next session start does not need a synthetic close to
+recover context. The server picks the most recently active substantive open
+session in the same project and owner boundary and injects a read-only snapshot
+of its newest 64 sanitized observations, capped at 6,000 characters. It makes no
+rolling transcript copy, reads no observations from another project, and does
+not close the source session, which may still be a valid parallel agent. Recent
+prompts and bounded tool and lifecycle metadata are always available. The latest
+assistant status appears only when Claude Code assistant capture was enabled as
+described above. Use `finalize-session` later, once you know the abandoned
+source is no longer live.
+
 On Unix, the helper uses a trusted `setsid` launcher when available and falls
 back to a separate process group otherwise; Windows uses detached/breakaway
 process flags. The spool is capped, so a permanently undrained backlog is

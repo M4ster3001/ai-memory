@@ -106,6 +106,7 @@ pub mod search;
 pub mod serve;
 pub mod server;
 pub mod service_host;
+pub mod session_usage;
 pub mod setup;
 pub mod setup_agent;
 pub(crate) mod setup_web;

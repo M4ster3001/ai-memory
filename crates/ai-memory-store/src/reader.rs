@@ -8,6 +8,7 @@
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::Arc;
 
 use ai_memory_core::{
@@ -1396,6 +1397,24 @@ pub struct OpenSession {
     pub cwd: Option<String>,
 }
 
+/// Latest substantive open session that can seed a bounded startup recovery
+/// packet. Unlike a handoff, this is a read-only view: the source session stays
+/// open because it may still belong to a live parallel agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterruptedSessionCandidate {
+    /// Session whose persisted observations are the recovery source.
+    pub session_id: SessionId,
+    /// Harness that produced the source session.
+    pub agent_kind: AgentKind,
+    /// ISO-8601 timestamp of the most recent in-scope observation.
+    pub last_activity_at: String,
+    /// Captured session cwd, if available. Lets a client-side backfill
+    /// locate the source session's own transcript file (its native
+    /// harness's on-disk layout is typically keyed by cwd), separate from
+    /// scope resolution — untrusted display/lookup data, never identity.
+    pub cwd: Option<String>,
+}
+
 /// Public state and attempt count for the latest scoped consolidation job.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SessionConsolidationSummary {
@@ -1508,6 +1527,28 @@ pub struct SessionSummary {
     pub actor_user: Option<String>,
     /// Latest consolidation generation in the requested scope, if present.
     pub consolidation: Option<SessionConsolidationSummary>,
+    /// Reported cumulative token usage, when the harness's hook could
+    /// determine it at session end. `None` — not a zeroed
+    /// [`SessionUsageView`] — for a session with no report at all (older
+    /// client, unsupported harness, or an end that fired before this
+    /// feature shipped).
+    pub usage: Option<SessionUsageView>,
+}
+
+/// Cumulative token usage for one session (token-cost visibility), as
+/// surfaced by [`ReaderPool::sessions_for_scope`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SessionUsageView {
+    /// Fresh (non-cached) input tokens.
+    pub input_tokens: u64,
+    /// Output tokens (including any reasoning/thinking breakdown).
+    pub output_tokens: u64,
+    /// Tokens written to a prompt cache.
+    pub cache_write_tokens: u64,
+    /// Tokens served from a prompt cache.
+    pub cache_read_tokens: u64,
+    /// Last-seen model name, when reported.
+    pub model: Option<String>,
 }
 
 /// Aggregate MCP tool-call counts for one client, from
@@ -2173,9 +2214,18 @@ pub struct ProjectSummary {
     pub project_name: String,
     /// Number of unexpired `is_latest = 1` pages.
     pub page_count: u64,
+    /// Number of recorded sessions, including sessions that remain open.
+    pub session_count: u64,
+    /// Number of sanitized observations recorded for this project.
+    pub observation_count: u64,
+    /// Sessions without a `SessionEnd` record. This can mean active work or
+    /// an interruption, so the dashboard presents it as a signal, not an error.
+    pub open_session_count: u64,
     /// ISO-8601 timestamp of the newest `updated_at`, or `None` when
     /// the project has no pages yet.
     pub last_updated: Option<String>,
+    /// Most recent capture, session start, or page update in this project.
+    pub last_activity: Option<String>,
 }
 
 /// Pending inbox depth for one recipient project. Returned by
@@ -5045,6 +5095,73 @@ impl ReaderPool {
         .await
     }
 
+    /// Total reported token usage across every session in one scope
+    /// (token-cost visibility) — the project-wide figure the web dashboard's
+    /// "Tokens" stat needs, as opposed to the per-row usage
+    /// [`Self::sessions_for_scope`] returns for its most-recent page.
+    /// `None` when not a single session in scope has reported any usage yet
+    /// (not a zeroed [`SessionUsageView`]).
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn total_session_usage(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        owner_filter: OwnerFilter,
+    ) -> StoreResult<Option<SessionUsageView>> {
+        self.with_conn(move |conn| {
+            let owner_clause = match &owner_filter {
+                OwnerFilter::Any => "",
+                OwnerFilter::User(_) => " AND (s.actor_user IS NULL OR s.actor_user = :actor)",
+                OwnerFilter::Unattributed => " AND s.actor_user IS NULL",
+            };
+            let sql = format!(
+                "SELECT COUNT(*), SUM(u.input_tokens), SUM(u.output_tokens), \
+                        SUM(u.cache_write_tokens), SUM(u.cache_read_tokens) \
+                 FROM session_usage u \
+                 JOIN sessions s ON s.id = u.session_id \
+                 WHERE s.workspace_id = :ws AND s.project_id = :proj{owner_clause}"
+            );
+            let mut stmt = conn.prepare_cached(&sql)?;
+            let ws_bytes = workspace_id.as_bytes();
+            let proj_bytes = project_id.as_bytes();
+            let mut named: Vec<(&str, &dyn rusqlite::ToSql)> = vec![
+                (":ws", &ws_bytes as &dyn rusqlite::ToSql),
+                (":proj", &proj_bytes as &dyn rusqlite::ToSql),
+            ];
+            if let OwnerFilter::User(user) = &owner_filter {
+                named.push((":actor", user));
+            }
+            let (rows, input, output, cache_write, cache_read): (
+                i64,
+                Option<i64>,
+                Option<i64>,
+                Option<i64>,
+                Option<i64>,
+            ) = stmt.query_row(named.as_slice(), |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })?;
+            if rows == 0 {
+                return Ok(None);
+            }
+            Ok(Some(SessionUsageView {
+                input_tokens: u64::try_from(input.unwrap_or(0)).unwrap_or(0),
+                output_tokens: u64::try_from(output.unwrap_or(0)).unwrap_or(0),
+                cache_write_tokens: u64::try_from(cache_write.unwrap_or(0)).unwrap_or(0),
+                cache_read_tokens: u64::try_from(cache_read.unwrap_or(0)).unwrap_or(0),
+                model: None,
+            }))
+        })
+        .await
+    }
+
     /// Return open sessions matching one scoped project and agent.
     ///
     /// Results are newest-first so callers can default to finalizing only the
@@ -5108,6 +5225,115 @@ impl ReaderPool {
             )
             .await?;
         Ok(sessions.pop())
+    }
+
+    /// Return the most recently active substantive interrupted session in a scope.
+    ///
+    /// This powers startup recovery when a harness disappears without a
+    /// `SessionEnd` (quota exhaustion, process kill, machine restart). The
+    /// query is owner-filtered before prompt-derived rows are selected and
+    /// excludes the receiving session id, so it cannot echo a new session back
+    /// to itself. It is deliberately non-destructive: parallel sessions are a
+    /// supported workflow and an open row is not proof that its process died.
+    ///
+    /// A candidate must contain at least one prompt or tool observation in the
+    /// exact scope. Lifecycle-only sessions never produce recovery noise. Some
+    /// harnesses reuse a session id after they previously emitted `SessionEnd`;
+    /// those rows are eligible again only when a substantive observation is
+    /// newer than the recorded end. This preserves normal completed-session
+    /// behavior while avoiding a silent continuity gap after quota recovery.
+    /// A handoff covering its newest work already supplies continuity, so
+    /// reading recovery must not replay a claimed or superseded baton.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn latest_interrupted_session_candidate(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        owner_filter: OwnerFilter,
+        receiving_session_id: Option<SessionId>,
+    ) -> StoreResult<Option<InterruptedSessionCandidate>> {
+        self.with_conn(move |conn| {
+            let owner_clause = match &owner_filter {
+                OwnerFilter::Any => "",
+                OwnerFilter::User(_) => " AND (s.actor_user IS NULL OR s.actor_user = :actor)",
+                OwnerFilter::Unattributed => " AND s.actor_user IS NULL",
+            };
+            let receiver_clause = if receiving_session_id.is_some() {
+                " AND s.id != :receiver"
+            } else {
+                ""
+            };
+            let sql = format!(
+                "SELECT s.id, s.agent_kind, MAX(o.created_at) AS last_activity, s.cwd \
+                 FROM sessions s \
+                 JOIN observations o ON o.session_id = s.id \
+                 WHERE s.workspace_id = :ws AND s.project_id = :proj \
+                   AND (s.ended_at IS NULL OR EXISTS ( \
+                       SELECT 1 FROM observations resumed \
+                       WHERE resumed.session_id = s.id \
+                         AND resumed.workspace_id = :ws \
+                         AND resumed.project_id = :proj \
+                         AND resumed.kind IN ('user-prompt','pre-tool-use','post-tool-use') \
+                         AND resumed.created_at > s.ended_at \
+                   )) \
+                   AND o.workspace_id = :ws AND o.project_id = :proj \
+                   AND EXISTS (SELECT 1 FROM observations substantive \
+                               WHERE substantive.session_id = s.id \
+                                 AND substantive.workspace_id = :ws \
+                                 AND substantive.project_id = :proj \
+                                 AND substantive.kind IN ('user-prompt','pre-tool-use','post-tool-use'))\
+                   AND NOT EXISTS (SELECT 1 FROM handoffs h \
+                                   WHERE h.from_session_id = s.id \
+                                     AND h.workspace_id = :ws AND h.project_id = :proj \
+                                     AND h.created_at >= ( \
+                                         SELECT MAX(work.created_at) FROM observations work \
+                                         WHERE work.session_id = s.id \
+                                           AND work.workspace_id = :ws AND work.project_id = :proj \
+                                           AND work.kind IN ('user-prompt','pre-tool-use','post-tool-use'))) \
+                   {owner_clause}{receiver_clause} \
+                 GROUP BY s.id, s.agent_kind, s.started_at, s.cwd \
+                 ORDER BY last_activity DESC, s.started_at DESC, s.id DESC \
+                 LIMIT 1"
+            );
+            let ws_bytes = workspace_id.as_bytes();
+            let proj_bytes = project_id.as_bytes();
+            let receiver_bytes = receiving_session_id.map(|id| *id.as_bytes());
+            let mut named: Vec<(&str, &dyn rusqlite::ToSql)> = vec![
+                (":ws", &ws_bytes as &dyn rusqlite::ToSql),
+                (":proj", &proj_bytes as &dyn rusqlite::ToSql),
+            ];
+            if let OwnerFilter::User(owner) = &owner_filter {
+                named.push((":actor", owner));
+            }
+            if let Some(receiver) = &receiver_bytes {
+                named.push((":receiver", receiver));
+            }
+            let row = conn
+                .query_row(&sql, named.as_slice(), |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                })
+                .optional()?;
+            let Some((id, agent, last_activity_us, cwd)) = row else {
+                return Ok(None);
+            };
+            let last_activity_at = jiff::Timestamp::from_microsecond(last_activity_us)
+                .map(|ts| ts.to_string())
+                .unwrap_or_default();
+            Ok(Some(InterruptedSessionCandidate {
+                session_id: SessionId::from_slice(&id)?,
+                agent_kind: AgentKind::from_wire(&agent),
+                last_activity_at,
+                cwd,
+            }))
+        })
+        .await
     }
 
     // Eight arguments is the full lookup key (scope + agent + owner +
@@ -5401,6 +5627,11 @@ impl ReaderPool {
                 let ended_us: Option<i64> = row.get(4)?;
                 let actor_user: Option<String> = row.get(5)?;
                 let n: i64 = row.get(6)?;
+                let input_tokens: Option<i64> = row.get(7)?;
+                let output_tokens: Option<i64> = row.get(8)?;
+                let cache_write_tokens: Option<i64> = row.get(9)?;
+                let cache_read_tokens: Option<i64> = row.get(10)?;
+                let model: Option<String> = row.get(11)?;
                 Ok((
                     id_bytes,
                     cwd,
@@ -5409,8 +5640,13 @@ impl ReaderPool {
                     ended_us,
                     actor_user,
                     n,
-                    row.get::<_, Option<String>>(7)?,
-                    row.get::<_, Option<u32>>(8)?,
+                    input_tokens,
+                    output_tokens,
+                    cache_write_tokens,
+                    cache_read_tokens,
+                    model,
+                    row.get::<_, Option<String>>(12)?,
+                    row.get::<_, Option<u32>>(13)?,
                 ))
             })?;
             let mut out = Vec::new();
@@ -5423,6 +5659,11 @@ impl ReaderPool {
                     ended_us,
                     actor_user,
                     n,
+                    input_tokens,
+                    output_tokens,
+                    cache_write_tokens,
+                    cache_read_tokens,
+                    model,
                     state,
                     attempts,
                 ) = row?;
@@ -5432,11 +5673,24 @@ impl ReaderPool {
                 let ended_at = ended_us
                     .and_then(|us| jiff::Timestamp::from_microsecond(us).ok())
                     .map(|ts| ts.to_string());
+                // `input_tokens` alone stands in for "a usage row exists": the
+                // LEFT JOIN yields all-NULL columns for a session with no
+                // report, and every real row always carries this column
+                // (defaulted to 0, never NULL) once `upsert_session_usage`
+                // has run.
+                let usage = input_tokens.map(|input_tokens| SessionUsageView {
+                    input_tokens: u64::try_from(input_tokens).unwrap_or(0),
+                    output_tokens: u64::try_from(output_tokens.unwrap_or(0)).unwrap_or(0),
+                    cache_write_tokens: u64::try_from(cache_write_tokens.unwrap_or(0)).unwrap_or(0),
+                    cache_read_tokens: u64::try_from(cache_read_tokens.unwrap_or(0)).unwrap_or(0),
+                    model,
+                });
                 out.push(SessionSummary {
                     session_id: SessionId::from_slice(&id_bytes)?,
                     cwd,
                     agent_kind,
                     started_at,
+                    usage,
                     ended_at,
                     observation_count: u64::try_from(n).unwrap_or(0),
                     actor_user,
@@ -6743,6 +6997,112 @@ impl ReaderPool {
             Ok(out)
         })
         .await
+    }
+
+    /// Best-effort harness attribution for the web UI: for every
+    /// `is_latest = 1` page in scope, the [`AgentKind`] of the most
+    /// recently cited session in its `page_evidence` (P2, kind
+    /// `'session'`). Pages with no session evidence — hand-written pages,
+    /// or writes from before the P2 evidence substrate shipped — are
+    /// simply absent from the map, the same "unknown, not unsupported"
+    /// convention as [`Self::page_evidence_counts`].
+    ///
+    /// Two queries total regardless of page count: evidence rows for the
+    /// scope, then one batched `sessions` lookup for the distinct session
+    /// ids involved. A malformed session id (evidence is only ever written
+    /// by us) or a session row that no longer exists is skipped rather than
+    /// failing the whole call — this is decorative UI metadata, not a
+    /// correctness-critical read.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn latest_page_agent_kinds(
+        &self,
+        workspace: &str,
+        project: &str,
+    ) -> StoreResult<std::collections::HashMap<String, AgentKind>> {
+        let workspace = workspace.to_owned();
+        let project = project.to_owned();
+        let evidence_rows: Vec<(String, String, i64)> = self
+            .with_conn(move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT pg.path, pe.source_id, pe.created_at \
+                     FROM pages pg \
+                     JOIN page_evidence pe ON pe.page_id = pg.id AND pe.source_kind = 'session' \
+                     JOIN projects p ON p.id = pg.project_id \
+                     JOIN workspaces w ON w.id = pg.workspace_id \
+                     WHERE w.name = ?1 AND p.name = ?2 AND pg.is_latest = 1",
+                )?;
+                let rows = stmt.query_map(params![workspace, project], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(StoreError::from)
+            })
+            .await?;
+
+        let mut latest_session_by_path: std::collections::HashMap<String, (SessionId, i64)> =
+            std::collections::HashMap::new();
+        for (path, session_id_str, created_at) in evidence_rows {
+            let Ok(session_id) = SessionId::from_str(&session_id_str) else {
+                continue;
+            };
+            latest_session_by_path
+                .entry(path)
+                .and_modify(|(existing_id, existing_at)| {
+                    if created_at > *existing_at {
+                        *existing_id = session_id;
+                        *existing_at = created_at;
+                    }
+                })
+                .or_insert((session_id, created_at));
+        }
+        if latest_session_by_path.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        let session_ids: Vec<SessionId> = latest_session_by_path
+            .values()
+            .map(|(id, _)| *id)
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        let session_id_blobs: Vec<Value> = session_ids
+            .iter()
+            .map(|id| Value::Blob(id.as_bytes().to_vec()))
+            .collect();
+        let agent_by_session: std::collections::HashMap<SessionId, AgentKind> = self
+            .with_conn(move |conn| {
+                let placeholders = std::iter::repeat_n("?", session_id_blobs.len())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let sql =
+                    format!("SELECT id, agent_kind FROM sessions WHERE id IN ({placeholders})");
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt.query_map(params_from_iter(session_id_blobs.iter()), |row| {
+                    Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
+                })?;
+                let mut out = std::collections::HashMap::new();
+                for r in rows {
+                    let (id_bytes, agent) = r?;
+                    if let Ok(id) = SessionId::from_slice(&id_bytes) {
+                        out.insert(id, AgentKind::from_wire(&agent));
+                    }
+                }
+                Ok(out)
+            })
+            .await?;
+
+        Ok(latest_session_by_path
+            .into_iter()
+            .filter_map(|(path, (session_id, _))| {
+                agent_by_session.get(&session_id).map(|kind| (path, *kind))
+            })
+            .collect())
     }
 
     /// Rank pages by how many of the query's tokens match their indexed
@@ -10606,13 +10966,19 @@ impl ReaderPool {
                         p.id AS project_id, \
                         p.name AS project_name, \
                         COUNT(pg.id) AS page_count, \
-                        MAX(pg.updated_at) AS last_updated_us \
+                        MAX(pg.updated_at) AS last_updated_us, \
+                        (SELECT COUNT(*) FROM sessions s WHERE s.project_id = p.id), \
+                        (SELECT COUNT(*) FROM observations o WHERE o.project_id = p.id), \
+                        (SELECT COUNT(*) FROM sessions s WHERE s.project_id = p.id AND s.ended_at IS NULL), \
+                        COALESCE((SELECT MAX(o.created_at) FROM observations o WHERE o.project_id = p.id), \
+                            (SELECT MAX(s.started_at) FROM sessions s WHERE s.project_id = p.id), \
+                            MAX(pg.updated_at)) AS last_activity \
                  FROM workspaces w \
                  JOIN projects p ON p.workspace_id = w.id \
                  LEFT JOIN pages pg ON pg.project_id = p.id AND pg.is_latest = 1{ttl} \
                  WHERE (?1 IS NULL OR w.name = ?1){visible} \
                  GROUP BY w.id, p.id \
-                 ORDER BY last_updated_us DESC NULLS LAST"
+                 ORDER BY last_activity DESC NULLS LAST"
             ))?;
             let now = now_us();
             let rows = stmt.query_map(params![workspace, now], |row| {
@@ -10622,6 +10988,10 @@ impl ReaderPool {
                 let project_name: String = row.get(3)?;
                 let page_count: i64 = row.get(4)?;
                 let last_updated_us: Option<i64> = row.get(5)?;
+                let session_count: i64 = row.get(6)?;
+                let observation_count: i64 = row.get(7)?;
+                let open_session_count: i64 = row.get(8)?;
+                let last_activity_us: Option<i64> = row.get(9)?;
                 Ok((
                     workspace_id,
                     workspace_name,
@@ -10629,6 +10999,7 @@ impl ReaderPool {
                     project_name,
                     page_count,
                     last_updated_us,
+                    session_count, observation_count, open_session_count, last_activity_us,
                 ))
             })?;
             let mut out = Vec::new();
@@ -10640,10 +11011,14 @@ impl ReaderPool {
                     project_name,
                     page_count,
                     last_updated_us,
+                    session_count, observation_count, open_session_count, last_activity_us,
                 ) = r?;
                 let workspace_id = WorkspaceId::from_slice(&workspace_id)?;
                 let project_id = ProjectId::from_slice(&project_id)?;
                 let last_updated = last_updated_us
+                    .and_then(|us| jiff::Timestamp::from_microsecond(us).ok())
+                    .map(|ts| ts.to_string());
+                let last_activity = last_activity_us
                     .and_then(|us| jiff::Timestamp::from_microsecond(us).ok())
                     .map(|ts| ts.to_string());
                 out.push(ProjectSummary {
@@ -10652,7 +11027,11 @@ impl ReaderPool {
                     project_id: project_id.to_string(),
                     project_name,
                     page_count: u64::try_from(page_count).unwrap_or(0),
+                    session_count: u64::try_from(session_count).unwrap_or(0),
+                    observation_count: u64::try_from(observation_count).unwrap_or(0),
+                    open_session_count: u64::try_from(open_session_count).unwrap_or(0),
                     last_updated,
+                    last_activity,
                 });
             }
             Ok(out)
@@ -13422,8 +13801,10 @@ fn sessions_for_scope_sql(
                 (SELECT COUNT(*) FROM observations o INDEXED BY idx_observations_session \
                  WHERE o.session_id = s.id \
                    AND o.workspace_id = :ws AND o.project_id = :proj) AS n, \
+                u.input_tokens, u.output_tokens, u.cache_write_tokens, u.cache_read_tokens, u.model, \
                 j.state, j.attempts \
          FROM sessions s \
+         LEFT JOIN session_usage u ON u.session_id = s.id \
          LEFT JOIN session_consolidation_jobs j ON j.session_id = s.id \
            AND j.workspace_id = :ws AND j.project_id = :proj \
            AND j.generation = (SELECT MAX(latest.generation) \
@@ -15332,8 +15713,8 @@ mod tests {
 
     use ai_memory_core::{
         AgentKind, Handoff, HandoffContent, HandoffId, HandoffLifecycle, HandoffOrigin,
-        HandoffScope, HandoffState, NewHandoff, NewSession, OwnerFilter, ProjectId, SessionId,
-        WorkspaceId,
+        HandoffScope, HandoffState, NewHandoff, NewPage, NewSession, OwnerFilter, PageEvidence,
+        PageEvidenceKind, PagePath, ProjectId, SessionId, Tier, WorkspaceId,
     };
 
     #[test]
@@ -16242,5 +16623,102 @@ mod tests {
         assert!(sql.contains("json_extract(pages.frontmatter_json, '$.summary')"));
         assert!(sql.contains("NULLIF(TRIM("));
         assert!(sql.contains("substr(pages.body, 1, 600)"));
+    }
+
+    fn evidence_test_page(ws: WorkspaceId, proj: ProjectId, path: &str) -> NewPage {
+        NewPage {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new(path).unwrap(),
+            title: "test".into(),
+            body: "body".into(),
+            tier: Tier::Semantic,
+            frontmatter_json: serde_json::json!({}),
+            pinned: false,
+            links: Vec::new(),
+            author_id: None,
+            expires_at: None,
+            entities: Vec::new(),
+            evidence: Vec::new(),
+        }
+    }
+
+    /// The web dashboard's per-page agent badge: the harness whose
+    /// session most recently cited a page as evidence. Only the *latest*
+    /// citation should win when a page has been touched by more than one
+    /// agent, and a page with no session evidence at all must be absent
+    /// from the map rather than reported as some default.
+    #[tokio::test]
+    async fn latest_page_agent_kinds_prefers_the_most_recent_session_citation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store.writer.get_or_create_workspace("acme").await.unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "webapp", None)
+            .await
+            .unwrap();
+
+        let codex_session = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: None,
+                id: codex_session,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Codex,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        let claude_session = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: None,
+                id: claude_session,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::ClaudeCode,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+
+        // Cited first by Codex, then by Claude Code — the join must report
+        // the later one, not the first or an arbitrary one.
+        let mut page = evidence_test_page(ws, proj, "concepts/attribution.md");
+        page.evidence = vec![PageEvidence {
+            kind: PageEvidenceKind::Session,
+            source_id: codex_session.to_string(),
+        }];
+        store.writer.upsert_page(page.clone()).await.unwrap();
+        page.evidence = vec![PageEvidence {
+            kind: PageEvidenceKind::Session,
+            source_id: claude_session.to_string(),
+        }];
+        store.writer.upsert_page(page).await.unwrap();
+
+        // A hand-written page with no session evidence at all.
+        let unattributed = evidence_test_page(ws, proj, "concepts/no-evidence.md");
+        store.writer.upsert_page(unattributed).await.unwrap();
+
+        let by_path = store
+            .reader
+            .latest_page_agent_kinds("acme", "webapp")
+            .await
+            .unwrap();
+        assert_eq!(
+            by_path.get("concepts/attribution.md"),
+            Some(&AgentKind::ClaudeCode),
+            "the later citation must win"
+        );
+        assert!(
+            !by_path.contains_key("concepts/no-evidence.md"),
+            "a page with no session evidence must be absent, not defaulted"
+        );
     }
 }
