@@ -83,6 +83,7 @@ pub use message::{
 };
 pub use observation::{
     NewObservation, NewSession, NewSessionUsage, Observation, ObservationKind, TokenCall,
+    TokenCallContext, TokenToolRef, TokenToolRelation,
 };
 pub use page::{
     FeedbackKind, LinkTarget, MAX_ENTITIES_PER_PAGE, MAX_ENTITY_LEN, NewPage, Page, PageEvidence,

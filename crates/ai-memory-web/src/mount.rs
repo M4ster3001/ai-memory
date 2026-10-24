@@ -317,6 +317,8 @@ pub struct WebMountSpec<'a> {
     /// The server's configured embedder and reranker, so project search in
     /// `/web` and `/api/v1` ranks like `memory_query`.
     pub recall: crate::Recall,
+    /// Safe configuration switches read once by the host.
+    pub runtime: Option<crate::features::RuntimeFeatures>,
     /// Process-side sources for the root-only health page.
     pub health: Option<Arc<crate::health::HealthSources>>,
 }
@@ -399,7 +401,8 @@ fn split_web_routers_unframed(
     }
     let mut state = crate::WebState::new(reader, wiki)
         .with_trusted_proxy_identity(spec.trusted_proxy_identity)
-        .with_recall(spec.recall);
+        .with_recall(spec.recall)
+        .with_runtime(spec.runtime);
     if let Some(health) = spec.health {
         state = state.with_health(health);
     }
@@ -743,6 +746,7 @@ mod tests {
                 base_path: &base,
                 trusted_proxy_identity: false,
                 recall: crate::Recall::default(),
+                runtime: None,
                 health: None,
             },
         )
@@ -1158,6 +1162,7 @@ mod tests {
                 base_path: &base,
                 trusted_proxy_identity: false,
                 recall: crate::Recall::default(),
+                runtime: None,
                 health: None,
             },
         )
@@ -1238,6 +1243,7 @@ mod tests {
                 base_path: "",
                 trusted_proxy_identity: false,
                 recall: crate::Recall::default(),
+                runtime: None,
                 health: None,
             },
         )
@@ -1326,6 +1332,7 @@ mod tests {
                 base_path: "",
                 trusted_proxy_identity: false,
                 recall: crate::Recall::default(),
+                runtime: None,
                 health: None,
             },
         )
@@ -1400,6 +1407,7 @@ mod tests {
                 base_path: "",
                 trusted_proxy_identity: false,
                 recall: crate::Recall::default(),
+                runtime: None,
                 health: None,
             },
         )
@@ -1462,6 +1470,7 @@ mod tests {
                 base_path: &base,
                 trusted_proxy_identity: false,
                 recall: crate::Recall::default(),
+                runtime: None,
                 health: None,
             },
         )
@@ -1553,6 +1562,7 @@ mod tests {
                 base_path: "",
                 trusted_proxy_identity: false,
                 recall: crate::Recall::default(),
+                runtime: None,
                 health: None,
             },
         )
@@ -1612,6 +1622,7 @@ mod tests {
                 base_path: "",
                 trusted_proxy_identity: false,
                 recall: crate::Recall::default(),
+                runtime: None,
                 health: None,
             },
         )
@@ -1660,6 +1671,7 @@ mod tests {
                 base_path: "",
                 trusted_proxy_identity: false,
                 recall: crate::Recall::default(),
+                runtime: None,
                 health: None,
             },
         )

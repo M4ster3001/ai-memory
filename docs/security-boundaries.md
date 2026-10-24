@@ -215,3 +215,40 @@ classification fails the test. Coverage: **STRONG**.
    defects, so the guards live at integration level (`multi_session.rs`,
    `handoff_ownership.rs`, `agent_messages.rs`, `active_project` pointer tests,
    the MCP permission suites). Put boundary tests there.
+
+## Contextual dashboard evidence and runtime states
+
+Knowledge evidence uses an already-authorized workspace/project/path. The
+store resolves the current version in that coordinate; session and observation
+citations must exist in the same scope and pass the existing qualified owner
+filter. Page authors remain attribution, never a page-read filter. Contradiction
+far ends use `readable_repository_predicate`, latest-version and expiry guards;
+visible totals use the same predicates as rows. Opaque evidence IDs are not
+exposed. `contextual_page_sources_preserve_shared_pages_and_refuse_foreign_or_private_evidence`
+checks named/shared source controls, same-scope owner refusal, foreign citation
+refusal, private far-end refusal, root controls and the HTTP scope gate.
+
+Runtime feature status publishes only explicit safe startup facts. Each request
+uses `AuthLevel::authorize(Capability::Admin, ...)` and masks state, detail and
+next step for administrative settings. Missing snapshots remain unknown.
+`contextual_states_report_effective_configuration_and_mask_admin_settings`
+checks root, DB reader and anonymous behavior, including zero-LLM and missing
+snapshot controls. The endpoint stays inside the authenticated API router.
+
+Token provenance passes through hook admission and ownership checks before the
+single writer transaction. IDs are validated and rejected when sanitization
+changes them; tool names are scrubbed before truncation, with at most sixteen
+references per report. No tool payloads are retained. `live_token_calls_scrub_private_labels_before_truncating`
+checks private/malformed context IDs and names crossing the size bound. Native
+cursor tests verify only explicit coordinates survive committed hooks and gaps
+clear context. Server investigation filters intersect authorized project,
+owner and route session before counting, totals, pagination and tool lookup.
+`token_investigation_filters_before_paging_and_keeps_native_context` checks all
+filter dimensions and foreign/session intersections; existing qualified-owner
+search regressions remain active. `token_context_rolls_back_with_response_counters_and_aggregates`
+injects a child-row failure and verifies both rows and aggregates roll back.
+
+Guard-removal validation detected all six deliberate faults above through their
+intended assertions (foreign citation scope, source owner, contradiction viewer,
+admin-setting mask, exact model and UTC lower bound). The permanent cases are in
+`scripts/check-dashboard-core-mutations.py`; compilation failures do not count.

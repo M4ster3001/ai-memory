@@ -20,6 +20,9 @@ use std::collections::HashSet;
 use std::io::{BufRead as _, Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 
+#[path = "session_usage_context.rs"]
+mod response_context;
+
 /// One bounded transcript batch. Publish its cursor only after the lifecycle
 /// event has been durably spooled; a crash then causes safe response-id replay.
 pub struct LiveCallBatch {
@@ -67,10 +70,12 @@ struct LiveCursor {
     prefix: String,
     anchor: String,
     skipping_long_line: bool,
+    #[serde(default)]
+    context: response_context::ScanContext,
 }
 
 const LIVE_BATCH_CALLS: usize = 256;
-const LIVE_CURSOR_BYTES: u64 = 16 * 1024;
+const LIVE_CURSOR_BYTES: u64 = 64 * 1024;
 
 fn fingerprint(file: &mut std::fs::File, start: u64, len: u64) -> std::io::Result<String> {
     use sha2::{Digest as _, Sha256};
@@ -139,6 +144,7 @@ pub fn extract_live_calls(
             // bounded chunks, rather than blocking every subsequent record.
             if consumed == 0 && bytes.len() as u64 == CODEX_TAIL_SCAN_BYTES {
                 cursor.skipping_long_line = true;
+                cursor.context = response_context::ScanContext::default();
                 previous = None;
                 model = None;
                 consumed += line.len();
@@ -155,8 +161,18 @@ pub fn extract_live_calls(
             break;
         }
         let Ok(v) = serde_json::from_slice::<serde_json::Value>(line) else {
+            cursor.context = response_context::ScanContext::default();
             continue;
         };
+        if let Some(update) = cursor.context.observe(&v, agent) {
+            if !result.contains_key(&update.call_id) {
+                order.push(update.call_id.clone());
+            }
+            result
+                .entry(update.call_id.clone())
+                .and_modify(|old| response_context::merge_context(old, &update))
+                .or_insert(update);
+        }
         if v.get("type").and_then(|v| v.as_str()) == Some("turn_context") {
             model = v
                 .pointer("/payload/model")
@@ -201,7 +217,10 @@ pub fn extract_live_calls(
                 "codex:{}:{}:{}:{}",
                 totals[0], totals[1], totals[2], totals[3]
             );
-            let usage = if let Some(last) = v.pointer("/payload/info/last_token_usage") {
+            let usage = if let Some(last) = v
+                .pointer("/payload/info/last_token_usage")
+                .or_else(|| v.pointer("/payload/usage"))
+            {
                 last.clone()
             } else if let Some(old) = previous {
                 serde_json::json!({"input_tokens":totals[0].saturating_sub(old[0])+totals[3].saturating_sub(old[3]),"output_tokens":totals[1].saturating_sub(old[1]),"cache_write_input_tokens":totals[2].saturating_sub(old[2]),"cached_input_tokens":totals[3].saturating_sub(old[3])})
@@ -229,6 +248,7 @@ pub fn extract_live_calls(
         );
         let input = u64_field(&usage, "input_tokens");
         let call = ai_memory_core::TokenCall {
+            context: Some(cursor.context.for_call(&v, agent)),
             call_id: id.clone(),
             input_tokens: if codex {
                 input.saturating_sub(cached)
@@ -259,9 +279,11 @@ pub fn extract_live_calls(
         if !result.contains_key(&id) {
             order.push(id.clone());
         }
+        cursor.context.remember(&call);
         result
             .entry(id)
             .and_modify(|old| {
+                response_context::merge_context(old, &call);
                 old.input_tokens = old.input_tokens.max(call.input_tokens);
                 old.output_tokens = old.output_tokens.max(call.output_tokens);
                 old.cache_write_tokens = old.cache_write_tokens.max(call.cache_write_tokens);
@@ -554,6 +576,118 @@ pub fn locate_claude_code_transcript(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_context_pairs_tools_across_committed_hooks_and_resets_unknown_turns() {
+        use ai_memory_core::{AgentKind, TokenToolRelation};
+        use serde_json::json;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("context.jsonl");
+        let rows = [
+            json!({"type":"user","uuid":"user-turn-1","message":{"content":[{"type":"text","text":"PRIVATE_PROMPT"}]}}),
+            json!({"type":"assistant","parentUuid":"user-turn-1","timestamp":"2026-10-01T12:00:00Z","message":{"id":"response-1","model":"model-1","usage":{"input_tokens":100,"output_tokens":5},"content":[{"type":"tool_use","id":"tool-1","name":"Read","input":{"path":"PRIVATE_PATH"}}]}}),
+        ];
+        let data = rows.iter().map(|v| format!("{v}\n")).collect::<String>();
+        std::fs::write(&path, &data).unwrap();
+        let first = extract_live_calls(&path, AgentKind::ClaudeCode, tmp.path(), "ctx").unwrap();
+        let c = first.calls[0].context.as_ref().unwrap();
+        assert_eq!(c.turn_id.as_deref(), Some("user-turn-1"));
+        assert_eq!(c.response_id.as_deref(), Some("response-1"));
+        assert_eq!(c.tools[0].relation, TokenToolRelation::Requested);
+        assert_eq!(c.recorded_at.as_deref(), Some("2026-10-01T12:00:00Z"));
+        first.commit();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        use std::io::Write as _;
+        writeln!(file,"{}",json!({"type":"user","uuid":"result-parent","message":{"content":[{"type":"tool_result","tool_use_id":"tool-1","is_error":true,"content":"PRIVATE_OUTPUT"}]}})).unwrap();
+        writeln!(file,"{}",json!({"type":"assistant","parentUuid":"result-parent","message":{"id":"response-2","usage":{"input_tokens":200,"output_tokens":7}}})).unwrap();
+        let next = extract_live_calls(&path, AgentKind::ClaudeCode, tmp.path(), "ctx").unwrap();
+        assert_eq!(next.calls.len(), 2);
+        let old = next
+            .calls
+            .iter()
+            .find(|c| c.call_id == "response-1")
+            .unwrap();
+        assert_eq!(old.context.as_ref().unwrap().tools[0].is_error, Some(true));
+        let input = next
+            .calls
+            .iter()
+            .find(|c| c.call_id == "response-2")
+            .unwrap();
+        assert_eq!(
+            input.context.as_ref().unwrap().tools[0].relation,
+            TokenToolRelation::Input
+        );
+        let serialized = serde_json::to_string(&next.next).unwrap();
+        assert!(
+            !serialized.contains("PRIVATE_"),
+            "Cursor must never retain prompt, tool arguments or output"
+        );
+        next.commit();
+        writeln!(file, "malformed gap").unwrap();
+        writeln!(
+            file,
+            "{}",
+            json!({"type":"assistant","message":{"id":"response-3","usage":{"input_tokens":3}}})
+        )
+        .unwrap();
+        let after = extract_live_calls(&path, AgentKind::ClaudeCode, tmp.path(), "ctx").unwrap();
+        assert!(after.calls[0].context.as_ref().unwrap().turn_id.is_none());
+        assert!(after.calls[0].context.as_ref().unwrap().tools.is_empty());
+    }
+
+    #[test]
+    fn live_codex_context_uses_native_coordinates_and_only_turn_association() {
+        use ai_memory_core::{AgentKind, TokenToolRelation};
+        use serde_json::json;
+        use std::io::Write as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("codex-context.jsonl");
+        let context = json!({"type":"turn_context","payload":{"turn_id":"native-turn","model":"codex-model"}});
+        let usage = json!({"type":"token_usage","timestamp":"2026-10-01T12:00:00Z","payload":{"turn_id":"native-turn","response_id":"native-response","thread_token_usage":{"input_tokens":50,"output_tokens":10},"usage":{"input_tokens":50,"output_tokens":10}}});
+        std::fs::write(&path, format!("{context}\n{usage}\n")).unwrap();
+        let first = extract_live_calls(&path, AgentKind::Codex, tmp.path(), "ctx").unwrap();
+        assert_eq!(first.calls.len(), 1);
+        assert_eq!(
+            first.calls[0]
+                .context
+                .as_ref()
+                .unwrap()
+                .response_id
+                .as_deref(),
+            Some("native-response")
+        );
+        first.commit();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(file,"{}",json!({"type":"response_item","payload":{"type":"function_call","call_id":"exec-1","name":"exec_command","arguments":"PRIVATE_ARGUMENTS"}})).unwrap();
+        let update = extract_live_calls(&path, AgentKind::Codex, tmp.path(), "ctx").unwrap();
+        assert_eq!(update.calls.len(), 1);
+        let tool = &update.calls[0].context.as_ref().unwrap().tools[0];
+        assert_eq!(tool.relation, TokenToolRelation::Turn);
+        assert_eq!(tool.name, "exec_command");
+        update.commit();
+        writeln!(
+            file,
+            "{}",
+            json!({"type":"turn_context","payload":{"model":"no-turn"}})
+        )
+        .unwrap();
+        let mut unknown = usage;
+        unknown["payload"]
+            .as_object_mut()
+            .unwrap()
+            .remove("turn_id");
+        unknown["payload"]["thread_token_usage"]["input_tokens"] = json!(100);
+        writeln!(file, "{unknown}").unwrap();
+        let after = extract_live_calls(&path, AgentKind::Codex, tmp.path(), "ctx").unwrap();
+        assert!(after.calls[0].context.as_ref().unwrap().turn_id.is_none());
+        assert!(after.calls[0].context.as_ref().unwrap().tools.is_empty());
+    }
 
     #[test]
     fn live_token_calls_merge_streaming_usage_and_skip_partial_lines() {

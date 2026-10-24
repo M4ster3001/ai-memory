@@ -21,7 +21,7 @@ mod notifications;
 mod page;
 mod pending;
 mod project;
-mod search;
+pub(crate) mod search;
 mod session;
 pub(crate) mod statics;
 mod workstreams;

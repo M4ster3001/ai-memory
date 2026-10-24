@@ -82,3 +82,25 @@ body.dashboard-shell { margin:0; min-height:100vh; background:var(--dash-bg); co
 .mail-overview { padding:20px; margin-bottom:24px; }.mail-overview h2 { font-size:16px; margin-bottom:6px; }.mailbox-links { display:flex; flex-wrap:wrap; gap:10px; margin-top:16px; }.mailbox-link { display:flex; flex-direction:column; gap:8px; flex:1 1 220px; min-width:0; max-width:100%; padding:14px; border:1px solid var(--dash-line); border-radius:7px; overflow-wrap:anywhere; }.mailbox-link>span:last-child { color:var(--dash-muted); font-size:11px; }.mailbox-link:hover,.mailbox-link[aria-current] { border-color:var(--dash-accent); background:var(--dash-accent-soft); }
 
 .nav-message-count { margin-left:auto; display:inline-flex; justify-content:center; align-items:center; min-width:22px; height:22px; padding:0 5px; border-radius:11px; background:var(--dash-accent); color:var(--dash-surface); font-size:11px; font-weight:700; }.nav-message-count[hidden],.nav-inbox-notifications[hidden] { display:none; }.nav-inbox-notifications { margin:0 8px 12px; padding:10px; border:1px solid var(--dash-line); border-radius:7px; background:var(--dash-soft); }.nav-inbox-notifications p { font-size:11px; color:var(--dash-muted); margin-bottom:5px; }.app-nav .nav-inbox-notifications a { display:block; min-height:44px; padding:10px 4px; font-size:11px; overflow-wrap:anywhere; }.mail-state-filter { display:flex; align-items:center; flex-wrap:wrap; gap:8px; margin-top:16px; }.mail-state-filter select { width:auto; flex:1; }
+
+/* Investigation and evidence keep long identifiers readable at every width. */
+.installation-status,.knowledge-evidence { margin-block:1.5rem; padding:1.25rem; }
+.installation-status summary,.knowledge-evidence summary { cursor:pointer; font-weight:600; }
+.feature-status-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,20rem),1fr)); gap:1rem; margin-top:1rem; }
+.feature-status { padding:1rem; border:1px solid var(--dash-line); border-radius:.75rem; }
+.feature-status h2,.knowledge-evidence h2 { font-size:1rem; margin-block:.75rem; }
+.feature-status p,.knowledge-evidence p,.knowledge-evidence dl { margin-block:.75rem; }
+.knowledge-evidence dd { margin:0 0 .75rem; overflow-wrap:anywhere; }
+.knowledge-evidence code,.knowledge-evidence li,.usage-call-context { overflow-wrap:anywhere; }
+.knowledge-sources { display:grid; gap:.75rem; padding-left:1rem; }
+.knowledge-evidence a { text-decoration:underline; }
+.knowledge-evidence details+details { margin-top:1rem; }
+.usage-call-context { min-width:14rem; max-width:26rem; white-space:normal; }
+.usage-call-context dl { display:grid; grid-template-columns:auto minmax(0,1fr); gap:.5rem; }
+.usage-call-context dd { margin:0; }
+
+.usage-controls label { display:flex; flex-direction:column; gap:.35rem; min-width:0; }
+.usage-controls input,.usage-controls select { min-width:0; max-width:100%; }
+
+.usage-controls>label:not(.sr-only) { flex:1 1 180px; max-width:100%; font-size:.75rem; }
+.usage-controls label input,.usage-controls label select { width:100%; box-sizing:border-box; }

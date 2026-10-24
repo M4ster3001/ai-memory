@@ -373,6 +373,49 @@ async function main() {
       assert.equal(await cdp.evaluate('document.querySelectorAll("[data-call-row]").length'),1);
       assert(await cdp.evaluate('document.querySelector("[data-call-row]").textContent.includes("tiny-newest")'));
     },
+    async 'contextual-investigation'() {
+      const sid=crypto.randomUUID(),href=base+'/web/w/investigation/app';
+      const hook='/hook?'+new URLSearchParams({workspace:'investigation',project:'app',agent:'codex',event:'post-tool-use'});
+      await request('/hook?'+new URLSearchParams({workspace:'investigation',project:'app',agent:'codex',event:'session-start'}),{session_id:sid});
+      const rows=Array.from({length:57},(_,n)=>({call_id:'context-'+n,model:n===56?'rare-model':'bulk-model',input_tokens:20,output_tokens:2,cache_read_tokens:0,cache_write_tokens:0,context:{turn_id:'native-turn',response_id:'native-'+n,recorded_at:'2026-10-01T12:00:00Z',tools:[{id:'exec-1',name:'exec_command',relation:'turn',is_error:true}]}}));
+      await request(hook,{session_id:sid,tool_name:'Bash',tool_input:{command:'echo synthetic'},tool_response:'synthetic',_ai_memory_usage_calls:rows});
+      await until(async()=> (await (await request('/web/w/investigation/app')).text()).includes('Captured calls</span><strong>57</strong>'),'Context fixture never reached storage');
+      await cdp.goto(href+'?tab=tokens','#token-usage');
+      await cdp.evaluate(`document.querySelector('[name=calls_model]').value='rare-model';document.querySelector('[name=calls_agent]').value='codex';document.querySelector('[name=calls_session]').value=${JSON.stringify(sid)};document.querySelector('[name=calls_from]').value='2026-10-01T12:00:00';document.querySelector('[name=calls_until]').value='2026-10-01T12:00:01';document.querySelector('[name=calls_tool]').value='exec_command';document.getElementById('call-query').requestSubmit()`);
+      await until(()=>cdp.evaluate('document.querySelectorAll("[data-call-row]").length===1&&!document.querySelector("#call-query").hasAttribute("aria-busy")'),'Server investigation filters did not isolate the response outside the first fifty');
+      assert(await cdp.evaluate('document.querySelector("[data-call-row]").textContent.includes("native-56")&&document.querySelector("[data-call-row]").textContent.includes("association")'));
+      await cdp.reload();assert.equal(await cdp.evaluate('document.querySelectorAll("[data-call-row]").length'),1);
+      await cdp.evaluate(`document.querySelector('[name=calls_model]').value='missing-model';document.querySelector('[name=calls_model]').dispatchEvent(new Event('change',{bubbles:true}))`);
+      await until(()=>cdp.evaluate('document.querySelectorAll("[data-call-row]").length===0&&!document.querySelector("#call-query").hasAttribute("aria-busy")'),'A mismatched exact model must remove all rows');
+      for(const width of [320,390]) {await cdp.send('Emulation.setDeviceMetricsOverride',{width,height:960,deviceScaleFactor:1,mobile:true});assert(await cdp.evaluate('document.documentElement.scrollWidth<=innerWidth'),'Investigation controls overflow the viewport');}
+      await cdp.send('Emulation.setDeviceMetricsOverride',{width:1440,height:1100,deviceScaleFactor:1,mobile:false});
+    },
+    async 'feature-states'() {
+      await cdp.goto(base+'/web/docs/features','.installation-status');
+      assert(await cdp.evaluate(`document.querySelector('[data-feature="learning"]').textContent.includes("Unavailable without LLM")`));
+      assert(await cdp.evaluate(`document.querySelector('[data-feature="external-clients"]').textContent.includes("Client setup unknown")`));
+      assert(await cdp.evaluate(`document.querySelector('[data-feature="consolidation"]').textContent.includes("Next step:")`));
+      assert.equal((await fetch(base+'/api/v1/docs/features/status',{redirect:'manual'})).status,401);
+      const status=await (await request('/api/v1/docs/features/status')).json();assert.equal(status.features.find(f=>f.id==='embeddings').state,'Not configured');
+    },
+    async 'knowledge-evidence'() {
+      const sid=sessions.get('team/app/codex');
+      const rpc=async(body,session)=> {
+        const response=await fetch(base+'/mcp',{method:'POST',headers:{Authorization:'Bearer '+token,'Content-Type':'application/json',Accept:'application/json, text/event-stream',...(session?{'Mcp-Session-Id':session}:{})},body:JSON.stringify(body),signal:AbortSignal.timeout(15000)});
+        assert(response.ok,'MCP fixture returned '+response.status);
+        const text=await response.text();const payload=text.trim().startsWith('{')?JSON.parse(text):JSON.parse(text.split('\n').find(line=>line.startsWith('data: ')).slice(6));return {payload,session:response.headers.get('Mcp-Session-Id')};
+      };
+      const initialized=await rpc({jsonrpc:'2.0',id:1,method:'initialize',params:{protocolVersion:'2025-03-26',capabilities:{},clientInfo:{name:'synthetic-dashboard-test',version:'1'}}});
+      const written=await rpc({jsonrpc:'2.0',id:2,method:'tools/call',params:{name:'memory_write_page',arguments:{workspace:'team',project:'app',path:'concepts/evidence.md',body:'# Evidence fixture\n\nVerificationneedle source.',session_id:sid}}},initialized.session);
+      assert(!written.payload.error&&!written.payload.result?.isError,'MCP evidence fixture failed: '+JSON.stringify(written.payload));
+      await cdp.goto(base+'/web/search?workspace=team&project=app&q=Verificationneedle','[data-hit-path]');
+      const href=await cdp.evaluate(`document.querySelector('[data-hit-path="concepts/evidence.md"] a').href`);assert.equal(new URL(href).searchParams.get('recall_q'),'Verificationneedle');
+      await cdp.goto(href,'.knowledge-evidence');assert(await cdp.evaluate('document.querySelector(".knowledge-evidence").textContent.includes("Session '+sid+'")'));
+      await cdp.evaluate('document.querySelector(".knowledge-evidence a.secondary-button").click()');await until(()=>cdp.evaluate('!!document.querySelector("[data-page-recall-trace]")'),'Page did not recompute its actual recall trace');
+      assert(await cdp.evaluate('document.querySelector(".knowledge-evidence").textContent.includes("Recomputed now")'));
+      for(const width of [320,390]) {await cdp.send('Emulation.setDeviceMetricsOverride',{width,height:960,deviceScaleFactor:1,mobile:true});assert(await cdp.evaluate('document.documentElement.scrollWidth<=innerWidth'),'Knowledge evidence overflows the viewport');}
+      await cdp.send('Emulation.setDeviceMetricsOverride',{width:1440,height:1100,deviceScaleFactor:1,mobile:false});
+    },
     async themes() {
       await cdp.goto(project, '#project-panel-overview');
       await cdp.send('Emulation.setEmulatedMedia', {features: [{name: 'prefers-color-scheme', value: 'light'}]});

@@ -7,6 +7,17 @@ Configuration examples belong in `<data_dir>/config.toml` unless a section names
 
 ## Start here
 
+The web version of this guide includes **Effective installation state and next
+steps**, evaluated for the current caller. The authenticated
+`GET /api/v1/docs/features/status` endpoint exposes the same safe facts. Settings
+come from the server's startup snapshot, while permissions are checked on every
+request. Restart after changing server configuration. A configured provider can
+still be unhealthy; use Health to diagnose it. Remote hooks, client versions,
+marker files and browser preferences cannot be verified by the server. Missing
+host wiring reads **Not reported**, and administrator settings read
+**Restricted** without the required capability. Markdown remains a build-matched
+reference rather than a live configuration dump.
+
 The built-in dashboard and this documentation need the web surface enabled:
 
 ```bash
@@ -52,6 +63,26 @@ registered sessions and captured-event counts should grow. If they do not, use
 [diagnostics](diagnostics.md) and check the client executable, URL and credentials.
 
 ## Token accounting and investigation
+
+The Token usage form filters the entire authorized response ledger on the
+server before selecting a 50-row page. UTC From is inclusive and Until is
+exclusive; date-only URLs use midnight UTC. Model and tool names match exactly;
+harness, session and native turn filters intersect the current project/session
+and ownership boundaries. Pagination and reload preserve every filter. The
+matching-token total covers the filtered ledger; summary cards retain the
+whole authorized scope for comparison. Response time is used when reported;
+older rows fall back to capture time.
+
+Open **Turn & tools** on a response for the native response ID, turn, timestamp
+basis, session and bounded tool references. Links narrow the ledger to the turn
+or tool. Claude tool requests/results use explicit IDs; Codex tool names are
+marked as same-turn associations. Association does not apportion token costs to
+a tool or establish causation. Arguments, outputs and prompts are excluded.
+Update the native binary on each agent machine to capture this metadata;
+updating the server container alone cannot update remote clients. Existing rows
+remain unknown unless a native client replays their original transcript.
+The extractor follows the [Claude tool-call schema](https://platform.claude.com/docs/en/agents-and-tools/tool-use/handle-tool-calls)
+and [Codex session usage records](https://github.com/openai/codex/blob/main/codex-rs/core/src/state/session.rs).
 
 **Purpose:** inspect usage for individual model responses and totals per session
 and agent type. **Enable:** update the native Claude Code or Codex client and
@@ -155,6 +186,22 @@ recorded state; it does not infer live process state from prompt text.
 See [managed workstreams](managed-workstreams.md).
 
 ## Recall, project routing and memory pages
+
+Each consulted page includes **Knowledge evidence and validity** for its indexed
+version. Readable source sessions link to their timelines; observation citations
+identify the observation within that source. Source scope and session ownership
+are checked separately from shared page access. Opaque feedback/rewrite IDs
+have no invented source links. Missing citations mean unknown, not unsupported;
+expired pages remain available through an explicit URL but leave normal
+retrieval. Declared contradictions include only live, readable far ends and do
+not decide which statement is correct. Evidence pages contain twenty citations.
+
+Search result links carry the query, filters, result limit and project/global
+mode. **Recompute explanation** runs the same authorized ranker on demand and
+shows stream ranks, RRF contributions, authority and optional reranking beside
+the page. Configured embedding/reranking providers may be contacted. This is a
+new computation, not a historical search snapshot. Cross-project search reports
+its FTS-only stream; a direct page URL has no inferred retrieval reason.
 
 **Default:** lexical retrieval and rule-based summaries work without an LLM.
 Connect MCP, then use the installed retrieval skills and `memory_query`.
@@ -300,6 +347,7 @@ The authenticated JSON endpoints are read-only product references:
 ```text
 GET /api/v1/docs?q=token
 GET /api/v1/docs/features
+GET /api/v1/docs/features/status
 GET /api/v1/docs/changelog?release=Unreleased
 ```
 

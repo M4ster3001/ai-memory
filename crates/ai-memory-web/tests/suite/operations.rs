@@ -986,6 +986,7 @@ async fn operations_agent_totals_and_session_drilldown_do_not_multiply_tokens() 
     let (_tmp, store, wiki, ws, project, sid) = fixture().await;
     let calls: Vec<_> = (0..3)
         .map(|i| TokenCall {
+            context: None,
             call_id: format!("call-{i}"),
             input_tokens: 100,
             output_tokens: 30,
@@ -1157,6 +1158,7 @@ async fn operations_agent_aggregates_and_drilldowns_apply_ownership_before_total
             .upsert_token_calls(
                 sid,
                 vec![TokenCall {
+                    context: None,
                     call_id: sid.to_string(),
                     input_tokens: tokens,
                     output_tokens: 5,
@@ -1233,6 +1235,7 @@ async fn operations_response_search_and_pagination_cover_the_full_project_and_se
     let (_tmp, store, wiki, _, _, sid) = fixture().await;
     let calls = (0..57)
         .map(|n| TokenCall {
+            context: None,
             call_id: format!("response-{n}"),
             input_tokens: if n == 56 { 1 } else { 1000 },
             output_tokens: 1,
@@ -1278,7 +1281,14 @@ async fn operations_response_search_and_pagination_cover_the_full_project_and_se
                 .unwrap();
             assert_eq!(results.contains("unique-tiny-model"), contains);
         }
-        for query in ["?calls_sort=unknown", "?calls_signal=unknown"] {
+        for query in [
+            "?calls_sort=unknown",
+            "?calls_signal=unknown",
+            "?calls_agent=invalid",
+            "?calls_session=not-uuid",
+            "?calls_from=tomorrow",
+            "?calls_from=2026-10-02&calls_until=2026-10-01",
+        ] {
             assert_eq!(
                 app.clone()
                     .oneshot(

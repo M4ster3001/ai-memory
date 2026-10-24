@@ -22,6 +22,9 @@ version in [`docs/changelog/`](docs/changelog/):
 
 
 ### Added
+- Added version-specific knowledge evidence, readable source links, declared contradictions, expiration context and on-page recall recomputation with the original search filters (#721).
+- Added caller-aware installation states and next steps to feature guides and the authenticated `/api/v1/docs/features/status` reference, separating effective settings from unavailable client facts (#721).
+- Added server-side response investigation by UTC period, exact model, harness, session, turn and tool, with complete pagination, filtered token totals and bounded native turn/tool provenance (#722).
 - Added bundled web documentation, searchable feature activation guides, per-release changelogs, and authenticated Markdown/JSON references for agents (#721).
 - Redesigned the responsive dashboard with persistent workspace navigation, searchable project cards, per-agent consumption and coverage, session response drilldowns, and filterable token investigation signals (#721).
 - Added a browser inbox with non-consuming received/sent history and an authorized composer for registered project agents; addressed messages now route to the selected harness through MCP or CLI while existing shared mail remains compatible (#721).

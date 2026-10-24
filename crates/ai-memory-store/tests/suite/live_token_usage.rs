@@ -30,6 +30,7 @@ async fn session(
 
 fn call(input: u64, output: u64) -> TokenCall {
     TokenCall {
+        context: None,
         call_id: "same-native-response-id".into(),
         input_tokens: input,
         output_tokens: output,
@@ -364,4 +365,221 @@ async fn token_call_queries_search_and_order_before_pagination_with_scope_and_ow
     .unwrap();
     assert!(huge.calls.is_empty());
     assert_eq!(huge.matching_calls, 57);
+}
+
+#[tokio::test]
+async fn token_investigation_filters_before_paging_and_keeps_native_context() {
+    use ai_memory_core::{TokenCallContext, TokenToolRef, TokenToolRelation};
+    use ai_memory_store::{TokenCallOrder, TokenCallQuery};
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = store.writer.get_or_create_workspace("team").await.unwrap();
+    let project = store
+        .writer
+        .get_or_create_project(ws, "app", None)
+        .await
+        .unwrap();
+    let foreign_project = store
+        .writer
+        .get_or_create_project(ws, "private", None)
+        .await
+        .unwrap();
+    let sid = session(&store, ws, project, AgentKind::Codex).await;
+    let claude = session(&store, ws, project, AgentKind::ClaudeCode).await;
+    let foreign = session(&store, ws, foreign_project, AgentKind::Codex).await;
+    let make = |n: usize| {
+        let mut c = call(10, 2);
+        c.call_id = format!("response-{n}");
+        c.model = Some("exact-model".into());
+        c.context = Some(TokenCallContext {
+            turn_id: Some("turn-17".into()),
+            response_id: Some(format!("native-{n}")),
+            recorded_at: Some("2026-10-01T12:00:00Z".into()),
+            tools: vec![TokenToolRef {
+                id: "tool-call-1".into(),
+                name: "read_file".into(),
+                relation: TokenToolRelation::Turn,
+                is_error: Some(true),
+            }],
+        });
+        c
+    };
+    store
+        .writer
+        .upsert_token_calls(sid, (0..57).map(make).collect())
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_token_calls(claude, vec![make(100)])
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_token_calls(foreign, vec![make(200)])
+        .await
+        .unwrap();
+    let query = TokenCallQuery {
+        model: Some("exact-model".into()),
+        agent: Some(AgentKind::Codex),
+        session_id: Some(sid),
+        from_us: Some(
+            "2026-10-01T12:00:00Z"
+                .parse::<jiff::Timestamp>()
+                .unwrap()
+                .as_microsecond(),
+        ),
+        until_us: Some(
+            "2026-10-01T12:00:01Z"
+                .parse::<jiff::Timestamp>()
+                .unwrap()
+                .as_microsecond(),
+        ),
+        turn_id: Some("turn-17".into()),
+        tool: Some("read_file".into()),
+        order: TokenCallOrder::Recent,
+        ..Default::default()
+    };
+    let first = store
+        .reader
+        .token_usage_report_page(ws, project, OwnerFilter::Any, None, query.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            first.call_count,
+            first.matching_calls,
+            first.calls.len(),
+            first.matching_tokens
+        ),
+        (58, 57, 50, 57 * 42)
+    );
+    let mut second_query = query.clone();
+    second_query.offset = 50;
+    let second = store
+        .reader
+        .token_usage_report_page(ws, project, OwnerFilter::Any, None, second_query)
+        .await
+        .unwrap();
+    assert_eq!(second.calls.len(), 7);
+    let ids = first
+        .calls
+        .iter()
+        .chain(&second.calls)
+        .map(|c| c.call_id.clone())
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(ids.len(), 57, "Stable complete pagination");
+    assert_eq!(first.calls[0].tools[0].name, "read_file");
+    assert_eq!(first.calls[0].tools[0].is_error, Some(true));
+    assert!(
+        first.calls[0]
+            .response_id
+            .as_ref()
+            .unwrap()
+            .starts_with("native-")
+    );
+    for wrong in 0..8 {
+        let mut q = query.clone();
+        match wrong {
+            0 => q.model = Some("exact".into()),
+            1 => q.agent = Some(AgentKind::Other),
+            2 => q.session_id = Some(foreign),
+            3 => q.from_us = q.until_us,
+            4 => q.until_us = q.from_us,
+            5 => q.turn_id = Some("missing".into()),
+            6 => q.tool = Some("read".into()),
+            _ => q.session_id = Some(claude),
+        };
+        let r = store
+            .reader
+            .token_usage_report_page(ws, project, OwnerFilter::Any, None, q)
+            .await
+            .unwrap();
+        assert_eq!(r.matching_calls, 0, "filter {wrong}");
+        assert!(r.calls.is_empty());
+    }
+    let intersect = store
+        .reader
+        .token_usage_report_page(ws, project, OwnerFilter::Any, Some(claude), query)
+        .await
+        .unwrap();
+    assert_eq!(
+        intersect.matching_calls, 0,
+        "Explicit session route must intersect the query"
+    );
+    let mut replay = make(0);
+    replay.context = None;
+    store
+        .writer
+        .upsert_token_calls(sid, vec![replay])
+        .await
+        .unwrap();
+    let legacy = store
+        .reader
+        .session_token_usage(ws, project, sid, OwnerFilter::Any)
+        .await
+        .unwrap();
+    assert!(
+        legacy
+            .calls
+            .iter()
+            .all(|c| c.turn_id.as_deref() == Some("turn-17") && c.tools.len() == 1),
+        "Old-client replay must preserve provenance"
+    );
+}
+
+#[tokio::test]
+async fn token_context_rolls_back_with_response_counters_and_aggregates() {
+    use ai_memory_core::{TokenCallContext, TokenToolRef, TokenToolRelation};
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = store.writer.get_or_create_workspace("team").await.unwrap();
+    let project = store
+        .writer
+        .get_or_create_project(ws, "app", None)
+        .await
+        .unwrap();
+    let sid = session(&store, ws, project, AgentKind::Codex).await;
+    store
+        .writer
+        .upsert_token_calls(sid, vec![call(10, 2)])
+        .await
+        .unwrap();
+    let conn = rusqlite::Connection::open(tmp.path().join("db/memory.sqlite")).unwrap();
+    conn.execute_batch("CREATE TRIGGER fail_context BEFORE INSERT ON token_call_tools WHEN NEW.tool_id='reject' BEGIN SELECT RAISE(ABORT,'fixture failure'); END;").unwrap();
+    let mut failure = call(40, 10);
+    failure.call_id = "failed-response".into();
+    failure.context = Some(TokenCallContext {
+        turn_id: Some("failed-turn".into()),
+        tools: vec![TokenToolRef {
+            id: "reject".into(),
+            name: "Read".into(),
+            relation: TokenToolRelation::Requested,
+            is_error: None,
+        }],
+        ..Default::default()
+    });
+    assert!(
+        store
+            .writer
+            .upsert_token_calls(sid, vec![call(100, 20), failure])
+            .await
+            .is_err()
+    );
+    let report = store
+        .reader
+        .session_token_usage(ws, project, sid, OwnerFilter::Any)
+        .await
+        .unwrap();
+    assert_eq!((report.call_count, report.input, report.output), (1, 10, 2));
+    assert!(report.calls[0].turn_id.is_none());
+    assert!(report.calls[0].tools.is_empty());
+    let totals = store
+        .reader
+        .total_session_usage(ws, project, OwnerFilter::Any)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(totals.input_tokens, 10);
+    conn.execute_batch("DROP TRIGGER fail_context;").unwrap();
 }

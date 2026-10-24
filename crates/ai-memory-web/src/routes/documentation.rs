@@ -1,18 +1,21 @@
-//! Authenticated, build-matched product help. No project data is read here.
+//! Authenticated, build-matched help with caller-visible installation states.
 
 use crate::{
     documentation::{self, Document},
     markdown,
     templates::VERSION,
 };
+use crate::{features::FeatureState, state::WebState};
+use ai_memory_core::AuthLevel;
 use askama::Template;
 use axum::{
     Json,
-    extract::{Path, Query},
+    extract::{Path, Query, State},
     http::{StatusCode, header},
     response::{Html, IntoResponse, Response},
 };
 use serde::Deserialize;
+use std::sync::Arc;
 
 #[derive(Default, Deserialize)]
 pub(crate) struct DocsQuery {
@@ -45,13 +48,14 @@ struct DocumentView {
     releases: Vec<ReleaseOption>,
     selected_release: String,
     sidebar: &'static [Document],
+    features: Vec<FeatureState>,
 }
 
 fn response(body: impl IntoResponse) -> Response {
     let mut response = body.into_response();
     response.headers_mut().insert(
         header::CACHE_CONTROL,
-        header::HeaderValue::from_static("private, no-cache"),
+        header::HeaderValue::from_static("private, no-store"),
     );
     response
 }
@@ -114,7 +118,12 @@ fn selected<'a>(
     Ok((body, id.into(), options))
 }
 
-pub(crate) async fn page(Path(slug): Path<String>, Query(query): Query<DocsQuery>) -> Response {
+pub(crate) async fn page(
+    State(state): State<Arc<WebState>>,
+    auth: Option<axum::Extension<AuthLevel>>,
+    Path(slug): Path<String>,
+    Query(query): Query<DocsQuery>,
+) -> Response {
     let raw = slug.ends_with(".md");
     let Some(doc) = documentation::find(slug.strip_suffix(".md").unwrap_or(&slug)) else {
         return StatusCode::NOT_FOUND.into_response();
@@ -141,7 +150,23 @@ pub(crate) async fn page(Path(slug): Path<String>, Query(query): Query<DocsQuery
     let rendered = markdown::render_reference_document(body, |url| {
         documentation::link(doc, &current_href, url)
     });
+    let features = match crate::features::states(&state, auth.map(|v| v.0)).await {
+        Ok(rows) => rows,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let features = features
+        .into_iter()
+        .filter(|f| {
+            doc.id == "features"
+                || (doc.id != "changelog"
+                    && !doc.id.starts_with("changelog")
+                    && ["install", "usage", "cookbook", "messaging", "architecture"]
+                        .contains(&doc.id)
+                    && ["capture", "tokens", "inbox", "external-clients"].contains(&f.id))
+        })
+        .collect();
     let view = DocumentView {
+        features,
         doc,
         html: rendered.html,
         outline: rendered.outline,
@@ -177,4 +202,23 @@ pub(crate) async fn api_page(Path(slug): Path<String>, Query(query): Query<DocsQ
     response(Json(
         serde_json::json!({"version":VERSION,"document":doc,"markdown":body,"release":release,"releases":options.into_iter().map(|r|r.id).collect::<Vec<_>>()}),
     ))
+}
+
+/// Safe facts only; authorization is recalculated on every request.
+pub(crate) async fn api_status(
+    State(state): State<Arc<WebState>>,
+    auth: Option<axum::Extension<AuthLevel>>,
+) -> Response {
+    match crate::features::states(&state, auth.map(|v| v.0)).await {
+        Ok(features) => {
+            let mut r =
+                Json(serde_json::json!({"version":VERSION,"features":features})).into_response();
+            r.headers_mut().insert(
+                header::CACHE_CONTROL,
+                header::HeaderValue::from_static("private, no-store"),
+            );
+            r
+        }
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
 }

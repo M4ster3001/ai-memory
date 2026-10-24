@@ -44,6 +44,23 @@ Logs and originals are kept under `target/dashboard-core-mutations-*`.
 
 ## Behaviors protected
 
+Six deliberate faults in source scope, source ownership, contradiction visibility,
+admin-setting disclosure, exact model filtering and UTC lower bounds were
+confirmed to fail their intended assertions; compiler errors do not count.
+Reproduce them with the corresponding cases in
+`scripts/check-dashboard-core-mutations.py`.
+
+The contextual investigation additions are covered by browser cases
+`contextual-investigation`, `feature-states` and `knowledge-evidence` against the
+real Rust server. They check combined server filters beyond fifty responses,
+reload, empty results, native association labels, effective zero-LLM states,
+source navigation, on-page recall and mobile overflow. Rust regressions in
+`contextual.rs`, `live_token_usage.rs`, `session_usage.rs` and the hooks router
+also exercise foreign source IDs, private contradictions, source ownership,
+root controls, redacted admin settings, transaction rollback, native cursor
+continuity, malformed gaps and sanitization before truncation. Historical
+unknown data is a required outcome, not replaced by guessed coordinates.
+
 | Behavior | Automated regression guard |
 | --- | --- |
 | Only the selected tab is visible/accessibility-exposed; keyboard, history, reload and old section links work | `web_dashboard_browser.mjs`: `tabs`; Rust `operations_project_tabs_have_one_default_panel_and_matching_controls` |

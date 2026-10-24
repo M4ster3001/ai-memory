@@ -27,6 +27,8 @@ mod migrations;
 mod ops;
 pub mod password;
 mod profile;
+mod provenance;
+pub use provenance::{PageDisagreement, PageProvenance, PageSource};
 mod project_authz;
 mod project_coordinates;
 mod reader;

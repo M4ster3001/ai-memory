@@ -4828,13 +4828,15 @@ async fn process_authorized(
             .filter_map(|value| {
                 let mut call: ai_memory_core::TokenCall =
                     serde_json::from_value(value.clone()).ok()?;
-                if call.call_id.is_empty()
-                    || call.call_id.len() > 128
-                    || !call.call_id.bytes().all(|b| {
-                        b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b':' | b'.')
-                    })
-                    || state.sanitizer.scrub(&call.call_id) != call.call_id
-                {
+                let safe_id = |id: &str| {
+                    !id.is_empty()
+                        && id.len() <= 128
+                        && id.bytes().all(|b| {
+                            b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b':' | b'.')
+                        })
+                        && state.sanitizer.scrub(id) == id
+                };
+                if !safe_id(&call.call_id) {
                     return None;
                 }
                 call.model = call.model.map(|m| {
@@ -4845,6 +4847,28 @@ async fn process_authorized(
                         .take(64)
                         .collect::<String>()
                 });
+                if let Some(context) = call.context.as_mut() {
+                    context.turn_id = context.turn_id.take().filter(|id| safe_id(id));
+                    context.response_id = context.response_id.take().filter(|id| safe_id(id));
+                    context.recorded_at = context
+                        .recorded_at
+                        .take()
+                        .and_then(|s| s.parse::<jiff::Timestamp>().ok())
+                        .map(|t| t.to_string());
+                    context.tools.truncate(16);
+                    context.tools.retain_mut(|tool| {
+                        if !safe_id(&tool.id) {
+                            return false;
+                        }
+                        tool.name = state
+                            .sanitizer
+                            .scrub(tool.name.trim())
+                            .chars()
+                            .take(64)
+                            .collect();
+                        !tool.name.is_empty()
+                    });
+                }
                 Some(call)
             })
             .collect();
@@ -23572,7 +23596,11 @@ pub(crate) mod tests {
         .unwrap();
         let call = |id: &str, model: String, input: u64| {
             serde_json::json!({
-                "call_id":id,"model":model,"input_tokens":input,"output_tokens":10,"cache_read_tokens":0,"cache_write_tokens":0
+                "call_id":id,"model":model,"input_tokens":input,"output_tokens":10,"cache_read_tokens":0,"cache_write_tokens":0,
+                "context":{"turn_id":"SENSITIVE_FIXTURE","response_id":"invalid id","recorded_at":"invalid timestamp","tools":[
+                    {"id":"SENSITIVE_FIXTURE","name":"private","relation":"turn"},
+                    {"id":"tool-safe","name":format!("{}SENSITIVE_FIXTURE","t".repeat(60)),"relation":"requested","is_error":true}
+                ]}
             })
         };
         let envelope = HookEnvelope::from_query_and_body(
@@ -23623,6 +23651,24 @@ pub(crate) mod tests {
             public.model, "fixture-public",
             "Public labels remain readable"
         );
+        assert!(
+            public.turn_id.is_none()
+                && public.response_id.is_none()
+                && public.response_at.is_none()
+        );
+        assert_eq!(
+            public.tools.len(),
+            1,
+            "Private tool identities must be refused"
+        );
+        assert_eq!(public.tools[0].id, "tool-safe");
+        assert_eq!(public.tools[0].is_error, Some(true));
+        assert!(public.tools[0].name.starts_with(&"t".repeat(60)));
+        assert!(
+            !public.tools[0].name.contains("SENS"),
+            "Scrub the complete label before bounding it"
+        );
+        assert!(public.tools[0].name.chars().count() <= 64);
     }
 
     #[tokio::test]

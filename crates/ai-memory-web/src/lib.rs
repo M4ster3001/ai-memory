@@ -45,8 +45,10 @@ use axum::Router;
 
 mod diff;
 mod documentation;
+pub mod features;
 pub mod health;
 mod html_auth;
+mod knowledge;
 #[cfg(feature = "management-ui")]
 pub mod management;
 mod markdown;

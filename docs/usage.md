@@ -909,6 +909,15 @@ prose.
 
 ## Investigate token usage in the dashboard
 
+Use UTC From/Until (inclusive/exclusive), exact model, harness and session
+filters to narrow the complete authorized ledger before pagination. Turn and
+tool filters connect a response to reported native context. **Turn & tools**
+distinguishes a requested tool, an input result and a same-turn association;
+shared context does not prove token cost attributable to one tool. Update native
+clients as well as the server to collect these fields. Old rows with no source
+metadata remain unknown. The [feature guide](features.md#token-accounting-and-investigation)
+explains timestamp fallbacks, filtered totals and capture prerequisites.
+
 Open a project under `/web` and select the **Token usage** tab. Updated native Claude Code
 and Codex hooks send measured response usage on `post-tool-use`, `stop`,
 `pre-compact` and `session-end`. A session can stay open: usage is stored as it
@@ -936,8 +945,10 @@ checkpoint content restarts the scan. Update the native binary on each agent
 machine: updating only the server does not change transcript capture. Reports
 appear after the agent writes usage; missing/deleted records and unsupported
 formats remain unknown.
-Only token counters, response identities and model names are retained in this
-ledger. Response model labels are sanitized before their length limit is applied.
+The ledger retains counters, response/model identifiers and bounded native turn,
+response-time and tool references when reported. It excludes prompts, tool
+arguments and outputs. Model/tool labels are sanitized before their length limit
+is applied; private or malformed context identifiers are refused.
 Project authorization and session-owner filters apply before ranking or
 aggregation. Existing session-end totals remain as a historical fallback.
 

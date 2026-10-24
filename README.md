@@ -629,7 +629,10 @@ readable wiki pages; the next session starts with a handoff.
   for capture coverage, cache accounting and investigation signals. Drill down
   from a project to an agent, its sessions and individual responses. The web
   [agent inbox](docs/agent-messaging.md#in-the-web-ui) lets an operator queue
-  requests for registered agents and inspect received/sent history.
+  requests for registered agents and inspect received/sent history. Token filters
+  run on the full authorized ledger, with native turn/tool context when reported.
+  Consulted pages expose sources, declared contradictions and recall explanations;
+  the [feature guide](docs/features.md) shows effective installation states in the web UI.
 - Back up host-side harness configuration with
   `ai-memory backup-agents -o agent-assets.tar.gz`; inspect a restore with
   `ai-memory restore-agents -i agent-assets.tar.gz`, then add `--apply` only

@@ -43,6 +43,7 @@ async fn dashboard_hook_counters_follow_the_upstream_admin_gate() {
             base_path: "",
             trusted_proxy_identity: true,
             recall: ai_memory_web::Recall::default(),
+            runtime: None,
             health: None,
         },
     )
@@ -3885,6 +3886,7 @@ async fn project_view_ranks_live_token_responses_and_flags_large_usage() {
         .unwrap();
     let calls: Vec<_> = (0..5)
         .map(|i| ai_memory_core::TokenCall {
+            context: None,
             call_id: format!("response-{i}"),
             input_tokens: if i == 4 { 150_000 } else { 100 },
             output_tokens: 20,
