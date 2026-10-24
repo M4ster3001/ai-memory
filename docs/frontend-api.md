@@ -995,3 +995,23 @@ harness. It requires write access to the source and destination, a JSON body,
 the UI header and the normal browser-session CSRF checks. It does not mutate
 wiki pages, pop messages or run an agent. See
 [agent messaging](agent-messaging.md#in-the-web-ui).
+
+## Bundled documentation for agents
+
+The documentation catalog is at `GET /api/v1/docs?q=token`. Each entry has an
+`id`, title, description, category and repository `source` path.
+`GET /api/v1/docs/{id}` returns that metadata plus `markdown`, the binary's
+package `version`, a selected `release` and the available `releases`. These are
+read-only product guides, independent of project scopes and database content.
+They use the same authentication as the other API routes. Search is limited to
+200 characters, and unknown document ids and releases return 404.
+
+The browser uses `/web/docs` and `/web/docs/{id}`. A `.md` suffix returns
+`text/markdown` instead of HTML. The changelog defaults to Unreleased, and
+archived series default to their first release. Use `?release=3.2.2` for one
+release or `?release=all` for a whole series. The guides and changelog files are
+compiled into the binary, including source-built Docker images, so no internet
+connection or running LLM is needed. Repository links outside the curated
+catalog open on GitHub. These pages describe shipped capabilities and do not
+expose the running server's configuration or credentials. Apply your configured
+base path and web slug to these examples.

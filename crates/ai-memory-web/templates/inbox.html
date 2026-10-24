@@ -15,8 +15,11 @@
     <div class="composer-heading"><span class="compose-icon" aria-hidden="true">↗</span><div><p class="eyebrow">DIRECT TO AN AGENT</p><h2 id="compose-title">New message</h2></div></div>
     <form id="message-composer" action="messages" method="post">
       <label class="field-label" for="message-from">From project</label><select id="message-from" class="field-input" required>{% for scope in scopes %}<option data-workspace="{{ scope.workspace }}" data-project="{{ scope.project }}" {% if scope.selected %}selected{% endif %}>{{ scope.workspace }} / {{ scope.project }}</option>{% endfor %}</select>
-      <label class="field-label" for="message-to">To agent</label><select id="message-to" class="field-input" required {% if !can_send %}disabled{% endif %}><option value="">Select a registered agent…</option>{% for recipient in recipients %}<option value="{{ loop.index }}" data-workspace="{{ recipient.workspace }}" data-project="{{ recipient.project }}" data-agent="{{ recipient.agent }}" {% if recipient.selected %}selected{% endif %}>{{ recipient.label }}</option>{% endfor %}</select>
-      <p class="field-hint">Agents appear after their first captured session in a project.</p>
+      <label class="field-label" for="message-to-project">To project</label><select id="message-to-project" class="field-input" required>{% for scope in scopes %}<option data-workspace="{{ scope.workspace }}" data-project="{{ scope.project }}" {% if scope.selected %}selected{% endif %}>{{ scope.workspace }} / {{ scope.project }}</option>{% endfor %}</select>
+      <p class="field-hint">Defaults to the source project. Choose another project for a cross-project message.</p>
+      <label class="field-label" for="message-to">To agent</label><select id="message-to" class="field-input" aria-describedby="message-agent-hint" required {% if !can_send %}disabled{% endif %}><option value="">{% if can_send %}Select a registered agent…{% else %}No registered agents in this project{% endif %}</option>{% for recipient in recipients %}{% if recipient.workspace == workspace && recipient.project == project %}<option value="{{ loop.index }}" data-workspace="{{ recipient.workspace }}" data-project="{{ recipient.project }}" data-agent="{{ recipient.agent }}" {% if recipient.selected %}selected{% endif %}>{{ recipient.label }}</option>{% endif %}{% endfor %}</select>
+      <template id="message-agent-options">{% for recipient in recipients %}<option value="{{ loop.index }}" data-workspace="{{ recipient.workspace }}" data-project="{{ recipient.project }}" data-agent="{{ recipient.agent }}">{{ recipient.label }}</option>{% endfor %}</template>
+      <p id="message-agent-hint" class="field-hint" role="status" aria-live="polite">{% if can_send %}Only agents registered in the destination project are shown.{% else %}No agents registered in this project yet. Capture a session or choose another destination project.{% endif %}</p>
       {% if needs_write_token %}<div class="delivery-note"><p>Your current browser sign-in permits reading. To send this message, re-enter a token with write access. The token is cleared after this request and is never saved.</p></div><label class="field-label" for="message-access-token">Write access token</label><input id="message-access-token" type="password" class="field-input" autocomplete="off" spellcheck="false" required placeholder="Used only for this message">{% endif %}
       <label class="field-label" for="message-subject">Subject <span>optional</span></label><input id="message-subject" class="field-input" maxlength="200" placeholder="What needs to happen?">
       <label class="field-label" for="message-body">Message</label><textarea id="message-body" class="field-input" rows="7" maxlength="8000" required placeholder="Describe the request, relevant context, and what a successful result looks like."></textarea>
@@ -30,15 +33,28 @@
 <script>
 (function(){
   var project=document.getElementById("mail-project"),form=document.getElementById("message-composer"),body=document.getElementById("message-body"),result=document.getElementById("message-result");
+  var fromProject=document.getElementById("message-from"),toProject=document.getElementById("message-to-project"),toAgent=document.getElementById("message-to"),button=form.querySelector('button[type="submit"]'),sending=false;
+  var agents=document.getElementById("message-agent-options").content.querySelectorAll("option"),agentHint=document.getElementById("message-agent-hint");
+  function updateSendButton(){button.disabled=sending||!toAgent.querySelector("option[data-agent]");}
+  function filterAgents(){
+    var scope=toProject.selectedOptions[0],placeholder=document.createElement("option");placeholder.value="";toAgent.replaceChildren(placeholder);
+    agents.forEach(function(option){if(scope&&option.dataset.workspace===scope.dataset.workspace&&option.dataset.project===scope.dataset.project)toAgent.appendChild(option.cloneNode(true));});
+    var available=toAgent.options.length>1;toAgent.disabled=!available;toAgent.value="";
+    placeholder.textContent=available?"Select a registered agent…":"No registered agents in this project";
+    agentHint.textContent=available?"Only agents registered in the destination project are shown.":"No agents registered in this project yet. Capture a session or choose another destination project.";
+    updateSendButton();
+  }
+  fromProject.addEventListener("change",function(){toProject.selectedIndex=fromProject.selectedIndex;filterAgents();});
+  toProject.addEventListener("change",filterAgents);
   document.getElementById("compose-shortcut").href=location.href.split("#")[0]+"#compose";
   project.addEventListener("change",function(){var o=project.selectedOptions[0],url=new URL("inbox",document.baseURI);url.searchParams.set("workspace",o.dataset.workspace);url.searchParams.set("project",o.dataset.project);location.assign(url.href);});
   body.addEventListener("input",function(){document.getElementById("message-count").textContent=Array.from(body.value).length+" / 8,000";});
   form.addEventListener("submit",async function(event){
     event.preventDefault();if(!form.reportValidity())return;
-    var button=form.querySelector('button[type="submit"]');if(button.disabled)return;
-    var from=document.getElementById("message-from").selectedOptions[0],to=document.getElementById("message-to").selectedOptions[0];
-    if(!from||!to||!to.dataset.agent)return;
-    button.disabled=true;result.textContent="Queuing message…";result.className="";
+    if(button.disabled)return;
+    var from=fromProject.selectedOptions[0],destination=toProject.selectedOptions[0],to=toAgent.selectedOptions[0];
+    if(!from||!destination||!to||!to.dataset.agent||to.dataset.workspace!==destination.dataset.workspace||to.dataset.project!==destination.dataset.project)return;
+    sending=true;updateSendButton();result.textContent="Queuing message…";result.className="";
     {% include "_js_cookie.html" %}
     var token=document.getElementById("message-access-token"),headers={"Content-Type":"application/json","X-Ai-Memory-UI":"1","X-CSRF-Token":decodeURIComponent(cookie("ai_memory_csrf")||"")};
     if(token)headers.Authorization="Bearer "+token.value.trim();
@@ -50,7 +66,7 @@
       result.className="send-success";result.textContent="Message queued for "+to.dataset.agent+". Reference: "+data.message_id;body.value="";document.getElementById("message-subject").value="";document.getElementById("message-count").textContent="0 / 8,000";
       var link=document.createElement("a"),url=new URL("inbox",document.baseURI);url.searchParams.set("workspace",from.dataset.workspace);url.searchParams.set("project",from.dataset.project);url.searchParams.set("box","outbox");link.href=url.href;link.textContent="View sent messages →";result.appendChild(document.createTextNode(" "));result.appendChild(link);
     }catch(error){result.className="send-error";result.textContent=error.name==="AbortError"?"Delivery is unconfirmed. Check Sent before trying again to avoid a duplicate.":(error.message||"Delivery is unconfirmed. Check Sent before trying again.");}
-    finally{clearTimeout(timeout);if(token)token.value="";button.disabled=false;result.focus();}
+    finally{clearTimeout(timeout);if(token)token.value="";sending=false;updateSendButton();result.focus();}
   });
 })();
 </script>
