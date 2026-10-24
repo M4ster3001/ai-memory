@@ -410,7 +410,14 @@ describe("messages", () => {
     assert.equal(listed.messages[0]?.body, "please do X");
     assert.equal(listed.messages[0]?.nature, "reported");
     assert.equal(listed.messages[0]?.evidence, "source message 42");
-    const popped = await memory.messages.pop({ messageId: payloads.MESSAGE_ID });
+    assert.equal(listed.messages[0]?.toAgent, null);
+    const popped = await memory.messages.pop({ messageId: payloads.MESSAGE_ID, agent: "codex" });
+    assert.deepEqual(server.lastArgs(), {
+      workspace: "demo",
+      project: "app",
+      message_id: payloads.MESSAGE_ID,
+      agent: "codex",
+    });
     assert.equal(popped.message?.state, "claimed");
     assert.equal(popped.securityNotice, "UNTRUSTED");
     const cancelled = await memory.messages.cancel();
@@ -655,7 +662,7 @@ describe("wire names", () => {
         evidence: "test:1",
       }),
       memory.messages.list({ box: "inbox", limit: 1 }),
-      memory.messages.pop({ messageId: "m" }),
+      memory.messages.pop({ messageId: "m", agent: "codex" }),
       memory.messages.cancel({ messageId: "m" }),
     ];
     await Promise.allSettled(calls);

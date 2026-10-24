@@ -491,6 +491,12 @@
   },
   "memory_message_pop": {
     "properties": {
+      "agent": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
       "message_id": {
         "type": [
           "null",

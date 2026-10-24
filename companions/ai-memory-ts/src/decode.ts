@@ -301,6 +301,7 @@ export function message(value: unknown, where: string): Message {
     createdAt: optStr(o, "created_at", where),
     claimedAt: nullableStr(o, "claimed_at", where),
     fromAgent: optStr(o, "from_agent", where),
+    toAgent: nullableStr(o, "to_agent", where),
     fromOwner: nullableStr(o, "from_owner_user", where),
     raw: o,
   };

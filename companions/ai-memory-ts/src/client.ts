@@ -620,9 +620,10 @@ export class MessagesNamespace {
     const a = argsObject(args, where);
     const scope = this.#core.scope(a.scope, where);
     if (a.messageId !== undefined) requireText(a.messageId, "messageId", where);
+    if (a.agent !== undefined) requireText(a.agent, "agent", where);
     const decoded = await this.#core.invoke(
       "memory_message_pop",
-      wire({ ...scopeWire(scope), message_id: a.messageId }),
+      wire({ ...scopeWire(scope), message_id: a.messageId, agent: a.agent }),
       true,
       options,
     );

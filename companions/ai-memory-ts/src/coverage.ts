@@ -149,7 +149,7 @@ export const TOOL_COVERAGE: Readonly<Record<string, ToolClassification>> = {
     status: "wrapped",
     methods: ["messages.pop"],
     phase: 2,
-    sends: [...SCOPE, "message_id"],
+    sends: [...SCOPE, "message_id", "agent"],
   },
   memory_message_cancel: {
     status: "wrapped",
