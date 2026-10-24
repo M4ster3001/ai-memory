@@ -21,6 +21,9 @@ pub struct WebState {
     pub reader: ReaderPool,
     /// Wiki handle — reads page bodies from disk.
     pub wiki: Wiki,
+    /// Process-lifetime, content-free hook-ingestion counters. `None` keeps
+    /// standalone embedders and tests backward-compatible.
+    pub ingest_metrics: Option<Arc<ai_memory_core::IngestMetrics>>,
     /// A trusted identity proxy asserts usernames, so the deployment tells
     /// operators apart even with no `users` rows. Root-only pages pass it to
     /// `ReaderPool::distinguishes_operators`, as the `/admin` gate does.
@@ -40,10 +43,18 @@ impl WebState {
         Self {
             reader,
             wiki,
+            ingest_metrics: None,
             trusted_proxy_identity: false,
             recall: Recall::default(),
             health: None,
         }
+    }
+
+    /// Attach the server's shared hook-health counters to a web surface.
+    #[must_use]
+    pub fn with_ingest_metrics(mut self, metrics: Arc<ai_memory_core::IngestMetrics>) -> Self {
+        self.ingest_metrics = Some(metrics);
+        self
     }
 
     /// Record whether a trusted identity proxy is configured.

@@ -30,7 +30,7 @@ use ai_memory_store::{
 };
 use ai_memory_web::{
     HtmlAuthRedirectConfig, WebMountSpec, html_auth_redirect_mw, normalize_prefix,
-    split_web_routers, web_base_href,
+    split_web_routers_with_metrics, web_base_href,
 };
 use ai_memory_wiki::{WatcherHandle, Wiki, WikiError, WikiResult, migrations, run_wiki_migrations};
 use anyhow::{Context, Result};
@@ -1875,10 +1875,11 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 );
             }
             let base_href = web_base_href(&args.base_path, &args.web_slug);
-            let web = split_web_routers(
+            let web = split_web_routers_with_metrics(
                 args.enable_web,
                 store.reader.clone(),
                 wiki.clone(),
+                Some(ingest_metrics.clone()),
                 WebMountSpec {
                     enable_api: args.enable_api,
                     web_ui_dir: args.web_ui_dir.as_deref(),
@@ -2258,6 +2259,7 @@ async fn start_maintenance_scheduler(
                             expired = outcome.expired,
                             hard_deleted = outcome.hard_deleted,
                             observations_pruned = outcome.observations_pruned,
+                            abandoned_sessions_closed = outcome.abandoned_sessions_closed,
                             ledgers_pruned = outcome.ledgers_pruned,
                             ledger_bytes_pruned = outcome.ledger_bytes_pruned,
                             ledgers_undeleted = outcome.ledgers_undeleted,
@@ -2737,6 +2739,15 @@ async fn run_dream_scheduler_loop(
     }
 }
 
+/// How long a session may sit open with no activity before the scheduled
+/// sweep closes it (safety net) — deliberately much more
+/// conservative than the `SessionStart`-triggered backfill-close's 15
+/// minutes (`ai_memory_hooks::router::BACKFILL_CLOSE_MIN_IDLE`), since this
+/// path has no positive "someone is continuing the work" signal at all; it
+/// is a blind time-based guess and must essentially never fire on a
+/// genuinely slow-but-alive session.
+const ABANDONED_SESSION_CUTOFF: std::time::Duration = std::time::Duration::from_secs(48 * 60 * 60);
+
 #[derive(Debug, Default)]
 struct ScheduledSweepTickOutcome {
     scopes: usize,
@@ -2750,6 +2761,9 @@ struct ScheduledSweepTickOutcome {
     ledger_bytes_pruned: u64,
     ledgers_undeleted: usize,
     errors: usize,
+    /// Sessions closed by the abandoned-session safety net (no usage, no
+    /// consolidation — see `ai_memory_store::ops::close_abandoned_sessions`).
+    abandoned_sessions_closed: u64,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2811,6 +2825,16 @@ async fn run_scheduled_sweep_tick(
                     "scheduled forget sweep failed for scope"
                 );
             }
+        }
+    }
+
+    let cutoff_us = jiff::Timestamp::now().as_microsecond()
+        - i64::try_from(ABANDONED_SESSION_CUTOFF.as_micros()).unwrap_or(i64::MAX);
+    match writer.close_abandoned_sessions(cutoff_us).await {
+        Ok(closed) => outcome.abandoned_sessions_closed = closed,
+        Err(e) => {
+            outcome.errors += 1;
+            tracing::warn!(error = %e, "scheduled abandoned-session close failed");
         }
     }
 
@@ -3693,6 +3717,7 @@ mod tests {
         Sanitized, Sanitizer, SessionId, Tier,
     };
     use ai_memory_llm::{ChatRequest, ChatResponse, LlmError, LlmResult, SyntheticEmbedder};
+    use ai_memory_web::split_web_routers;
     use ai_memory_wiki::WritePageRequest;
     use axum::http::Request;
     use secrecy::SecretString;

@@ -3,7 +3,10 @@
 //! Spins up a `Store` + `Wiki` in a tempdir, seeds two pages, builds
 //! the router, and exercises each route via `tower::ServiceExt::oneshot`.
 
-use ai_memory_core::{AgentKind, NewHandoff, NewPage, PagePath, Tier};
+use ai_memory_core::{
+    AgentKind, NewHandoff, NewPage, NewSession, NewSessionUsage, PageEvidence, PageEvidenceKind,
+    PagePath, SessionId, Tier,
+};
 use ai_memory_store::Store;
 use ai_memory_web::{api_router, router};
 use ai_memory_wiki::{Wiki, WritePageRequest};
@@ -18,6 +21,55 @@ async fn setup() -> (TempDir, Store, Wiki) {
     let store = Store::open(tmp.path()).unwrap();
     let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
     (tmp, store, wiki)
+}
+
+#[tokio::test]
+async fn dashboard_hook_counters_follow_the_upstream_admin_gate() {
+    use ai_memory_core::AuthLevel;
+    use ai_memory_web::{WebMountSpec, split_web_routers_with_metrics};
+
+    let (_tmp, store, wiki) = setup().await;
+    let split = split_web_routers_with_metrics(
+        true,
+        store.reader.clone(),
+        wiki,
+        Some(std::sync::Arc::new(ai_memory_core::IngestMetrics::default())),
+        WebMountSpec {
+            enable_api: false,
+            web_ui_dir: None,
+            cors_origins: &[],
+            web_slug: "",
+            base_href: "/",
+            base_path: "",
+            trusted_proxy_identity: true,
+            recall: ai_memory_web::Recall::default(),
+            health: None,
+        },
+    )
+    .unwrap();
+    for level in [AuthLevel::Root, AuthLevel::User, AuthLevel::Anonymous] {
+        let response = split
+            .protected
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .extension(level)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert_eq!(
+            text.contains("Hook capture health"),
+            level == AuthLevel::Root
+        );
+    }
 }
 
 fn new_page(
@@ -145,6 +197,9 @@ async fn smoke_project_page_returns_200() {
         text.contains("Bar Note"),
         "expected page title in project response"
     );
+    assert!(text.contains("Project capture summary"));
+    assert!(text.contains("Captured events"));
+    assert!(text.contains("Compiled pages"));
 }
 
 #[tokio::test]
@@ -895,6 +950,10 @@ async fn api_projects_returns_project_stats() {
     assert_eq!(json[0]["workspace_name"], "default");
     assert_eq!(json[0]["project_name"], "scratch");
     assert_eq!(json[0]["page_count"], 1);
+    assert_eq!(json[0]["session_count"], 0);
+    assert_eq!(json[0]["observation_count"], 0);
+    assert_eq!(json[0]["open_session_count"], 0);
+    assert!(json[0]["last_activity"].is_string());
 }
 
 #[tokio::test]
@@ -3646,6 +3705,207 @@ async fn project_view_separates_machinery_from_knowledge() {
     assert!(!knowledge.contains("Session abc123"));
 }
 
+/// The project overview shows which agent CLIs produced its memory: a
+/// session-count breakdown in the stats card, and, on each Recent Activity
+/// row, the harness whose session most recently cited that page as
+/// evidence.
+#[tokio::test]
+async fn project_view_shows_agent_attribution() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+
+    let session_id = SessionId::new();
+    store
+        .writer
+        .begin_session(NewSession {
+            occurred_at: None,
+            id: session_id,
+            workspace_id: ws,
+            project_id: proj,
+            agent_kind: AgentKind::ClaudeCode,
+            cwd: None,
+            actor_user: None,
+        })
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_page(NewPage {
+            evidence: vec![PageEvidence {
+                kind: PageEvidenceKind::Session,
+                source_id: session_id.to_string(),
+            }],
+            ..new_page(
+                ws,
+                proj,
+                "concepts/retrieval.md",
+                "Retrieval Concept",
+                "body text",
+            )
+        })
+        .await
+        .unwrap();
+
+    let app = router(store.reader.clone(), wiki.clone());
+    let req = Request::builder()
+        .uri("/w/default/scratch")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = std::str::from_utf8(&body).unwrap();
+
+    assert!(
+        text.contains("Agents:"),
+        "the stats card must show the per-agent session breakdown"
+    );
+    let recent = &text[text.find("Recent Activity").expect("recent heading")..];
+    assert!(
+        recent.contains("Claude Code"),
+        "the page cited by the Claude Code session must carry that badge"
+    );
+}
+
+/// The project overview's Sessions table shows per-session token usage and
+/// duration, and the stats card's "Tokens" metric aggregates the project
+/// total.
+#[tokio::test]
+async fn project_view_shows_session_token_usage() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+
+    let session_id = SessionId::new();
+    store
+        .writer
+        .begin_session(NewSession {
+            occurred_at: None,
+            id: session_id,
+            workspace_id: ws,
+            project_id: proj,
+            agent_kind: AgentKind::Codex,
+            cwd: None,
+            actor_user: None,
+        })
+        .await
+        .unwrap();
+    store.writer.end_session(session_id, None).await.unwrap();
+    store
+        .writer
+        .upsert_session_usage(NewSessionUsage {
+            session_id,
+            input_tokens: 12_345,
+            output_tokens: 6_789,
+            cache_write_tokens: 0,
+            cache_read_tokens: 0,
+            model: Some("gpt-5-codex".into()),
+        })
+        .await
+        .unwrap();
+
+    let app = router(store.reader.clone(), wiki.clone());
+    let req = Request::builder()
+        .uri("/w/default/scratch")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = std::str::from_utf8(&body).unwrap();
+
+    assert!(
+        text.contains("Tokens (in / out)"),
+        "the stats card must show the project-wide tokens metric"
+    );
+    assert!(
+        text.contains("12.3k / 6.8k"),
+        "the stats total must reflect the reported usage"
+    );
+    let sessions = &text[text.find("Sessions</h2>").expect("sessions heading")..];
+    assert!(
+        sessions.contains("Codex"),
+        "the session row must carry the agent badge"
+    );
+    assert!(
+        sessions.contains("12.3k in / 6.8k out"),
+        "the session row must show its own token usage"
+    );
+}
+
+/// A session with no reported usage shows "—", never a zeroed total — the
+/// dashboard must not imply a session cost nothing when it simply never
+/// reported.
+#[tokio::test]
+async fn project_view_session_without_usage_shows_dash_not_zero() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    store
+        .writer
+        .begin_session(NewSession {
+            occurred_at: None,
+            id: SessionId::new(),
+            workspace_id: ws,
+            project_id: proj,
+            agent_kind: AgentKind::OpenCode,
+            cwd: None,
+            actor_user: None,
+        })
+        .await
+        .unwrap();
+
+    let app = router(store.reader.clone(), wiki.clone());
+    let req = Request::builder()
+        .uri("/w/default/scratch")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = std::str::from_utf8(&body).unwrap();
+
+    let sessions = &text[text.find("Sessions</h2>").expect("sessions heading")..];
+    assert!(
+        sessions.contains("—"),
+        "a session with no reported usage must show a dash"
+    );
+    assert!(
+        !sessions.contains("0 in / 0 out"),
+        "must never show a zeroed total for an unreported session"
+    );
+}
+
 #[tokio::test]
 async fn homepage_llm_notice_is_dismissible_and_backup_banner_is_gone() {
     let (_tmp, store, wiki) = setup().await;
@@ -3679,6 +3939,9 @@ async fn homepage_llm_notice_is_dismissible_and_backup_banner_is_gone() {
     assert!(text.contains(r#"id="llm-notice""#));
     assert!(text.contains(r#"id="llm-notice-close""#));
     assert!(text.contains("ai-memory-llm-notice-dismissed"));
+    assert!(text.contains("Memory dashboard"));
+    assert!(text.contains("Captured events"));
+    assert!(text.contains("Open sessions"));
 
     // The old always-on backup banner is gone (the migration dialog
     // carries that information; `status` keeps the durable reminder).
