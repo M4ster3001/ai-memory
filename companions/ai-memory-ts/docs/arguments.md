@@ -175,6 +175,7 @@ Methods: `messages.pop`
 | `workspace` | `workspace` |
 | `project` | `project` |
 | `message_id` | `messageId` |
+| `agent` | `agent` |
 
 ## `memory_message_cancel`
 

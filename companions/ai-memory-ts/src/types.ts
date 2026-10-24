@@ -771,6 +771,8 @@ export interface Message {
   readonly claimedAt: string | null;
   /** The sender's harness label. */
   readonly fromAgent: string | undefined;
+  /** The harness the message is addressed to, or `null` for shared project mail. */
+  readonly toAgent: string | null;
   /** The sending operator key, or `null`. */
   readonly fromOwner: string | null;
   /** The server's decoded JSON. */
@@ -797,6 +799,12 @@ export interface ListMessagesResult {
 export interface PopMessageArgs extends ScopedArgs {
   /** Claim exactly this message. Omit to claim the oldest pending one. */
   messageId?: string;
+  /**
+   * The harness claiming (for example `codex` or `claude-code`), for a
+   * client whose session metadata does not identify it. Mail addressed to a
+   * harness can only be claimed by that harness.
+   */
+  agent?: string;
 }
 
 /** Result of {@link MessagesNamespace.pop}. */
