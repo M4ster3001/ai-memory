@@ -572,6 +572,7 @@ pub(crate) struct RelatedRow {
 #[derive(Template)]
 #[template(path = "page.html")]
 pub(crate) struct PageView {
+    pub knowledge: crate::knowledge::KnowledgeView,
     /// Workspace name.
     pub workspace: String,
     /// Project name.
@@ -1176,6 +1177,24 @@ pub(crate) struct ChangePasswordView {
 }
 /// Metadata-only operational view of measured responses.
 pub(crate) struct TokenUsagePanel {
+    pub model: String,
+    pub session: String,
+    pub from: String,
+    pub until: String,
+    pub turn: String,
+    pub tool: String,
+    pub agents: Vec<UsageAgentOption>,
+    pub matching_tokens: String,
+    pub search: String,
+    pub recent: bool,
+    pub signals_only: bool,
+    pub matching: u64,
+    pub shown_start: u64,
+    pub shown_end: u64,
+    pub previous_href: String,
+    pub next_href: String,
+    pub observation_offset: usize,
+    pub observation_limit: usize,
     pub count: u64,
     pub input: String,
     pub output: String,
@@ -1185,6 +1204,13 @@ pub(crate) struct TokenUsagePanel {
     pub rows: Vec<TokenUsageRow>,
 }
 pub(crate) struct TokenUsageRow {
+    pub turn: String,
+    pub turn_href: String,
+    pub response_native: String,
+    pub session: String,
+    pub recorded_at: String,
+    pub time_basis: &'static str,
+    pub tools: Vec<UsageTool>,
     pub total_value: u64,
     pub observed_at: String,
     pub href: String,
@@ -1197,6 +1223,20 @@ pub(crate) struct TokenUsageRow {
     pub total: String,
     pub when: String,
     pub signal: String,
+}
+
+pub(crate) struct UsageAgentOption {
+    pub value: String,
+    pub label: String,
+    pub selected: bool,
+}
+
+pub(crate) struct UsageTool {
+    pub id: String,
+    pub name: String,
+    pub relation: &'static str,
+    pub is_error: Option<bool>,
+    pub href: String,
 }
 
 #[cfg(test)]

@@ -266,6 +266,31 @@ version in [`docs/changelog/`](docs/changelog/):
   and it disables sending, with an explanation, for a project that has no
   registered agent (#NNN).
 
+- Added server-side response investigation to the project dashboard. Responses
+  can be filtered by UTC period, exact model, harness, session, turn and tool,
+  with complete pagination, filtered token totals and bounded native turn and
+  tool provenance. The context lives in extra `token_calls` columns and a
+  `token_call_tools` table (migration V94). A response from an older hook keeps
+  its provenance unknown instead of guessed. Filters apply after project
+  authorization and the session-owner check and before counting, ranking and
+  pagination (#NNN).
+
+- Added version-specific knowledge evidence to the page and project views:
+  readable source links, declared contradictions, expiration context and an
+  on-page recall recomputation that reuses the original search filters (#NNN).
+
+- Feature guides and the authenticated `/api/v1/docs/features/status`
+  reference now report caller-aware installation states and next steps. They
+  separate effective settings from client facts the server cannot know, and
+  administrative settings are masked for callers without admin rights (#NNN).
+
+- Replaced the static Inbox label with live, access-filtered pending counts and
+  project links throughout the web navigation. Counts are grouped by workspace
+  and project, hide restricted projects, never consume mail, and link to the
+  pending-only mailbox of the project that has mail. Received inboxes open on
+  pending messages, with older queued requests behind collected history, and the
+  composer shows the current project explicitly (#NNN).
+
 ### Changed
 
 - `memory_lint` now reports embedding-band pairs as
@@ -326,6 +351,25 @@ version in [`docs/changelog/`](docs/changelog/):
   never mixes another live session's transcript into a delivered handoff.
   Normal single-use handoffs and managed workstream packets are unchanged
   (#NNN).
+
+- Fixed live response capture after transcript gaps. Bounded batches now resume
+  from durable enqueue checkpoints, including across hook processes and
+  transcript read windows (#NNN).
+
+- Fixed response search, signal filtering and recent ordering so they query all
+  authorized calls before pagination. Response pages are independent, and
+  session detail pages refresh usage live (#NNN).
+
+- Scoped session reads now treat substantive work after an old end as a resumed
+  session, matching the activity feed, without changing persisted lifecycle
+  watermarks. Completed-only listings exclude those resumed sessions (#NNN).
+
+- Token model labels are now sanitized before truncation, so the size limit can
+  no longer expose a prefix of private text (#NNN).
+
+- Selecting a release on the changelog page now loads its notes immediately and
+  keeps the URL, outline and Markdown reference in sync. The form still submits
+  without JavaScript (#NNN).
 
 ## [3.2.8] - 2026-10-27
 

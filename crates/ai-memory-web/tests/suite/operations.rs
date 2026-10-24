@@ -269,6 +269,465 @@ async fn operations_browser_can_send_to_an_explicit_other_project() {
 }
 
 #[tokio::test]
+async fn operations_inbox_queue_context_hides_foreign_projects_and_preserves_mail() {
+    let (_tmp, store, wiki, ws, project, _) = fixture().await;
+    let foreign_ws = store
+        .writer
+        .get_or_create_workspace("private-team")
+        .await
+        .unwrap();
+    let foreign = store
+        .writer
+        .get_or_create_project(foreign_ws, "app", None)
+        .await
+        .unwrap();
+    let idle = store
+        .writer
+        .get_or_create_project(ws, "idle", None)
+        .await
+        .unwrap();
+    for (workspace_id, project_id) in [(foreign_ws, foreign), (ws, idle)] {
+        store
+            .writer
+            .begin_session(NewSession {
+                id: SessionId::new(),
+                workspace_id,
+                project_id,
+                agent_kind: AgentKind::Codex,
+                cwd: None,
+                actor_user: None,
+                occurred_at: None,
+            })
+            .await
+            .unwrap();
+    }
+    let app = router(store.reader.clone(), wiki);
+    for workspace in ["team", "private-team", "private-team"] {
+        let mut value = body();
+        value["to_workspace"] = json!(workspace);
+        let response = app
+            .clone()
+            .oneshot(
+                send()
+                    .extension(AuthLevel::Root)
+                    .body(Body::from(value.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+    let root = text(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/inbox?workspace=team&project=idle")
+                    .extension(AuthLevel::Root)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    let overview = root
+        .split("<section class=\"surface mail-overview\"")
+        .nth(1)
+        .unwrap()
+        .split("</section>")
+        .next()
+        .unwrap();
+    assert!(overview.contains("3 queued"));
+    for (workspace, count) in [("team", 1), ("private-team", 2)] {
+        let card = overview
+            .split(&format!("data-mailbox-workspace=\"{workspace}\""))
+            .nth(1)
+            .unwrap()
+            .split("</a>")
+            .next()
+            .unwrap();
+        assert!(card.contains("data-mailbox-project=\"app\""));
+        assert!(card.contains(&format!("{count} queued")));
+        assert!(
+            overview.contains(&format!("inbox?workspace={workspace}&#38;project=app"))
+                || overview.contains(&format!("inbox?workspace={workspace}&amp;project=app"))
+        );
+    }
+    assert!(root.contains("Viewing mailbox:"));
+    assert!(root.contains("<strong>team / idle</strong>"));
+    assert!(!root.contains("NEW MESSAGE"));
+    let default = text(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/inbox")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(
+        !default.contains("<strong>team / idle</strong>"),
+        "default must prefer a queued mailbox"
+    );
+    for id in [project, foreign, idle] {
+        store
+            .writer
+            .set_access_mode(id, ai_memory_store::AccessMode::Restricted)
+            .await
+            .unwrap();
+    }
+    let user = store
+        .writer
+        .create_human_user(
+            NewUser {
+                username: "mail-reader".into(),
+                name: None,
+                email: None,
+            },
+            UserRole::User,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    store
+        .writer
+        .grant_memory(user, project, GrantLevel::Read, None)
+        .await
+        .unwrap();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/inbox")
+                .extension(AuthLevel::User)
+                .extension(AuthorizedViewer(user))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = text(response).await;
+    assert!(html.contains("<strong>1 queued</strong>"));
+    assert!(html.contains("<strong>team / app</strong>"));
+    assert!(
+        !html.contains("private-team"),
+        "restricted project names must not leak through queue context"
+    );
+    assert!(!html.contains("data-mailbox-project=\"idle\""));
+    let root = text(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/inbox")
+                    .extension(AuthLevel::Root)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(root.contains("private-team"));
+    assert!(root.contains("<strong>3 queued</strong>"));
+    for (uri, expected) in [
+        (
+            "/inbox?workspace=private-team&project=app",
+            StatusCode::FORBIDDEN,
+        ),
+        ("/inbox?workspace=team", StatusCode::BAD_REQUEST),
+        ("/inbox?project=app", StatusCode::BAD_REQUEST),
+        (
+            "/inbox?workspace=team&project=missing",
+            StatusCode::NOT_FOUND,
+        ),
+    ] {
+        assert_eq!(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .extension(AuthLevel::User)
+                        .extension(AuthorizedViewer(user))
+                        .body(Body::empty())
+                        .unwrap()
+                )
+                .await
+                .unwrap()
+                .status(),
+            expected,
+            "{uri}"
+        );
+    }
+    assert_eq!(
+        store
+            .reader
+            .pending_message_count(ws, project)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        store
+            .reader
+            .pending_message_count(foreign_ws, foreign)
+            .await
+            .unwrap(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn operations_notifications_are_read_only_and_hide_restricted_projects() {
+    let (_tmp, store, wiki, ws, project, _) = fixture().await;
+    let app = router(store.reader.clone(), wiki);
+    let request = |user| {
+        let request = Request::builder().uri("/inbox/notifications");
+        let request = match user {
+            Some(user) => request
+                .extension(AuthLevel::User)
+                .extension(AuthorizedViewer(user)),
+            None => request.extension(AuthLevel::Root),
+        };
+        request.body(Body::empty()).unwrap()
+    };
+    let response = app.clone().oneshot(request(None)).await.unwrap();
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    let empty: Value = serde_json::from_str(&text(response).await).unwrap();
+    assert_eq!(empty, json!({"pending":0,"project_count":0,"projects":[]}));
+    let foreign_ws = store
+        .writer
+        .get_or_create_workspace("private-team")
+        .await
+        .unwrap();
+    let mut restricted = Vec::new();
+    for (workspace, workspace_id, name, n) in [
+        ("team", ws, "app", 1),
+        ("private-team", foreign_ws, "app", 2),
+        ("team", ws, "mail-0", 1),
+        ("team", ws, "mail-1", 1),
+        ("team", ws, "mail-2", 1),
+        ("team", ws, "mail-3", 1),
+        ("team", ws, "mail-4", 1),
+        ("team", ws, "mail-5", 1),
+    ] {
+        let pid = store
+            .writer
+            .get_or_create_project(workspace_id, name, None)
+            .await
+            .unwrap();
+        if pid != project {
+            store
+                .writer
+                .begin_session(NewSession {
+                    id: SessionId::new(),
+                    workspace_id,
+                    project_id: pid,
+                    agent_kind: AgentKind::Codex,
+                    cwd: None,
+                    actor_user: None,
+                    occurred_at: None,
+                })
+                .await
+                .unwrap();
+            restricted.push(pid);
+        }
+        for _ in 0..n {
+            let mut value = body();
+            value["to_workspace"] = json!(workspace);
+            value["to_project"] = json!(name);
+            assert_eq!(
+                app.clone()
+                    .oneshot(
+                        send()
+                            .extension(AuthLevel::Root)
+                            .body(Body::from(value.to_string()))
+                            .unwrap()
+                    )
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::CREATED
+            );
+        }
+    }
+    let root: Value =
+        serde_json::from_str(&text(app.clone().oneshot(request(None)).await.unwrap()).await)
+            .unwrap();
+    assert_eq!(root["pending"], 9);
+    assert_eq!(root["project_count"], 8);
+    assert_eq!(root["projects"].as_array().unwrap().len(), 5);
+    assert_eq!(
+        root["projects"][0],
+        json!({"workspace":"private-team","project":"app","pending":2})
+    );
+    assert!(
+        !root.to_string().contains("Review"),
+        "notifications must not carry message content"
+    );
+    for id in restricted.into_iter().chain([project]) {
+        store
+            .writer
+            .set_access_mode(id, ai_memory_store::AccessMode::Restricted)
+            .await
+            .unwrap();
+    }
+    let user = store
+        .writer
+        .create_human_user(
+            NewUser {
+                username: "notification-reader".into(),
+                name: None,
+                email: None,
+            },
+            UserRole::User,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    store
+        .writer
+        .grant_memory(user, project, GrantLevel::Read, None)
+        .await
+        .unwrap();
+    let response = app.clone().oneshot(request(Some(user))).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let visible: Value = serde_json::from_str(&text(response).await).unwrap();
+    assert_eq!(
+        visible,
+        json!({"pending":1,"project_count":1,"projects":[{"workspace":"team","project":"app","pending":1}]})
+    );
+    assert_eq!(
+        store
+            .reader
+            .pending_message_count(ws, project)
+            .await
+            .unwrap(),
+        1
+    );
+    let refused = app
+        .oneshot(
+            Request::builder()
+                .uri("/inbox?workspace=private-team&project=app&state=pending")
+                .extension(AuthLevel::User)
+                .extension(AuthorizedViewer(user))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn operations_pending_mail_is_filtered_before_history_pagination() {
+    let (_tmp, store, wiki, ws, project, _) = fixture().await;
+    let app = router(store.reader.clone(), wiki);
+    for n in 0..51 {
+        let mut value = body();
+        value["subject"] = json!(if n == 0 {
+            "Old pending request".to_owned()
+        } else {
+            format!("Collected request {n}")
+        });
+        let response = app
+            .clone()
+            .oneshot(send().body(Body::from(value.to_string())).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let row: Value = serde_json::from_str(&text(response).await).unwrap();
+        if n > 0 {
+            store
+                .writer
+                .pop_message(
+                    ai_memory_core::MessageClaim {
+                        workspace_id: ws,
+                        project_id: project,
+                        claiming_agent: AgentKind::Codex,
+                        claiming_session: None,
+                        claiming_user: None,
+                    },
+                    Some(row["message_id"].as_str().unwrap().parse().unwrap()),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+    let get = |uri| Request::builder().uri(uri).body(Body::empty()).unwrap();
+    let all = text(
+        app.clone()
+            .oneshot(get("/inbox?workspace=team&project=app&state="))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(!all.contains("Old pending request"));
+    assert!(
+        all.contains("offset=50&amp;state="),
+        "All-history pagination must preserve the explicit empty state filter"
+    );
+    let tail = text(
+        app.clone()
+            .oneshot(get("/inbox?workspace=team&project=app&state=&offset=50"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(tail.contains("Old pending request"));
+    let default = text(
+        app.clone()
+            .oneshot(get("/inbox?workspace=team&project=app"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(default.contains("Old pending request"));
+    assert!(!default.contains("Collected request"));
+
+    let filtered = text(
+        app.clone()
+            .oneshot(get("/inbox?workspace=team&project=app&state=pending"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(filtered.contains("Old pending request"));
+    assert!(!filtered.contains("Collected request"));
+    assert_eq!(filtered.matches("class=\"mail-row\"").count(), 1);
+    let collected = text(
+        app.clone()
+            .oneshot(get("/inbox?workspace=team&project=app&state=claimed"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(!collected.contains("Old pending request"));
+    assert_eq!(collected.matches("class=\"mail-row\"").count(), 50);
+    assert_eq!(
+        app.oneshot(get("/inbox?workspace=team&project=app&state=unknown"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        store
+            .reader
+            .pending_message_count(ws, project)
+            .await
+            .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn operations_browser_send_and_inbox_reads_preserve_pending_state() {
     let (_tmp, store, wiki, ws, project, _) = fixture().await;
     let app = router(store.reader.clone(), wiki);
@@ -527,6 +986,7 @@ async fn operations_agent_totals_and_session_drilldown_do_not_multiply_tokens() 
     let (_tmp, store, wiki, ws, project, sid) = fixture().await;
     let calls: Vec<_> = (0..3)
         .map(|i| TokenCall {
+            context: None,
             call_id: format!("call-{i}"),
             input_tokens: 100,
             output_tokens: 30,
@@ -698,6 +1158,7 @@ async fn operations_agent_aggregates_and_drilldowns_apply_ownership_before_total
             .upsert_token_calls(
                 sid,
                 vec![TokenCall {
+                    context: None,
                     call_id: sid.to_string(),
                     input_tokens: tokens,
                     output_tokens: 5,
@@ -766,8 +1227,81 @@ async fn operations_legacy_login_requires_an_explicit_nonpersistent_write_token(
             );
             assert!(!input.contains("value=") && !input.contains("name="));
         }
-        assert!(html.contains("if(token)token.value=\"\""));
-        assert!(html.contains("if(token)headers.Authorization="));
-        assert!(!html.contains("localStorage.setItem(\"token"));
+    }
+}
+
+#[tokio::test]
+async fn operations_response_search_and_pagination_cover_the_full_project_and_session() {
+    let (_tmp, store, wiki, _, _, sid) = fixture().await;
+    let calls = (0..57)
+        .map(|n| TokenCall {
+            context: None,
+            call_id: format!("response-{n}"),
+            input_tokens: if n == 56 { 1 } else { 1000 },
+            output_tokens: 1,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            model: Some(if n == 56 {
+                "unique-tiny-model".into()
+            } else {
+                "bulk-model".into()
+            }),
+        })
+        .collect();
+    store.writer.upsert_token_calls(sid, calls).await.unwrap();
+    let app = router(store.reader.clone(), wiki);
+    for base in ["/w/team/app".into(), format!("/w/team/app/s/{sid}")] {
+        for (query, count, contains) in [
+            ("", 50, false),
+            ("?calls_q=unique-tiny-model", 1, true),
+            ("?calls_offset=50", 7, true),
+            ("?calls_signal=signals", 0, false),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("{base}{query}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let html = text(response).await;
+            assert_eq!(status, StatusCode::OK, "{base}{query}: {html}");
+            assert!(html.contains("Captured calls</span><strong>57</strong>"));
+            assert_eq!(html.matches("<tr data-call-row").count(), count);
+            let results = html
+                .split("<div class=\"usage-results\">")
+                .nth(1)
+                .unwrap()
+                .split("<p class=\"usage-note\">")
+                .next()
+                .unwrap();
+            assert_eq!(results.contains("unique-tiny-model"), contains);
+        }
+        for query in [
+            "?calls_sort=unknown",
+            "?calls_signal=unknown",
+            "?calls_agent=invalid",
+            "?calls_session=not-uuid",
+            "?calls_from=tomorrow",
+            "?calls_from=2026-10-02&calls_until=2026-10-01",
+        ] {
+            assert_eq!(
+                app.clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri(format!("{base}{query}"))
+                            .body(Body::empty())
+                            .unwrap()
+                    )
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
     }
 }

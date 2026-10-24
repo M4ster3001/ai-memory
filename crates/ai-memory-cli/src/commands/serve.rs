@@ -1473,6 +1473,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
     let server = consolidator_setup.server;
     let consolidator = consolidator_setup.consolidator;
     let admin_llm = consolidator_setup.admin_llm;
+    let llm_configured = admin_llm.is_some();
     let profile_llm = admin_llm.clone();
     // Share the tool router's last-activity clock with the B3 dream scheduler so
     // it can tell an idle box from a busy one and cancel a run on the operator's
@@ -1895,6 +1896,21 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                         embedder: embedder.clone(),
                         rerank: server.rerank_stage(),
                     },
+                    runtime: Some(ai_memory_web::features::RuntimeFeatures {
+                        llm_configured,
+                        consolidate_on_session_end: config.consolidate_on_session_end,
+                        capture_assistant_default: config.capture_assistant,
+                        backfill_on_start: config.backfill_on_start,
+                        learning_scheduled: config.auto_improve.scheduler.enabled
+                            && config.auto_improve.scheduler.interval_secs > 0
+                            && config.auto_improve.scheduler.max_sessions_per_tick > 0,
+                        learning_on_session_end: config.auto_improve.on_session_end,
+                        review_requires_approval: config.auto_improve.require_approval,
+                        maintenance_enabled: config.maintenance.enabled,
+                        retention_scheduled: config.maintenance.forget_sweep_interval_secs > 0,
+                        human_login: human_mode,
+                        observation_stream: config.retrieval.observation_stream,
+                    }),
                     health: Some(Arc::new(ai_memory_web::health::HealthSources {
                         ingest: ingest_metrics.clone(),
                         providers: provider_health.clone(),
@@ -7003,6 +7019,7 @@ mod tests {
                 base_path: "",
                 trusted_proxy_identity: false,
                 recall: ai_memory_web::Recall::default(),
+                runtime: None,
                 health: None,
             },
         )
@@ -7107,6 +7124,7 @@ mod tests {
                 base_path: "",
                 trusted_proxy_identity: false,
                 recall: ai_memory_web::Recall::default(),
+                runtime: None,
                 health: None,
             },
         )
@@ -7181,6 +7199,7 @@ mod tests {
                 base_path: "",
                 trusted_proxy_identity: false,
                 recall: ai_memory_web::Recall::default(),
+                runtime: None,
                 health: None,
             },
         )
@@ -7348,6 +7367,7 @@ mod tests {
                 base_path: "",
                 trusted_proxy_identity: false,
                 recall: ai_memory_web::Recall::default(),
+                runtime: None,
                 health: None,
             },
         )
@@ -7412,6 +7432,7 @@ mod tests {
                 base_path: "",
                 trusted_proxy_identity: false,
                 recall: ai_memory_web::Recall::default(),
+                runtime: None,
                 health: None,
             },
         )

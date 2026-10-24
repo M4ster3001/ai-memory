@@ -933,6 +933,16 @@ prose.
 
 ## Investigate token usage in the dashboard
 
+Use UTC From and Until (inclusive and exclusive), exact model, harness and
+session filters to narrow the complete authorized ledger before pagination. Turn
+and tool filters connect a response to reported native context. "Turn & tools"
+separates a requested tool, an input result and a same-turn association, and
+shared context does not prove that a token cost belongs to one tool. Update
+native clients as well as the server to collect these fields. Old rows with no
+source metadata stay unknown. The
+[feature guide](features.md#token-accounting-and-investigation) explains
+timestamp fallbacks, filtered totals and capture prerequisites.
+
 Open a project under `/web` and select the Token usage tab. Updated native Claude Code and
 Codex hooks send measured response usage on `post-tool-use`, `stop`,
 `pre-compact` and `session-end`. A session can stay open: usage is stored as it
@@ -940,21 +950,34 @@ arrives, and the panel and the session totals refresh every ten seconds. To
 enable capture, update the native client on each agent machine as well as the
 server.
 
-Each response is deduplicated by its native identity, so a partial update raises
+Responses are deduplicated by their native identity, so a partial update raises
 the stored counters instead of adding the same response again. Fresh input
-excludes cache reads. The panel lists the fifty largest captured responses, each
-linking to its session with model, input, output, cache and total tokens. It
-flags contexts of at least 100,000 tokens, outputs of at least 20,000 tokens,
-and responses above three times the project's captured-response average once
-five responses exist. These flags are hints for investigation. They do not
-confirm an anomaly or show a currency cost.
+excludes cache reads. Search, signal filtering and recent ordering query all
+captured responses before fifty-row pages are selected. Page links keep those
+filters, and search results and totals stay separate. Responses link to their
+session and show model, input, output, cache and total tokens. The panel flags
+contexts of at least 100,000 tokens, outputs of at least 20,000 tokens, and
+responses above three times the project's captured-response average once five
+responses exist. These are hints for investigation, not confirmed anomalies or
+currency costs.
 
-Live extraction reads a bounded 4 MiB transcript tail and reports at most 256
-responses per event. Capture starts with the updated hooks, so earlier calls
-outside that window are not reconstructed. A report appears after the agent
-writes usage to its transcript, and unsupported formats and missing reports stay
-unknown. The ledger keeps only token counters, response identities and model
-names. Project authorization and session-owner filters apply before ranking or
+Live extraction reads forward in bounded 4 MiB batches and reports at most 256
+responses per event. A cursor under the client's data directory advances only
+after the local enqueue is durable. Later hooks continue any backlog, including
+records outside the previous byte window, and repeated responses stay
+deduplicated. A large backlog needs several events, and a session with no
+further hooks does not drain its transcript on its own. Incomplete lines wait
+for completion, and lines over 4 MiB are skipped in bounded chunks. Truncation
+or changed checkpoint content restarts the scan. Update the native binary on
+each agent machine, because updating only the server does not change transcript
+capture. Reports appear after the agent writes usage. Missing or deleted
+records and unsupported formats stay unknown.
+
+The ledger keeps counters, response and model identifiers, and bounded native
+turn, response-time and tool references when reported. It excludes prompts, tool
+arguments and outputs. Model and tool labels are sanitized before their length
+limit is applied, and private or malformed context identifiers are refused.
+Project authorization and session-owner filters apply before ranking or
 aggregation. Session-end totals remain as a fallback for history.
 
 The header's Light / Dark / System control stores the preference in the browser.
@@ -985,18 +1008,27 @@ response records, so coverage and captured-call counts are shown separately.
 
 The response table can be searched by model, agent or response, filtered by
 investigation signal, and sorted by token usage or capture time. These controls
-work on the fifty largest captured responses in the current scope. A project
-refresh keeps the filter controls and keyboard focus in place. A session's
-response ledger is a snapshot until the page is refreshed.
+query all captured responses in the current scope before fifty-row pages are
+selected. Project and session usage refresh every ten seconds while visible, and
+the filter controls and keyboard focus stay in place.
 
 ### Coordinate work from the browser
 
 The Inbox lists the messages a selected project received and sent, fifty per
-page, without claiming them. Expanding a row shows its plain text. New message
-picks a source project and a recipient harness from the agents that already have
-sessions in visible projects. Sending needs write access to both projects and
-goes through the configured sanitizer and message admission policy. Browser
-sessions use the existing CSRF checks.
+page, without claiming them. Received mail opens on pending messages, and "All
+messages" or "Collected" show history. Page links keep the selected state.
+"Waiting for agents" shows real queued counts and mailbox links for each
+workspace and project you can access. By default the page opens a project with
+queued messages, and the heading names the current mailbox. The sidebar
+refreshes pending counts every ten seconds on visible pages, and its project
+links open "Awaiting collection". Collected mail leaves the count. The count is a
+queue indicator, not human read or unread tracking. "Message state" filters the
+history before pagination. Reading through a notification does not claim mail.
+Expanding a row shows its plain text. New message picks a source project and a
+recipient harness from the agents that already have sessions in visible
+projects. Sending needs write access to both projects and goes through the
+configured sanitizer and message admission policy. Browser sessions use the
+existing CSRF checks.
 
 A queued request does not launch an agent. The addressed harness collects it the
 next time it checks its inbox, and "Collected" records that claim, not that the

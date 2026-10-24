@@ -165,6 +165,30 @@ mod tests {
     use rusqlite::{Connection, params};
 
     #[test]
+    fn v94_preserves_old_response_rows_and_cascades_context() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        run_to(&mut conn, 93).unwrap();
+        conn.execute_batch("INSERT INTO workspaces(id,name,created_at) VALUES(zeroblob(16),'usage',1);
+            INSERT INTO projects(id,workspace_id,name,created_at) VALUES(zeroblob(16),zeroblob(16),'usage',1);
+            INSERT INTO sessions(id,workspace_id,project_id,agent_kind,started_at) VALUES(zeroblob(16),zeroblob(16),zeroblob(16),'codex',1);
+            INSERT INTO token_calls(session_id,call_id,input_tokens,output_tokens,cache_write_tokens,cache_read_tokens,observed_at) VALUES(zeroblob(16),'old-response',70,7,0,0,123);").unwrap();
+        run(&mut conn).unwrap();
+        run(&mut conn).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        let preserved:(u64,u64,i64,Option<String>,Option<String>,Option<i64>)=conn.query_row("SELECT input_tokens,output_tokens,observed_at,turn_id,native_response_id,response_at FROM token_calls",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).unwrap();
+        assert_eq!(preserved, (70, 7, 123, None, None, None));
+        conn.execute_batch("INSERT INTO token_call_tools(session_id,call_id,tool_id,tool_name,relation) VALUES(zeroblob(16),'old-response','tool-1','Read','requested');
+            DELETE FROM token_calls WHERE call_id='old-response';").unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM token_call_tools", [], |r| r
+                .get::<_, u64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
     fn v92_normalizes_codex_cache_once_and_preserves_claude() {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", "OFF").unwrap();

@@ -239,7 +239,7 @@ pub const PAGE_KINDS: [&str; 10] = [
     DEFAULT_PAGE_KIND,
 ];
 
-fn page_kind_expr(path_column: &str, frontmatter_column: &str) -> String {
+pub(crate) fn page_kind_expr(path_column: &str, frontmatter_column: &str) -> String {
     let arms: String = PATH_KINDS
         .iter()
         .map(|(prefix, kind)| {
@@ -1577,15 +1577,64 @@ pub struct TokenCallView {
     pub cache_read: u64,
     /// First received timestamp.
     pub observed_at: String,
+    /// Native turn coordinate, unknown for old reports.
+    pub turn_id: Option<String>,
+    /// Native provider response coordinate, when reported.
+    pub response_id: Option<String>,
+    /// Reported response time; otherwise the UI uses capture time explicitly.
+    pub response_at: Option<String>,
+    /// Bounded tool provenance, loaded in one batch for this result page.
+    pub tools: Vec<ai_memory_core::TokenToolRef>,
 }
 
-/// Project usage coverage and its most expensive measured responses.
+/// Ordering applied to all matching measured responses before pagination.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TokenCallOrder {
+    /// Most tokens first, including cache.
+    #[default]
+    Largest,
+    /// Latest reported response time first; capture time when unavailable.
+    Recent,
+}
+
+/// Bounded, project/session-scoped response investigation query.
+#[derive(Debug, Clone, Default)]
+pub struct TokenCallQuery {
+    /// Literal substring of response id, model or harness (up to 256 chars).
+    pub search: String,
+    /// Restrict to the same investigation signals shown in the dashboard.
+    pub signals_only: bool,
+    /// Stable ordering before the fifty-row page is selected.
+    pub order: TokenCallOrder,
+    /// Matching responses to skip.
+    pub offset: usize,
+    /// Exact reported model (including the unavailable marker).
+    pub model: Option<String>,
+    /// Exact harness identity.
+    pub agent: Option<AgentKind>,
+    /// Intersect this session with the caller's authorized scope.
+    pub session_id: Option<SessionId>,
+    /// Inclusive UTC lower bound, in microseconds.
+    pub from_us: Option<i64>,
+    /// Exclusive UTC upper bound, in microseconds.
+    pub until_us: Option<i64>,
+    /// Exact native turn identity.
+    pub turn_id: Option<String>,
+    /// Exact tool label, across all provenance relations.
+    pub tool: Option<String>,
+}
+
+/// Usage coverage and one filtered page of measured responses.
 #[derive(Debug, Clone, Default)]
 pub struct TokenUsageReport {
-    /// Largest fifty responses by input, cache and output combined.
+    /// Up to fifty responses after filtering and ordering.
     pub calls: Vec<TokenCallView>,
     /// All distinct measured responses, not only the displayed fifty.
     pub call_count: u64,
+    /// Responses matching the investigation query, before pagination.
+    pub matching_calls: u64,
+    /// Total tokens (including cache) across all matching responses.
+    pub matching_tokens: u64,
     /// Fresh input across measured responses.
     pub input: u64,
     /// Output across measured responses.
@@ -5334,6 +5383,20 @@ impl ReaderPool {
         owner: OwnerFilter,
         session: Option<SessionId>,
     ) -> StoreResult<TokenUsageReport> {
+        self.token_usage_report_page(ws, proj, owner, session, TokenCallQuery::default())
+            .await
+    }
+
+    /// Search and order all authorized responses before selecting one bounded
+    /// page. Totals and signal averages always cover the whole authorized scope.
+    pub async fn token_usage_report_page(
+        &self,
+        ws: WorkspaceId,
+        proj: ProjectId,
+        owner: OwnerFilter,
+        session: Option<SessionId>,
+        query: TokenCallQuery,
+    ) -> StoreResult<TokenUsageReport> {
         self.with_conn(move |conn| {
             let (mode, actor) = match owner {
                 OwnerFilter::Any => (0, String::new()),
@@ -5363,21 +5426,50 @@ impl ReaderPool {
                         cache_write: r.get(3)?,
                         cache_read: r.get(4)?,
                         calls: Vec::new(),
+                        matching_calls: 0,
+                        matching_tokens: 0,
                     })
                 },
             )?;
+            let total = "(c.input_tokens + c.output_tokens + c.cache_write_tokens + c.cache_read_tokens)";
+            let context = "(c.input_tokens + c.cache_write_tokens + c.cache_read_tokens)";
+            let mean = (report.input + report.output + report.cache_write + report.cache_read)
+                .checked_div(report.call_count).unwrap_or(0);
+            let filtered = format!("{from} AND (?6 = '' OR instr(lower(c.call_id || ' ' || COALESCE(c.native_response_id,'') || ' ' || s.agent_kind || ' ' || replace(s.agent_kind,'-',' ') || ' ' || COALESCE(c.model,'')), ?6) > 0) \
+                AND (?7 = 0 OR {context} >= 100000 OR c.output_tokens >= 20000 OR (?8 >= 5 AND {total} > ?9)) \
+                AND (?10 IS NULL OR COALESCE(c.model,'Not reported')=?10) \
+                AND (?11 IS NULL OR s.agent_kind=?11) AND (?12 IS NULL OR s.id=?12) \
+                AND (?13 IS NULL OR COALESCE(c.response_at,c.observed_at)>=?13) \
+                AND (?14 IS NULL OR COALESCE(c.response_at,c.observed_at)<?14) \
+                AND (?15 IS NULL OR c.turn_id=?15) \
+                AND (?16 IS NULL OR EXISTS(SELECT 1 FROM token_call_tools t WHERE t.session_id=c.session_id AND t.call_id=c.call_id AND t.tool_name=?16))");
+            let search = query.search.chars().take(256).collect::<String>().to_lowercase();
+            let filter_session = query.session_id.map(|s| s.as_bytes().to_vec());
+            let filter_agent = query.agent.map(AgentKind::as_str);
+            let filtered_params = rusqlite::params![ws.as_bytes(), proj.as_bytes(), mode, actor,
+                session_bytes, search, query.signals_only, report.call_count, mean.saturating_mul(3),
+                query.model,filter_agent,filter_session,query.from_us,query.until_us,query.turn_id,query.tool];
+            (report.matching_calls,report.matching_tokens) = conn.query_row(&format!("SELECT COUNT(*),COALESCE(SUM({total}),0){filtered}"), filtered_params, |r| Ok((r.get(0)?,r.get(1)?)))?;
+            let order = match query.order {
+                TokenCallOrder::Largest => format!("{total} DESC, c.observed_at DESC"),
+                TokenCallOrder::Recent => format!("COALESCE(c.response_at,c.observed_at) DESC, {total} DESC"),
+            };
+            let offset = query.offset.min(i64::MAX as usize);
             let mut stmt = conn.prepare(&format!(
                 "SELECT c.call_id, s.id, s.agent_kind, COALESCE(c.model, 'Not reported'), \
                         c.input_tokens, c.output_tokens, c.cache_write_tokens, \
-                        c.cache_read_tokens, c.observed_at {from} \
-                 ORDER BY c.input_tokens + c.output_tokens + c.cache_write_tokens \
-                          + c.cache_read_tokens DESC, c.observed_at DESC, c.call_id LIMIT 50"
+                        c.cache_read_tokens, c.observed_at, c.turn_id,c.native_response_id,c.response_at {filtered} \
+                 ORDER BY {order}, c.session_id, c.call_id LIMIT 50 OFFSET {offset}"
             ))?;
-            let rows = stmt.query_map(params, |r| {
+            let rows = stmt.query_map(filtered_params, |r| {
                 let sid: Vec<u8> = r.get(1)?;
                 Ok((
                     sid,
                     TokenCallView {
+                        turn_id: r.get(9)?,
+                        response_id: r.get(10)?,
+                        response_at: r.get::<_,Option<i64>>(11)?.and_then(|us| jiff::Timestamp::from_microsecond(us).ok()).map(|t| t.to_string()),
+                        tools: Vec::new(),
                         call_id: r.get(0)?,
                         session_id: String::new(),
                         agent: r.get(2)?,
@@ -5392,10 +5484,25 @@ impl ReaderPool {
                     },
                 ))
             })?;
+            let mut keys=Vec::new();
             for row in rows {
                 let (sid, mut call) = row?;
+                keys.push(Value::Blob(sid.clone()));keys.push(Value::Text(call.call_id.clone()));
                 call.session_id = SessionId::from_slice(&sid)?.to_string();
                 report.calls.push(call);
+            }
+            if !keys.is_empty() {
+                let pairs=std::iter::repeat_n("(?,?)",report.calls.len()).collect::<Vec<_>>().join(",");
+                let mut tools=conn.prepare(&format!("SELECT session_id,call_id,tool_id,tool_name,relation,is_error FROM token_call_tools WHERE (session_id,call_id) IN ({pairs}) ORDER BY session_id,call_id,tool_id,relation"))?;
+                let rows=tools.query_map(params_from_iter(keys),|r|Ok((r.get::<_,Vec<u8>>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,Option<bool>>(5)?)))?;
+                for row in rows {
+                    let (sid,call_id,id,name,relation,is_error)=row?;
+                    let sid=SessionId::from_slice(&sid)?.to_string();
+                    let relation=match relation.as_str(){"requested"=>ai_memory_core::TokenToolRelation::Requested,"input"=>ai_memory_core::TokenToolRelation::Input,_=>ai_memory_core::TokenToolRelation::Turn};
+                    if let Some(call)=report.calls.iter_mut().find(|c|c.session_id==sid && c.call_id==call_id) && call.tools.len()<16 {
+                        call.tools.push(ai_memory_core::TokenToolRef{id,name,relation,is_error});
+                    }
+                }
             }
             Ok(report)
         })
@@ -14306,13 +14413,23 @@ fn sessions_for_scope_sql(
         OwnerFilter::User(_) => " AND (s.actor_user IS NULL OR s.actor_user = :actor)",
         OwnerFilter::Unattributed => " AND s.actor_user IS NULL",
     };
+    // Keep the persisted end as the writer's finalization watermark. New
+    // substantive work in this scope reopens only the read view, matching
+    // recent_session_activity without changing lifecycle or handoff admission.
+    let effective_end = "CASE WHEN EXISTS (\
+        SELECT 1 FROM observations resumed INDEXED BY idx_observations_session \
+        WHERE resumed.session_id = s.id \
+          AND resumed.workspace_id = :ws AND resumed.project_id = :proj \
+          AND resumed.created_at > s.ended_at \
+          AND resumed.kind NOT IN ('session-start', 'session-end')\
+        ) THEN NULL ELSE s.ended_at END";
     let ended_clause = if include_open {
-        ""
+        String::new()
     } else {
-        " AND s.ended_at IS NOT NULL"
+        format!(" AND ({effective_end}) IS NOT NULL")
     };
     format!(
-        "SELECT s.id, s.cwd, s.agent_kind, s.started_at, s.ended_at, s.actor_user, \
+        "SELECT s.id, s.cwd, s.agent_kind, s.started_at, {effective_end} AS ended_at, s.actor_user, \
                 (SELECT COUNT(*) FROM observations o INDEXED BY idx_observations_session \
                  WHERE o.session_id = s.id \
                    AND o.workspace_id = :ws AND o.project_id = :proj) AS n, \

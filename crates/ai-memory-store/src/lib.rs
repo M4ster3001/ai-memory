@@ -27,6 +27,8 @@ mod migrations;
 mod ops;
 pub mod password;
 mod profile;
+mod provenance;
+pub use provenance::{PageDisagreement, PageProvenance, PageSource};
 mod project_authz;
 mod project_coordinates;
 mod reader;
@@ -104,9 +106,10 @@ pub use reader::{
     SessionActivity, SessionConsolidationQueue, SessionConsolidationSummary, SessionDependentRows,
     SessionEndDisposition, SessionKindSummary, SessionLine, SessionObservationSnapshot,
     SessionPromptTitles, SessionSummary, SessionToolTitles, SessionUsageView, SettledPage,
-    StatusCounts, StorageStatus, StoredEmbedding, StoredPageBody, StreamTimings, TokenCallView,
-    TokenUsageReport, VectorQuery, WorkspaceScopeRow, WorkspaceSummary, f32_vec_to_bytes,
-    highlighted_snippet_html, plain_snippet, project_name_fold_key,
+    StatusCounts, StorageStatus, StoredEmbedding, StoredPageBody, StreamTimings, TokenCallOrder,
+    TokenCallQuery, TokenCallView, TokenUsageReport, VectorQuery, WorkspaceScopeRow,
+    WorkspaceSummary, f32_vec_to_bytes, highlighted_snippet_html, plain_snippet,
+    project_name_fold_key,
 };
 pub use retrieval_tuning::{RetrievalTuning, is_session_recall_query};
 pub use scope::{
