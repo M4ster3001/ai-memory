@@ -10,6 +10,7 @@ use crate::state::WebState;
 
 mod agents;
 mod api;
+mod documentation;
 mod graph;
 mod health;
 mod history;
@@ -116,6 +117,8 @@ pub(crate) async fn require_admin(
 pub(crate) fn build(state: Arc<WebState>) -> Router {
     Router::new()
         .route("/", get(index::handler))
+        .route("/docs", get(documentation::index))
+        .route("/docs/{slug}", get(documentation::page))
         .route("/inbox", get(inbox::handler))
         .route("/messages", post(inbox::send))
         .route(

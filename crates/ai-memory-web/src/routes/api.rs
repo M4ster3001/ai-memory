@@ -28,6 +28,11 @@ const PAGE_CACHE_MAX_AGE: u32 = 300;
 /// Build the `/api/v1` router from a shared [`WebState`].
 pub(crate) fn build(state: Arc<WebState>) -> Router {
     Router::new()
+        .route("/docs", axum::routing::get(super::documentation::api_index))
+        .route(
+            "/docs/{slug}",
+            axum::routing::get(super::documentation::api_page),
+        )
         .route("/workspaces", axum::routing::get(workspaces_handler))
         .route("/projects", axum::routing::get(projects_handler))
         .route(

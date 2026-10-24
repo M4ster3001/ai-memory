@@ -93,6 +93,28 @@ version in [`docs/changelog/`](docs/changelog/):
   send with an explicit write token supplied for that one request and cleared
   right after, with no browser persistence (#NNN).
 
+- Added bundled product documentation to the web UI and the API. The guides and
+  release notes are compiled into the binary and served at `/web/docs`,
+  `/web/docs/changelog` and `/web/docs/{id}` (a `.md` suffix returns the
+  Markdown). They include searchable feature activation guides, per-release
+  changelogs, and authenticated `/api/v1/docs` JSON and Markdown references for
+  agents. No network access or LLM is needed, and the pages describe shipped
+  capabilities without exposing the running server's configuration or
+  credentials. The source-built Docker image now copies `CHANGELOG.md` for this
+  (#NNN).
+
+- Project pages now show one section at a time in accessible tabs: Overview,
+  Agents, Token usage, Sessions and Knowledge. The selected tab is kept in the
+  URL (`?tab=agents`), which keeps reload, shared links and browser history in
+  sync, and the tabs support Left, Right, Home and End. Existing
+  `#agents`-style section bookmarks still open the matching tab (#NNN).
+
+- The browser inbox composer now sets To project to the source project by
+  default and lists only harnesses with captured sessions in the destination
+  workspace and project. It resets a stale recipient when a project changes,
+  and it disables sending, with an explanation, for a project that has no
+  registered agent (#NNN).
+
 ### Fixed
 
 - Updated tokio to 1.54.1 in the server, relay, importer and wikisync
