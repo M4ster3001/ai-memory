@@ -226,6 +226,24 @@ version in [`docs/changelog/`](docs/changelog/):
   dark variant now uses the `dark` class instead of the media query, so a
   manual choice overrides the system setting (#NNN).
 
+- Redesigned the responsive web dashboard. It has persistent workspace
+  navigation, searchable project cards, per-agent consumption and coverage, and
+  session drilldowns that show the token totals recorded for each agent (#NNN).
+
+- Added a browser inbox at `/web/inbox`. It lists received and sent mail
+  without consuming it. A caller with write access to both the source and the
+  destination project can also queue a message for a registered harness of that
+  project. The text goes through the configured sanitizer and admission before
+  the single writer, and the browser never claims mail or starts an agent.
+  Messages can now be addressed to one harness (`to_agent`, migration V93).
+  `memory_message_pop` and `ai-memory message pop` take an optional `agent`,
+  and only that harness can claim the message, even by id. Existing shared mail
+  (`to_agent = NULL`) behaves as before. A claim from a session-aware client
+  whose routing metadata arrives before its session start was persisted is no
+  longer refused. A browser session opened with the legacy read-only login can
+  send with an explicit write token supplied for that one request and cleared
+  right after, with no browser persistence (#NNN).
+
 ### Changed
 
 - `memory_lint` now reports embedding-band pairs as

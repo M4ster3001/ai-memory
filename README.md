@@ -627,7 +627,10 @@ readable wiki pages; the next session starts with a handoff.
 - Investigate Claude Code and Codex response-token usage in the project
   dashboard, and pick a Light, Dark or System theme. See
   [Investigate token usage](docs/usage.md#investigate-token-usage-in-the-dashboard)
-  for capture coverage, cache accounting and the investigation flags.
+  for capture coverage, cache accounting and the investigation flags. You can
+  drill down from a project to an agent, its sessions and individual responses.
+  The web [agent inbox](docs/agent-messaging.md#in-the-web-ui) lets an operator
+  queue requests for registered agents and read the received and sent history.
 - Back up host-side harness configuration with
   `ai-memory backup-agents -o agent-assets.tar.gz`; inspect a restore with
   `ai-memory restore-agents -i agent-assets.tar.gz`, then add `--apply` only

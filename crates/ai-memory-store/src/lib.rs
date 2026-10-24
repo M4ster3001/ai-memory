@@ -17,6 +17,7 @@ use rusqlite::{Connection, TransactionBehavior};
 mod api_credentials;
 mod auto_improve;
 pub mod belief;
+mod dashboard;
 pub mod decay;
 mod error;
 mod fts_query;
@@ -50,6 +51,7 @@ pub use auto_improve::{
     StagedAutoImproveRun, StagedAutoImproveRunReport, artifact_path_for,
 };
 pub use belief::{BeliefInputs, CONFIDENCE_CAP, confidence};
+pub use dashboard::{AgentUsage, RegisteredAgent};
 pub use decay::{
     DecayParams, SALIENCE_MAX, SALIENCE_MIN, SALIENCE_STEP, TierLambdas,
     lambda_from_half_life_days, retention_score, retention_score_with_breadth,

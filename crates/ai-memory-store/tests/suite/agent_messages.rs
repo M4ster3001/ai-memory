@@ -124,6 +124,7 @@ fn message(
         from_owner_user: None,
         to_workspace_id: to.0,
         to_project_id: to.1,
+        to_agent: None,
         subject: Some("need a thing".into()),
         body: body.into(),
         nature: ai_memory_core::MessageNature::Unknown,
@@ -139,6 +140,66 @@ fn claim(to: (WorkspaceId, ProjectId)) -> MessageClaim {
         claiming_session: None,
         claiming_user: None,
     }
+}
+
+#[tokio::test]
+async fn addressed_messages_are_claimed_once_only_by_the_selected_harness() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let a = project(&store, "team", "sender").await;
+    let b = project(&store, "team", "receiver").await;
+    let mut directed = message(a, b, "for codex");
+    directed.to_agent = Some(AgentKind::Codex);
+    let id = store.writer.insert_message(directed).await.unwrap();
+    let mut wrong = claim(b);
+    wrong.claiming_agent = AgentKind::ClaudeCode;
+    assert!(
+        store
+            .writer
+            .pop_message(wrong.clone(), None)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .writer
+            .pop_message(wrong, Some(id))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let shared = store
+        .writer
+        .insert_message(message(a, b, "shared"))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .writer
+            .pop_message(claim(b), None)
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        shared
+    );
+    let mut correct = claim(b);
+    correct.claiming_agent = AgentKind::Codex;
+    let (left, right) = tokio::join!(
+        store.writer.pop_message(correct.clone(), Some(id)),
+        store.writer.pop_message(correct, Some(id))
+    );
+    let claimed: Vec<_> = [left.unwrap(), right.unwrap()]
+        .into_iter()
+        .flatten()
+        .collect();
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].to_agent, Some(AgentKind::Codex));
+    assert_eq!(
+        store.reader.pending_message_count(b.0, b.1).await.unwrap(),
+        0
+    );
 }
 
 /// The core queue contract: A sends to B, B pops it exactly once, a second pop

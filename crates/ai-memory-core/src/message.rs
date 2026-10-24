@@ -147,6 +147,9 @@ pub struct NewAgentMessage {
     pub to_workspace_id: WorkspaceId,
     /// Recipient project.
     pub to_project_id: ProjectId,
+    /// Optional harness recipient within the project; absent means any agent.
+    #[serde(default)]
+    pub to_agent: Option<AgentKind>,
     /// Optional one-line subject.
     pub subject: Option<String>,
     /// The message body (the request for the recipient agent).
@@ -197,6 +200,8 @@ pub struct AgentMessage {
     pub to_workspace_id: WorkspaceId,
     /// Recipient project.
     pub to_project_id: ProjectId,
+    /// Harness recipient, or `None` for the shared project queue.
+    pub to_agent: Option<AgentKind>,
     /// Sender-side provenance (untrusted, but structured — judge before acting).
     #[serde(flatten)]
     pub origin: MessageOrigin,

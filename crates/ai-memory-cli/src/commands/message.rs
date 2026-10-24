@@ -43,6 +43,8 @@ struct AgentMessage {
     created_at: String,
     #[serde(default)]
     claimed_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    to_agent: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -219,6 +221,7 @@ async fn pop(config: &Config, args: MessagePopArgs) -> Result<()> {
         &endpoint,
         "/admin/messages/pop",
         &PopRequest {
+            agent: args.agent.as_deref(),
             workspace: &workspace,
             project: &project,
             message_id: args.id.as_deref(),
@@ -326,6 +329,8 @@ fn escape_body_fence(body: &str) -> String {
 
 #[derive(Debug, Serialize)]
 struct PopRequest<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent: Option<&'a str>,
     workspace: &'a str,
     project: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -396,6 +401,7 @@ mod tests {
             state: "claimed".to_owned(),
             created_at: "2026-01-01T00:00:00Z".to_owned(),
             claimed_at: None,
+            to_agent: None,
         }
     }
 
@@ -509,6 +515,7 @@ mod tests {
             workspace: None,
             project: Some("   ".into()),
             id: None,
+            agent: None,
             json: false,
         };
         let error = pop(&config, a).await.unwrap_err();
@@ -525,6 +532,7 @@ mod tests {
             workspace: None,
             project: None,
             id: Some("   ".into()),
+            agent: None,
             json: false,
         };
         let error = pop(&config, a).await.unwrap_err();
@@ -645,6 +653,7 @@ mod tests {
                 workspace: Some(String::new()),
                 project: None,
                 id: None,
+                agent: None,
                 json: false,
             },
         )

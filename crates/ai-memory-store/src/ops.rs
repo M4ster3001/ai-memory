@@ -5752,6 +5752,9 @@ pub(crate) fn row_to_agent_message(
             id: MessageId::from_slice(&id_bytes)?,
             to_workspace_id: WorkspaceId::from_slice(&to_ws)?,
             to_project_id: ProjectId::from_slice(&to_pj)?,
+            to_agent: row
+                .get::<_, Option<String>>(14)?
+                .map(|s| AgentKind::from_wire(&s)),
             origin: MessageOrigin {
                 from_workspace_id: WorkspaceId::from_slice(&from_ws)?,
                 from_project_id: ProjectId::from_slice(&from_pj)?,
@@ -5787,7 +5790,7 @@ pub(crate) fn row_to_agent_message(
 /// The stable column list backing [`row_to_agent_message`].
 pub(crate) const MESSAGE_COLUMNS: &str = "id, from_workspace_id, from_project_id, from_agent, \
      from_owner_user, to_workspace_id, to_project_id, subject, body, state, created_at, claimed_at, \
-     nature, evidence";
+     nature, evidence, to_agent";
 
 /// Send a message into a recipient project's inbox.
 ///
@@ -5832,8 +5835,8 @@ pub fn insert_message(conn: &mut Connection, m: &NewAgentMessage) -> StoreResult
         "INSERT INTO agent_messages ( \
              id, from_workspace_id, from_project_id, from_agent, from_session_id, \
              from_owner_user, to_workspace_id, to_project_id, subject, body, state, created_at, \
-             nature, evidence \
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', ?11, ?12, ?13)",
+             nature, evidence, to_agent \
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', ?11, ?12, ?13, ?14)",
         params![
             id.as_bytes(),
             m.from_workspace_id.as_bytes(),
@@ -5848,6 +5851,7 @@ pub fn insert_message(conn: &mut Connection, m: &NewAgentMessage) -> StoreResult
             now,
             m.nature.as_str(),
             evidence,
+            m.to_agent.map(|a| a.as_str()),
         ],
     )?;
     // Audit records the lifecycle event under the recipient scope (the crossing
@@ -5894,8 +5898,13 @@ pub(crate) fn pop_message_in_transaction(
             .query_row(
                 "SELECT id FROM agent_messages \
                  WHERE to_workspace_id = ?1 AND to_project_id = ?2 AND state = 'pending' \
+                   AND (to_agent IS NULL OR to_agent = ?3) \
                  ORDER BY created_at ASC LIMIT 1",
-                params![claim.workspace_id.as_bytes(), claim.project_id.as_bytes()],
+                params![
+                    claim.workspace_id.as_bytes(),
+                    claim.project_id.as_bytes(),
+                    claim.claiming_agent.as_str()
+                ],
                 |row| row.get::<_, Vec<u8>>(0),
             )
             .optional()?
@@ -5910,11 +5919,13 @@ pub(crate) fn pop_message_in_transaction(
     let exists: bool = tx
         .query_row(
             "SELECT 1 FROM agent_messages \
-             WHERE id = ?1 AND to_workspace_id = ?2 AND to_project_id = ?3 AND state = 'pending'",
+             WHERE id = ?1 AND to_workspace_id = ?2 AND to_project_id = ?3 AND state = 'pending' \
+               AND (to_agent IS NULL OR to_agent = ?4)",
             params![
                 target.as_bytes(),
                 claim.workspace_id.as_bytes(),
-                claim.project_id.as_bytes()
+                claim.project_id.as_bytes(),
+                claim.claiming_agent.as_str(),
             ],
             |_| Ok(true),
         )
@@ -5930,7 +5941,8 @@ pub(crate) fn pop_message_in_transaction(
     let changed = tx.execute(
         "UPDATE agent_messages SET state = 'claimed', claimed_at = ?1, \
              claimed_by_session = ?2, claimed_by_agent = ?3, claimed_by_user = ?4 \
-         WHERE id = ?5 AND to_workspace_id = ?6 AND to_project_id = ?7 AND state = 'pending'",
+         WHERE id = ?5 AND to_workspace_id = ?6 AND to_project_id = ?7 AND state = 'pending' \
+           AND (to_agent IS NULL OR to_agent = ?3)",
         params![
             now,
             session,

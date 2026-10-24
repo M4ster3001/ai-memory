@@ -755,9 +755,13 @@ a human password or completed bootstrap exists. For human-authenticated
 administration, create the first root account ([first-time
 root](install.md#first-time-root-greenfield)) and serve the compiled admin SPA
 with `--web-ui-dir`: it signs in through `/auth/login` and uses an HttpOnly web
-session plus CSRF protection. Browser-stored Bearers remain unsupported.
-`AI_MEMORY_AUTH_TOKEN` and `aim_` API keys remain machine-only credentials sent
-as `Authorization: Bearer <token>` by MCP, hook, handoff, and workstream clients.
+session plus CSRF protection. Browser-stored Bearers remain unsupported. The
+inbox composer can use an explicitly entered write token for a single message
+when the legacy sign-in is
+read-only; it clears the token after the request and never persists it.
+Outside this inbox action, `AI_MEMORY_AUTH_TOKEN` and `aim_` API keys remain
+machine credentials sent as `Authorization: Bearer <token>` by MCP, hook, handoff,
+and workstream clients.
 
 To host the web UI under a URL subpath behind a reverse proxy, the
 `--base-path` / `--web-slug` flags do the work. See
@@ -955,3 +959,45 @@ aggregation. Session-end totals remain as a fallback for history.
 
 The header's Light / Dark / System control stores the preference in the browser.
 System follows operating-system changes, and a manual choice overrides it.
+
+### Explore agents and sessions
+
+The workspace sidebar keeps projects, the inbox, workstreams, the knowledge
+graph, learning review and server health within reach on desktop and mobile.
+Project cards show the recorded harnesses and can be filtered by name, open
+sessions or queued messages. An open session only means its end event has not
+arrived. It does not prove that an agent is online.
+
+Inside a project, agent cards add up reported usage across sessions and show how
+many sessions reported it. "Explore sessions" pages through one harness's
+sessions, and a session opens to its response ledger and captured event
+timeline. Missing usage stays unknown. Legacy session totals can exist without
+individual response records, so coverage and captured-call counts are shown
+separately.
+
+The response table can be searched by model, agent or response, filtered by
+investigation signal, and sorted by token usage or capture time. These controls
+work on the fifty largest captured responses in the current scope. A project
+refresh keeps the filter controls and keyboard focus in place. A session's
+response ledger is a snapshot until the page is refreshed.
+
+### Coordinate work from the browser
+
+The Inbox lists the messages a selected project received and sent, fifty per
+page, without claiming them. Expanding a row shows its plain text. New message
+picks a source project and a recipient harness from the agents that already have
+sessions in visible projects. Sending needs write access to both projects and
+goes through the configured sanitizer and message admission policy. Browser
+sessions use the existing CSRF checks.
+
+A queued request does not launch an agent. The addressed harness collects it the
+next time it checks its inbox, and "Collected" records that claim, not that the
+task succeeded. Static MCP clients pass their harness in the `agent` argument of
+`memory_message_pop`. See [agent messaging](agent-messaging.md).
+
+The navigation and drilldowns follow the overview-to-detail approach in
+[Grafana](https://grafana.com/docs/grafana/latest/visualizations/dashboards/build-dashboards/best-practices/)
+and the session grouping documented by
+[Langfuse](https://langfuse.com/docs/observability/features/sessions). They are
+interaction references. The built-in interface is still Cargo-built HTML and CSS
+with small vanilla JavaScript enhancements.
