@@ -183,7 +183,7 @@ mod tests {
         conn.execute_batch("INSERT INTO workspaces(id,name,created_at) VALUES(zeroblob(16),'usage',1);
             INSERT INTO projects(id,workspace_id,name,created_at) VALUES(zeroblob(16),zeroblob(16),'usage',1);
             INSERT INTO sessions(id,workspace_id,project_id,agent_kind,started_at) VALUES(zeroblob(16),zeroblob(16),zeroblob(16),'codex',1);
-            INSERT INTO token_calls(session_id,call_id,input_tokens,output_tokens,observed_at) VALUES(zeroblob(16),'old-response',70,7,123);").unwrap();
+            INSERT INTO token_calls(session_id,call_id,input_tokens,output_tokens,cache_write_tokens,cache_read_tokens,observed_at) VALUES(zeroblob(16),'old-response',70,7,0,0,123);").unwrap();
         run(&mut conn).unwrap();
         run(&mut conn).unwrap();
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();

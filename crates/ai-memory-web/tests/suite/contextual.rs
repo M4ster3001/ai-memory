@@ -326,6 +326,38 @@ async fn contextual_page_sources_preserve_shared_pages_and_refuse_foreign_or_pri
         "Root control must see the private far end"
     );
     let app = mounted(&store, wiki, None);
+    let owned = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/web/w/team/app/p/target.md")
+                .extension(AuthLevel::User)
+                .extension(AuthorizedViewer(user))
+                .extension(ActorContext {
+                    user: Some("alice".into()),
+                    ..ActorContext::anonymous()
+                })
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(owned.status(), StatusCode::OK);
+    let owned_html = String::from_utf8(
+        axum::body::to_bytes(owned.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(
+        owned_html.contains(&ids[0].to_string()),
+        "The route must forward the legitimate owner's context"
+    );
+    assert!(
+        !owned_html.contains(&ids[1].to_string()),
+        "Another owner's source must stay hidden"
+    );
     let (_, html) = get(
         &app,
         "/web/w/team/app/p/target.md",
@@ -452,9 +484,17 @@ async fn contextual_evidence_paginates_versions_and_hides_expired_disagreements(
     assert!(!html.contains("private-opaque-"));
     let (_, html) = get(&app, "/web/w/team/app/p/expired.md", AuthLevel::Root, None).await;
     assert!(html.contains("Expired: excluded from normal retrieval"));
-    wiki.write_page(request("page.md", serde_json::json!({}), vec![]))
+    let same = wiki
+        .write_page(request("page.md", serde_json::json!({}), vec![]))
         .await
         .unwrap();
+    assert_eq!(
+        same, id,
+        "Identical writes keep the version and its citations"
+    );
+    let mut rewritten = request("page.md", serde_json::json!({}), vec![]);
+    rewritten.body = "# Changed version\n\nThis rewrite has different evidence.".into();
+    wiki.write_page(rewritten).await.unwrap();
     let now = read(0).await.unwrap().unwrap();
     assert_ne!(now.page_id, id);
     assert_eq!(
