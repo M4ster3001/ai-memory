@@ -13,6 +13,13 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- The Docker install guide now says up front that its client-side commands need
+  a native `ai-memory` binary on the laptop, not the Docker image. It names the
+  two failures a Docker-only client hits: `command not found`, and `403
+  Forbidden: forbidden host` when the server's `AI_MEMORY_ALLOWED_HOSTS` still
+  holds the literal `<server-ip>` placeholder. A troubleshooting table covers
+  both and the `401 Unauthorized` case (#NNN).
+
 - Refused empty and whitespace-only `--workspace` and `--project` flags at the
   shared CLI scope-resolution choke point (`resolve_scope`,
   `resolve_scope_noting_marker_project`, `resolve_scope_with_marker`, and
