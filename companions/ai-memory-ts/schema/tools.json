@@ -726,6 +726,12 @@
       "include_related": {
         "type": "boolean"
       },
+      "max_chars": {
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
       "path": {
         "type": [
           "null",

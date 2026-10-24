@@ -172,6 +172,8 @@ export interface ReadPageBase extends ScopedArgs {
   includeRelated?: boolean;
   /** Hops to walk with `includeRelated` (default 1, capped at 3 by the server). */
   relatedDepth?: number;
+  /** Cap the returned body at this many characters (default 12000, 500 to 64000). */
+  maxChars?: number;
 }
 
 /** Arguments of {@link PagesNamespace.read}: exactly one of `path` or `query`. */
@@ -217,8 +219,12 @@ export interface Page {
   readonly path: string;
   /** Page title. */
   readonly title: UntrustedText;
-  /** Markdown body. */
+  /** Markdown body, cut at `maxChars` with a visible marker when `truncated`. */
   readonly body: UntrustedText;
+  /** Whether the server cut the body at `maxChars`. */
+  readonly truncated: boolean | undefined;
+  /** Length in characters of the untruncated body. */
+  readonly totalChars: number | undefined;
   /** Parsed frontmatter (tags, tier, pinned and other metadata). Untrusted. */
   readonly frontmatter: Readonly<Record<string, unknown>>;
   /** Bounded heading hashes for anchored patches. */
@@ -601,7 +607,7 @@ export interface ObservationsArgs extends ScopedArgs {
    * completed one when nothing worked in the last 30 days.
    */
   sessionId?: string;
-  /** Maximum observations (server default 50, clamped to 200). */
+  /** Maximum observations (server default 20, clamped to 200). */
   limit?: number;
   /** Observations to skip. */
   offset?: number;
@@ -611,7 +617,7 @@ export interface ObservationsArgs extends ScopedArgs {
   kinds?: ObservationKind[];
   /** Full-text query restricted to the session. */
   query?: string;
-  /** Cap each body at this many characters (200 to 16384, default 4000). */
+  /** Cap each body at this many characters (200 to 16384, default 1000). */
   bodyMaxChars?: number;
 }
 

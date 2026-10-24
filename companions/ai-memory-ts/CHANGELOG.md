@@ -15,6 +15,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `query` takes the server's `memory_query` page filters: `kind`, `tier`,
   `pathPrefix` and `tag`, in every search mode.
 
+- `pages.read` takes `maxChars`, and `Page` carries `truncated` and
+  `totalChars`, matching the server's new `memory_read_page` size cap. Both are
+  `undefined` against a server that predates it. The documented `observations`
+  defaults are now 20 rows of 1000 characters.
+
 ## [0.1.0]
 
 ### Added

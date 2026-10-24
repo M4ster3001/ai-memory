@@ -67,7 +67,7 @@ export const TOOL_COVERAGE: Readonly<Record<string, ToolClassification>> = {
     status: "wrapped",
     methods: ["pages.read", "pages.update"],
     phase: 1,
-    sends: [...SCOPE, "path", "query", "include_related", "related_depth"],
+    sends: [...SCOPE, "path", "query", "include_related", "related_depth", "max_chars"],
   },
   memory_delete_page: {
     status: "wrapped",

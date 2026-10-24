@@ -293,6 +293,8 @@ async fn read_page_response_payload_unchanged() {
             "sections",
             "sections_truncated",
             "title",
+            "total_chars",
+            "truncated"
         ],
         "reinforcement must not add fields to the read_page payload: {resp}"
     );

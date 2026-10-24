@@ -164,6 +164,12 @@ version in [`docs/changelog/`](docs/changelog/):
   side is upgraded, and nothing showed it. When they differ in major version,
   the text report adds a warning to upgrade the older side (#1644).
 
+- `memory_read_page` now accepts an optional `max_chars` (default 12000,
+  minimum 500, maximum 64000). It caps the returned body with the same visible
+  truncation marker that `memory_read_session_observations` already uses. The
+  response always carries `truncated` and `total_chars`, so a caller knows the
+  real size even when the body was not cut (#NNN).
+
 ### Changed
 
 - `memory_lint` now reports embedding-band pairs as
@@ -210,6 +216,14 @@ version in [`docs/changelog/`](docs/changelog/):
   and callers such as the reranker named only the first candidate, so a log
   could blame the primary for a timeout another candidate caused. Response
   bodies are never logged (#1628).
+
+- `memory_read_session_observations` returns less by default: `limit` drops
+  from 50 to 20 and `body_max_chars` from 4000 to 1000. A caller that needs
+  more can still raise either one, up to the unchanged ceilings of 200 and
+  16384. A routine "what did this session do" lookup is much cheaper this way.
+  The retrieval skill now documents a narrow `order="desc"` recipe, with a small
+  `kinds`, `limit` and `body_max_chars`, for that question instead of reading
+  the whole session (#NNN).
 
 ## [3.2.8] - 2026-10-27
 
