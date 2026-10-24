@@ -244,6 +244,7 @@ export class PagesNamespace {
         query: a.query,
         include_related: a.includeRelated === true ? true : undefined,
         related_depth: a.relatedDepth,
+        max_chars: a.maxChars,
       }),
       false,
       options,
@@ -255,6 +256,8 @@ export class PagesNamespace {
       path: str(o, "path", "memory_read_page"),
       title: untrusted(str(o, "title", "memory_read_page")),
       body: untrusted(str(o, "body", "memory_read_page")),
+      truncated: typeof o["truncated"] === "boolean" ? o["truncated"] : undefined,
+      totalChars: typeof o["total_chars"] === "number" ? o["total_chars"] : undefined,
       frontmatter:
         frontmatter !== null && typeof frontmatter === "object" && !Array.isArray(frontmatter)
           ? (frontmatter as Raw)

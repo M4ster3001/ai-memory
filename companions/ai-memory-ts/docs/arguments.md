@@ -40,6 +40,7 @@ Methods: `pages.read`, `pages.update`
 | `query` | `query` |
 | `include_related` | `includeRelated` |
 | `related_depth` | `relatedDepth` |
+| `max_chars` | `maxChars` |
 
 ## `memory_delete_page`
 

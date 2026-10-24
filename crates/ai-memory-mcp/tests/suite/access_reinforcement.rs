@@ -285,7 +285,15 @@ async fn read_page_response_payload_unchanged() {
     keys.sort_unstable();
     assert_eq!(
         keys,
-        vec!["body", "frontmatter", "page_id", "path", "title"],
+        vec![
+            "body",
+            "frontmatter",
+            "page_id",
+            "path",
+            "title",
+            "total_chars",
+            "truncated"
+        ],
         "reinforcement must not add fields to the read_page payload: {resp}"
     );
 }
