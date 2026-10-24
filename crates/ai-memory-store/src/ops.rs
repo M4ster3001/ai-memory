@@ -2860,17 +2860,25 @@ pub fn upsert_token_calls(
     let tx = conn.transaction()?;
     let now = Timestamp::now().as_microsecond();
     for call in calls.iter().take(256) {
+        let context = call.context.as_ref();
+        let response_at = context
+            .and_then(|c| c.recorded_at.as_deref())
+            .and_then(|s| s.parse::<Timestamp>().ok())
+            .map(|t| t.as_microsecond());
         tx.execute(
             "INSERT INTO token_calls \
                  (session_id, call_id, model, input_tokens, output_tokens, \
-                  cache_write_tokens, cache_read_tokens, observed_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+                  cache_write_tokens, cache_read_tokens, observed_at, turn_id, native_response_id, response_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
              ON CONFLICT(session_id, call_id) DO UPDATE SET \
                  model = COALESCE(excluded.model, model), \
                  input_tokens = MAX(input_tokens, excluded.input_tokens), \
                  output_tokens = MAX(output_tokens, excluded.output_tokens), \
                  cache_write_tokens = MAX(cache_write_tokens, excluded.cache_write_tokens), \
-                 cache_read_tokens = MAX(cache_read_tokens, excluded.cache_read_tokens)",
+                 cache_read_tokens = MAX(cache_read_tokens, excluded.cache_read_tokens), \
+                 turn_id = COALESCE(turn_id, excluded.turn_id), \
+                 native_response_id = COALESCE(native_response_id, excluded.native_response_id), \
+                 response_at = COALESCE(response_at, excluded.response_at)",
             params![
                 session_id.as_bytes(),
                 call.call_id,
@@ -2880,8 +2888,17 @@ pub fn upsert_token_calls(
                 call.cache_write_tokens.min(1_000_000_000) as i64,
                 call.cache_read_tokens.min(1_000_000_000) as i64,
                 now,
+                context.and_then(|c| c.turn_id.as_deref()),
+                context.and_then(|c| c.response_id.as_deref()),
+                response_at,
             ],
         )?;
+        if let Some(context) = context {
+            for tool in context.tools.iter().take(16) {
+                tx.execute("INSERT INTO token_call_tools (session_id,call_id,tool_id,tool_name,relation,is_error) VALUES (?1,?2,?3,?4,?5,?6) ON CONFLICT(session_id,call_id,tool_id,relation) DO UPDATE SET tool_name=excluded.tool_name, is_error=CASE WHEN is_error=1 OR excluded.is_error=1 THEN 1 ELSE COALESCE(excluded.is_error,is_error) END",
+                    params![session_id.as_bytes(),call.call_id,tool.id,tool.name,tool.relation.as_str(),tool.is_error])?;
+            }
+        }
     }
     let usage = tx.query_row(
         "SELECT SUM(input_tokens), SUM(output_tokens), \
@@ -8917,6 +8934,7 @@ pub(crate) mod tests {
         let sid = SessionId::new();
         begin_session(&mut conn, &hook_session(sid, ws, proj, None)).unwrap();
         let mut call = ai_memory_core::TokenCall {
+            context: None,
             call_id: "response-1".into(),
             input_tokens: 100,
             output_tokens: 10,

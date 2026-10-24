@@ -16,6 +16,8 @@ use crate::recall::Recall;
 /// [`crate::router`].
 #[derive(Clone)]
 pub struct WebState {
+    /// Safe effective startup configuration; absent for unwired embedders.
+    pub runtime: Option<crate::features::RuntimeFeatures>,
     /// Read-only SQLite pool — drives FTS5 search, page metadata,
     /// project list aggregates.
     pub reader: ReaderPool,
@@ -41,6 +43,7 @@ impl WebState {
     #[must_use]
     pub fn new(reader: ReaderPool, wiki: Wiki) -> Self {
         Self {
+            runtime: None,
             reader,
             wiki,
             ingest_metrics: None,
@@ -48,6 +51,12 @@ impl WebState {
             recall: Recall::default(),
             health: None,
         }
+    }
+
+    /// Attach safe startup switches without retaining raw configuration.
+    pub fn with_runtime(mut self, runtime: Option<crate::features::RuntimeFeatures>) -> Self {
+        self.runtime = runtime;
+        self
     }
 
     /// Attach the server's shared hook-health counters to a web surface.
