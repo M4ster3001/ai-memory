@@ -3411,6 +3411,7 @@ async fn handle_send_message(
         from_owner_user,
         to_workspace_id: to_ws,
         to_project_id: to_proj,
+        to_agent: None,
         subject,
         body,
     };
@@ -3459,6 +3460,8 @@ async fn handle_send_message(
 /// `POST /admin/messages/pop` request body (V64).
 #[derive(Debug, Deserialize)]
 struct PopMessageRequest {
+    #[serde(default)]
+    agent: Option<AgentKind>,
     workspace: String,
     project: String,
     #[serde(default)]
@@ -3516,7 +3519,15 @@ async fn handle_pop_message(
     let claim = ai_memory_core::MessageClaim {
         workspace_id: ws,
         project_id: proj,
-        claiming_agent: AgentKind::Other,
+        claiming_agent: req
+            .agent
+            .or_else(|| {
+                actor_ext
+                    .as_ref()
+                    .and_then(|a| a.0.agent.as_deref())
+                    .map(AgentKind::from_wire)
+            })
+            .unwrap_or(AgentKind::Other),
         claiming_session: None,
         claiming_user,
     };
@@ -9552,6 +9563,7 @@ mod tests {
                     from_owner_user: None,
                     to_workspace_id: ws,
                     to_project_id: recipient,
+                    to_agent: None,
                     subject: None,
                     body: "fixture".into(),
                 })

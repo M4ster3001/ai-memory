@@ -985,3 +985,13 @@ accepting wildcard. The layer allows `GET / POST / OPTIONS`,
 
 For status updates on any of these, the issue tracker is the source of
 truth.
+
+### Browser inbox exception
+
+The `/api/v1` surface and wiki editing stay read-only. The built-in web UI adds
+`/web/inbox` and `POST /web/messages` (under the configured base path and web
+slug). The POST queues a sanitized, admitted message for an existing project and
+harness. It requires write access to the source and destination, a JSON body,
+the UI header and the normal browser-session CSRF checks. It does not mutate
+wiki pages, pop messages or run an agent. See
+[agent messaging](agent-messaging.md#in-the-web-ui).

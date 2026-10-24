@@ -5143,6 +5143,17 @@ impl ReaderPool {
         proj: ProjectId,
         owner: OwnerFilter,
     ) -> StoreResult<TokenUsageReport> {
+        self.token_usage_report_filtered(ws, proj, owner, None)
+            .await
+    }
+
+    pub(crate) async fn token_usage_report_filtered(
+        &self,
+        ws: WorkspaceId,
+        proj: ProjectId,
+        owner: OwnerFilter,
+        session: Option<SessionId>,
+    ) -> StoreResult<TokenUsageReport> {
         self.with_conn(move |conn| {
             let (mode, actor) = match owner {
                 OwnerFilter::Any => (0, String::new()),
@@ -5152,8 +5163,10 @@ impl ReaderPool {
             let from = " FROM token_calls c JOIN sessions s ON s.id = c.session_id \
                          WHERE s.workspace_id = ?1 AND s.project_id = ?2 \
                          AND (?3 = 0 OR s.actor_user IS NULL \
-                              OR (?3 = 1 AND s.actor_user = ?4))";
-            let params = rusqlite::params![ws.as_bytes(), proj.as_bytes(), mode, actor];
+                              OR (?3 = 1 AND s.actor_user = ?4)) AND (?5 IS NULL OR s.id = ?5)";
+            let session_bytes = session.map(|id| id.as_bytes().to_vec());
+            let params =
+                rusqlite::params![ws.as_bytes(), proj.as_bytes(), mode, actor, session_bytes];
             let mut report = conn.query_row(
                 &format!(
                     "SELECT COUNT(*), COALESCE(SUM(c.input_tokens), 0), \
@@ -5581,6 +5594,7 @@ impl ReaderPool {
             limit,
             offset,
             None,
+            None,
         )
         .await
     }
@@ -5610,6 +5624,7 @@ impl ReaderPool {
                 1,
                 0,
                 Some(session_id),
+                None,
             )
             .await?;
         Ok(sessions.pop())
@@ -5702,7 +5717,7 @@ impl ReaderPool {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn sessions_for_scope_filtered(
+    pub(crate) async fn sessions_for_scope_filtered(
         &self,
         workspace_id: WorkspaceId,
         project_id: ProjectId,
@@ -5711,10 +5726,16 @@ impl ReaderPool {
         limit: usize,
         offset: usize,
         exact_session_id: Option<SessionId>,
+        agent: Option<String>,
     ) -> StoreResult<Vec<SessionSummary>> {
         self.with_conn(move |conn| {
             let sql =
                 sessions_for_scope_sql(exact_session_id.is_some(), &owner_filter, include_open);
+            let sql = if agent.is_some() {
+                sql.replace("WHERE 1 = 1", "WHERE s.agent_kind = :agent")
+            } else {
+                sql
+            };
             let mut stmt = conn.prepare_cached(&sql)?;
             let ws_bytes = workspace_id.as_bytes();
             let proj_bytes = project_id.as_bytes();
@@ -5729,6 +5750,9 @@ impl ReaderPool {
             ];
             if let Some(sid) = &sid_bytes {
                 named.push((":sid", sid));
+            }
+            if let Some(agent) = &agent {
+                named.push((":agent", agent));
             }
             if let OwnerFilter::User(user) = &owner_filter {
                 named.push((":actor", user));

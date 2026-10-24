@@ -1,0 +1,21 @@
+<script>
+(function(){
+  var timer,stopped=false;
+  async function refresh(){
+    if(stopped)return;
+    if(document.hidden){timer=setTimeout(refresh,10000);return;}
+    var controller=new AbortController(),timeout=setTimeout(function(){controller.abort();},5000);
+    try{
+      var response=await fetch(location.href,{credentials:"same-origin",signal:controller.signal,headers:{"Accept":"text/html"}});
+      if(!response.ok||response.redirected)throw new Error("Refresh unavailable");
+      var page=new DOMParser().parseFromString(await response.text(),"text/html");
+      ["#token-usage .usage-metrics","#token-usage .usage-results","#agents .agent-grid","#project-capture-summary","#session-token-table"].forEach(function(selector){var next=page.querySelector(selector),current=document.querySelector(selector);if(next&&current&&!current.contains(document.activeElement))current.replaceWith(next);});
+      document.getElementById("token-refresh-status").textContent="";document.dispatchEvent(new Event("usage:updated"));
+    }catch(_){document.getElementById("token-refresh-status").textContent="Update unavailable. Showing the last received values.";}
+    finally{clearTimeout(timeout);if(!stopped)timer=setTimeout(refresh,10000);}
+  }
+  timer=setTimeout(refresh,10000);
+  window.addEventListener("pagehide",function(){stopped=true;clearTimeout(timer);});
+  window.addEventListener("pageshow",function(event){if(event.persisted){stopped=false;timer=setTimeout(refresh,10000);}});
+})();
+</script>

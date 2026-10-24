@@ -3693,8 +3693,9 @@ async fn project_view_separates_machinery_from_knowledge() {
 
     // The sidebar still reaches everything: machinery sits in the
     // collapsed System section.
-    let sidebar =
-        &text[text.find("<aside").expect("sidebar")..text.find("Recent Activity").unwrap()];
+    let sidebar = &text[text
+        .find("<aside aria-label=\"Project pages\"")
+        .expect("sidebar")..text.find("Recent Activity").unwrap()];
     let system = &sidebar[sidebar.find("System").expect("system section")..];
     assert!(system.contains("Lint report 2026-09-02"));
     assert!(system.contains("Session abc123"));
@@ -3985,7 +3986,7 @@ async fn project_view_session_without_usage_shows_dash_not_zero() {
 }
 
 #[tokio::test]
-async fn homepage_llm_notice_is_dismissible_and_backup_banner_is_gone() {
+async fn homepage_memory_explainer_is_collapsed_and_backup_banner_is_gone() {
     let (_tmp, store, wiki) = setup().await;
     let ws = store
         .writer
@@ -4012,11 +4013,11 @@ async fn homepage_llm_notice_is_dismissible_and_backup_banner_is_gone() {
         .unwrap();
     let text = std::str::from_utf8(&body).unwrap();
 
-    // The explainer ships hidden with a persistent dismissal control;
-    // client script reveals it unless previously dismissed.
-    assert!(text.contains(r#"id="llm-notice""#));
-    assert!(text.contains(r#"id="llm-notice-close""#));
-    assert!(text.contains("ai-memory-llm-notice-dismissed"));
+    // The explainer stays available without competing with the operational cards.
+    let explainer = text.split("About compiled memory").next().unwrap();
+    let details = explainer.rsplit("<details").next().unwrap();
+    assert!(!details.contains(" open"));
+    assert!(text.contains("Pages are compiled from captured observations"));
     assert!(text.contains("Memory dashboard"));
     assert!(text.contains("Captured events"));
     assert!(text.contains("Open sessions"));
@@ -5009,6 +5010,7 @@ async fn send_mail(
             from_owner_user: None,
             to_workspace_id: to.0,
             to_project_id: to.1,
+            to_agent: None,
             subject: Some(subject.to_owned()),
             body: body.to_owned(),
         })
@@ -5651,7 +5653,13 @@ async fn sidebar_folders_show_five_newest_with_a_link_to_the_rest() {
     assert!(body.contains("href=\"w/default/scratch/p/big/\""));
     assert!(body.contains("(6)"));
     assert!(body.contains("View all 6"));
-    let side = &body[..body.find("</aside>").expect("sidebar")];
+    let side = body
+        .split("<aside aria-label=\"Project pages\"")
+        .nth(1)
+        .expect("project sidebar")
+        .split("</aside>")
+        .next()
+        .unwrap();
     assert!(side.contains("Big 5") && !side.contains("Big 0"));
     // Five pages: all shown, no link; the root bucket is unlinked.
     assert!(body.contains("Five 0") && !body.contains("View all 5"));
@@ -5813,8 +5821,8 @@ async fn project_tree_and_namespace_listing_hide_expired_pages() {
     // The home page cards count only unexpired pages.
     let (status, home) = get_body(&app, "/").await;
     assert_eq!(status, StatusCode::OK);
-    assert!(home.contains("2 pages"), "{home}");
-    assert!(!home.contains("4 pages"), "{home}");
+    assert!(home.contains("2 <small>pages</small>"), "{home}");
+    assert!(!home.contains("4 <small>pages</small>"), "{home}");
 
     let (status, namespace) = get_body(&app, "/w/default/scratch/p/notes/").await;
     assert_eq!(status, StatusCode::OK);
@@ -6107,7 +6115,7 @@ async fn header_search_carries_the_current_project() {
             !header.contains(r#"type="hidden" name="workspace""#),
             "{uri}: {header}"
         );
-        assert!(header.contains(r#"placeholder="Search…""#), "{uri}");
+        assert!(header.contains(r#"placeholder="Search memory…""#), "{uri}");
     }
 }
 

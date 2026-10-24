@@ -2003,7 +2003,11 @@ async fn fetch_and_accept_handoff_at(
     // text (no subject, no sender string) — so a hostile message cannot inject
     // text into the on-start context. Nothing is popped here; the agent pops
     // deliberately via memory_message_pop.
-    let inbox_notice = match state.reader.pending_message_count(ws, proj).await {
+    let inbox_notice = match state
+        .reader
+        .pending_messages_for_agent(ws, proj, agent)
+        .await
+    {
         Ok(0) => None,
         Ok(count) => {
             let names = inbox_scope_names(state, ws, proj).await;
@@ -5942,6 +5946,7 @@ pub(crate) mod tests {
                     from_owner_user: None,
                     to_workspace_id: state.workspace_id,
                     to_project_id: state.project_id,
+                    to_agent: None,
                     subject: Some(format!("subject {i}")),
                     body: format!("please do task {i}"),
                 })
