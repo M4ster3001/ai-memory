@@ -26,7 +26,7 @@
   <p class="mt-1 text-sm text-slate-500 dark:text-slate-400">Capture and continuity summary. Counts are metadata; raw prompts and commands are not shown here.</p>
 </div>
 
-<section aria-label="Project capture summary" class="mb-8 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900/50 p-5">
+<section id="project-capture-summary" aria-label="Project capture summary" class="mb-8 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900/50 p-5">
   <div class="project-memory-grid">
     <div><div class="text-xs text-slate-500">Sessions</div><div class="mt-1 text-xl font-semibold">{{ stats.session_count }}</div></div>
     <div><div class="text-xs text-slate-500">Captured events</div><div class="mt-1 text-xl font-semibold">{{ stats.observation_count }}</div></div>
@@ -68,6 +68,46 @@
   </label>
   <button type="submit" class="rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700">Search</button>
 </form>
+
+<section id="token-usage" class="usage-panel" aria-labelledby="token-heading">
+  <div class="usage-heading"><div><h2 id="token-heading">Token usage</h2><p>Measured model responses · updates every 10 seconds</p></div><span class="usage-status">Live during sessions</span></div>
+  <div class="usage-metrics">
+    <div><span>Captured calls</span><strong>{{ token_usage.count }}</strong></div>
+    <div><span>Fresh input</span><strong>{{ token_usage.input }}</strong></div>
+    <div><span>Output</span><strong>{{ token_usage.output }}</strong></div>
+    <div><span>Cache read</span><strong>{{ token_usage.cache_read }}</strong></div>
+    <div><span>Cache write</span><strong>{{ token_usage.cache_write }}</strong></div>
+    <div><span>Input from cache</span><strong>{{ token_usage.hit_rate }}</strong></div>
+  </div>
+  <p class="usage-note">Largest 50 captured responses, including cached tokens. Select a response to inspect its session. Signals are investigation hints, not errors or monetary cost estimates. Usage appears after transcript writes. Coverage starts with live capture; unsupported or missing usage is not zero.</p>
+  {% if token_usage.rows.is_empty() %}<p class="usage-empty">Waiting for response usage. Updated Claude Code and Codex hooks report during tool calls and completed turns; ending the session is not required.</p>{% else %}
+  <div class="usage-scroll"><table class="usage-table"><thead><tr><th>Response / session</th><th>Model</th><th>Fresh input</th><th>Output</th><th>Cache</th><th>Total</th><th>Signal</th></tr></thead><tbody>
+  {% for row in token_usage.rows %}<tr><td><a href="{{ row.href }}" title="{{ row.id }}">{{ row.agent }}</a><small class="usage-response-id">{{ row.id }}</small><small>{{ row.when }}</small></td><td>{{ row.model }}</td><td>{{ row.input }}</td><td>{{ row.output }}</td><td>{{ row.cache }}</td><td><strong>{{ row.total }}</strong></td><td><span class="{% if row.signal != "—" %}usage-alert{% endif %}">{{ row.signal }}</span></td></tr>{% endfor %}
+  </tbody></table></div>{% endif %}
+  <p class="usage-note" id="token-refresh-status" role="status" aria-live="polite"></p>
+</section>
+<script>
+(function () {
+  var timer;
+  async function refresh() {
+    if (document.hidden) { timer=setTimeout(refresh,10000); return; }
+    var controller=new AbortController();
+    var timeout=setTimeout(function(){controller.abort();},5000);
+    try {
+      var response=await fetch(location.href,{credentials:"same-origin",signal:controller.signal,headers:{"Accept":"text/html"}});
+      if(!response.ok || response.redirected) throw new Error("refresh unavailable");
+      var page=new DOMParser().parseFromString(await response.text(),"text/html");
+      ["token-usage","project-capture-summary","session-token-table"].forEach(function(id){
+        var next=page.getElementById(id), current=document.getElementById(id);
+        if(next && current) current.replaceWith(next);
+      });
+    } catch (_) { document.getElementById("token-refresh-status").textContent="Update unavailable. Showing the last received values."; }
+    finally {clearTimeout(timeout);timer=setTimeout(refresh,10000);}
+  }
+  timer=setTimeout(refresh,10000);
+  window.addEventListener("pagehide",function(){clearTimeout(timer);});
+})();
+</script>
 
 <div class="flex flex-col md:flex-row gap-8">
   <!-- Sidebar: folder tree -->
@@ -222,7 +262,7 @@
   </div>
 </div>
 
-<div class="mt-10">
+<div id="session-token-table" class="mt-10">
   <h2 class="text-xs font-semibold uppercase tracking-wide text-slate-400 dark:text-slate-500 mb-3">Sessions</h2>
   {% if sessions.is_empty() %}
   <p class="text-sm text-slate-400 dark:text-slate-600">No sessions recorded yet.</p>

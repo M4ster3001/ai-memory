@@ -1556,6 +1556,46 @@ pub struct SessionSummary {
     pub usage: Option<SessionUsageView>,
 }
 
+/// One measured response, with no prompt or tool text.
+#[derive(Debug, Clone)]
+pub struct TokenCallView {
+    /// Native response id.
+    pub call_id: String,
+    /// Source session id.
+    pub session_id: String,
+    /// Source harness.
+    pub agent: String,
+    /// Reported model or an unavailable marker.
+    pub model: String,
+    /// Fresh input.
+    pub input: u64,
+    /// Output including reasoning.
+    pub output: u64,
+    /// Cache writes.
+    pub cache_write: u64,
+    /// Cache reads.
+    pub cache_read: u64,
+    /// First received timestamp.
+    pub observed_at: String,
+}
+
+/// Project usage coverage and its most expensive measured responses.
+#[derive(Debug, Clone, Default)]
+pub struct TokenUsageReport {
+    /// Largest fifty responses by input, cache and output combined.
+    pub calls: Vec<TokenCallView>,
+    /// All distinct measured responses, not only the displayed fifty.
+    pub call_count: u64,
+    /// Fresh input across measured responses.
+    pub input: u64,
+    /// Output across measured responses.
+    pub output: u64,
+    /// Cache writes across measured responses.
+    pub cache_write: u64,
+    /// Cache reads across measured responses.
+    pub cache_read: u64,
+}
+
 /// Cumulative token usage for one session (token-cost visibility), as
 /// surfaced by [`ReaderPool::sessions_for_scope`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -5271,6 +5311,80 @@ impl ReaderPool {
                 });
             }
             Ok(out)
+        })
+        .await
+    }
+
+    /// Read response diagnostics in one scope, filtering session ownership
+    /// before aggregating or ranking. No observation bodies are loaded.
+    pub async fn token_usage_report(
+        &self,
+        ws: WorkspaceId,
+        proj: ProjectId,
+        owner: OwnerFilter,
+    ) -> StoreResult<TokenUsageReport> {
+        self.with_conn(move |conn| {
+            let (mode, actor) = match owner {
+                OwnerFilter::Any => (0, String::new()),
+                OwnerFilter::User(a) => (1, a),
+                OwnerFilter::Unattributed => (2, String::new()),
+            };
+            let from = " FROM token_calls c JOIN sessions s ON s.id = c.session_id \
+                         WHERE s.workspace_id = ?1 AND s.project_id = ?2 \
+                         AND (?3 = 0 OR s.actor_user IS NULL \
+                              OR (?3 = 1 AND s.actor_user = ?4))";
+            let params = rusqlite::params![ws.as_bytes(), proj.as_bytes(), mode, actor];
+            let mut report = conn.query_row(
+                &format!(
+                    "SELECT COUNT(*), COALESCE(SUM(c.input_tokens), 0), \
+                         COALESCE(SUM(c.output_tokens), 0), \
+                         COALESCE(SUM(c.cache_write_tokens), 0), \
+                         COALESCE(SUM(c.cache_read_tokens), 0){from}"
+                ),
+                params,
+                |r| {
+                    Ok(TokenUsageReport {
+                        call_count: r.get(0)?,
+                        input: r.get(1)?,
+                        output: r.get(2)?,
+                        cache_write: r.get(3)?,
+                        cache_read: r.get(4)?,
+                        calls: Vec::new(),
+                    })
+                },
+            )?;
+            let mut stmt = conn.prepare(&format!(
+                "SELECT c.call_id, s.id, s.agent_kind, COALESCE(c.model, 'Not reported'), \
+                        c.input_tokens, c.output_tokens, c.cache_write_tokens, \
+                        c.cache_read_tokens, c.observed_at {from} \
+                 ORDER BY c.input_tokens + c.output_tokens + c.cache_write_tokens \
+                          + c.cache_read_tokens DESC, c.observed_at DESC, c.call_id LIMIT 50"
+            ))?;
+            let rows = stmt.query_map(params, |r| {
+                let sid: Vec<u8> = r.get(1)?;
+                Ok((
+                    sid,
+                    TokenCallView {
+                        call_id: r.get(0)?,
+                        session_id: String::new(),
+                        agent: r.get(2)?,
+                        model: r.get(3)?,
+                        input: r.get(4)?,
+                        output: r.get(5)?,
+                        cache_write: r.get(6)?,
+                        cache_read: r.get(7)?,
+                        observed_at: jiff::Timestamp::from_microsecond(r.get(8)?)
+                            .map(|t| t.to_string())
+                            .unwrap_or_default(),
+                    },
+                ))
+            })?;
+            for row in rows {
+                let (sid, mut call) = row?;
+                call.session_id = SessionId::from_slice(&sid)?.to_string();
+                report.calls.push(call);
+            }
+            Ok(report)
         })
         .await
     }

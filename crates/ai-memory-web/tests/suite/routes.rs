@@ -3693,7 +3693,8 @@ async fn project_view_separates_machinery_from_knowledge() {
 
     // The sidebar still reaches everything: machinery sits in the
     // collapsed System section.
-    let sidebar = &text[..text.find("Recent Activity").unwrap()];
+    let sidebar =
+        &text[text.find("<aside").expect("sidebar")..text.find("Recent Activity").unwrap()];
     let system = &sidebar[sidebar.find("System").expect("system section")..];
     assert!(system.contains("Lint report 2026-09-02"));
     assert!(system.contains("Session abc123"));
@@ -3852,6 +3853,83 @@ async fn project_view_shows_session_token_usage() {
         sessions.contains("12.3k in / 6.8k out"),
         "the session row must show its own token usage"
     );
+}
+
+#[tokio::test]
+async fn project_view_ranks_live_token_responses_and_flags_large_usage() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    let sid = SessionId::new();
+    store
+        .writer
+        .begin_session(NewSession {
+            occurred_at: None,
+            id: sid,
+            workspace_id: ws,
+            project_id: proj,
+            agent_kind: AgentKind::ClaudeCode,
+            cwd: None,
+            actor_user: None,
+        })
+        .await
+        .unwrap();
+    let calls: Vec<_> = (0..5)
+        .map(|i| ai_memory_core::TokenCall {
+            call_id: format!("response-{i}"),
+            input_tokens: if i == 4 { 150_000 } else { 100 },
+            output_tokens: 20,
+            cache_read_tokens: 800,
+            cache_write_tokens: 0,
+            model: Some("test-model".into()),
+        })
+        .collect();
+    store
+        .writer
+        .upsert_token_calls(sid, calls.clone())
+        .await
+        .unwrap();
+    store.writer.upsert_token_calls(sid, calls).await.unwrap();
+    let response = router(store.reader.clone(), wiki)
+        .oneshot(
+            Request::builder()
+                .uri("/w/default/scratch")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = std::str::from_utf8(&body).unwrap();
+    let panel = text
+        .split("id=\"token-usage\"")
+        .nth(1)
+        .unwrap()
+        .split("</section>")
+        .next()
+        .unwrap();
+    assert!(panel.contains("Captured calls</span><strong>5</strong>"));
+    assert!(panel.contains("Above 3× average"));
+    assert!(panel.contains("test-model"));
+    assert!(panel.find("response-4").unwrap() < panel.find("response-0").unwrap());
+    assert!(
+        panel.contains(&sid.to_string()),
+        "responses link to their source session"
+    );
+    for theme in ["light", "dark", "system"] {
+        assert!(text.contains(&format!("data-theme-choice=\"{theme}\"")));
+    }
 }
 
 /// A session with no reported usage shows "—", never a zeroed total — the

@@ -164,6 +164,30 @@ mod tests {
     };
     use rusqlite::{Connection, params};
 
+    #[test]
+    fn v92_normalizes_codex_cache_once_and_preserves_claude() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        run_to(&mut conn, 91).unwrap();
+        conn.execute_batch("INSERT INTO workspaces(id,name,created_at) VALUES(zeroblob(16),'usage',1);
+            INSERT INTO projects(id,workspace_id,name,created_at) VALUES(zeroblob(16),zeroblob(16),'usage',1);
+            INSERT INTO sessions(id,workspace_id,project_id,agent_kind,started_at) VALUES(zeroblob(16),zeroblob(16),zeroblob(16),'codex',1);
+            INSERT INTO sessions(id,workspace_id,project_id,agent_kind,started_at) VALUES(x'00000000000000000000000000000001',zeroblob(16),zeroblob(16),'claude-code',1);
+            INSERT INTO session_usage(session_id,input_tokens,cache_read_tokens,updated_at) SELECT id,1000,800,1 FROM sessions;").unwrap();
+        run(&mut conn).unwrap();
+        run(&mut conn).unwrap();
+        let codex: u64 = conn
+            .query_row(
+                "SELECT input_tokens FROM session_usage WHERE session_id=zeroblob(16)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let claude:u64=conn.query_row("SELECT input_tokens FROM session_usage WHERE session_id=x'00000000000000000000000000000001'",[],|r|r.get(0)).unwrap();
+        assert_eq!(codex, 200);
+        assert_eq!(claude, 1000);
+    }
+
     /// A store migrated by a newer build (an applied version above anything
     /// this binary embeds) must fail to open with the actionable
     /// `DataSchemaAhead` error, not refinery's raw "missing from the

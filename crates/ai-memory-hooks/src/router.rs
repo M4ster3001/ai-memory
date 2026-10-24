@@ -4952,6 +4952,42 @@ async fn process_authorized(
         }
     }
 
+    // Admission and the observation write above establish this session's
+    // ownership before any usage is attached. No prompt or tool body is saved.
+    if let Some(values) = env
+        .raw
+        .get("_ai_memory_usage_calls")
+        .and_then(|v| v.as_array())
+    {
+        let calls: Vec<_> = values
+            .iter()
+            .take(256)
+            .filter_map(|value| {
+                let mut call: ai_memory_core::TokenCall =
+                    serde_json::from_value(value.clone()).ok()?;
+                if call.call_id.is_empty()
+                    || call.call_id.len() > 128
+                    || !call.call_id.bytes().all(|b| {
+                        b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b':' | b'.')
+                    })
+                    || state.sanitizer.scrub(&call.call_id) != call.call_id
+                {
+                    return None;
+                }
+                call.model = call.model.map(|m| {
+                    state
+                        .sanitizer
+                        .scrub(&m.trim().chars().take(64).collect::<String>())
+                });
+                Some(call)
+            })
+            .collect();
+        if !calls.is_empty()
+            && let Err(e) = state.writer.upsert_token_calls(session_id, calls).await
+        {
+            warn!(error=%e,"live token usage write failed");
+        }
+    }
     // On SessionEnd, close boundary-only sessions without generated artifacts.
     // Substantive sessions synthesize the summary page and auto-handoff below.
     // OpenCode's service outlives its CLI: a completed root turn publishes a
@@ -24275,6 +24311,87 @@ pub(crate) mod tests {
         assert!(is_acknowledgment("谢谢"));
         assert!(!is_acknowledgment("fix the bug in main.rs"));
         assert!(!is_acknowledgment("what is the return type?"));
+    }
+
+    #[tokio::test]
+    async fn live_token_calls_update_open_sessions_without_an_end_event() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.trusted_proxy_identity = true;
+        let id = "live-token-session";
+        let event = || {
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "user-prompt".into(),
+                    agent: Some("claude-code".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({"session_id":id,"prompt":"work","_ai_memory_usage_calls":[{"call_id":"response-1","input_tokens":100,"output_tokens":20,"cache_write_tokens":0,"cache_read_tokens":80,"model":"test-model"}]}),
+            )
+        };
+        process(
+            &state,
+            event(),
+            Some(IdentityKey::User("alice".into())),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        process(
+            &state,
+            event(),
+            Some(IdentityKey::User("alice".into())),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        let report = state
+            .reader
+            .token_usage_report(
+                state.workspace_id,
+                state.project_id,
+                ai_memory_core::OwnerFilter::User("user:alice".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(report.call_count, 1);
+        assert_eq!(report.input, 100);
+        assert_eq!(report.cache_read, 80);
+        let other = state
+            .reader
+            .token_usage_report(
+                state.workspace_id,
+                state.project_id,
+                ai_memory_core::OwnerFilter::User("user:bob".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(other.call_count, 0);
+        for (workspace, project) in [
+            (WorkspaceId::new(), state.project_id),
+            (state.workspace_id, ProjectId::new()),
+        ] {
+            let foreign = state
+                .reader
+                .token_usage_report(workspace, project, ai_memory_core::OwnerFilter::Any)
+                .await
+                .unwrap();
+            assert_eq!(foreign.call_count, 0);
+            assert_eq!(foreign.input, 0);
+            assert!(foreign.calls.is_empty());
+        }
+        let sid = SessionId::from_native(id);
+        let session = state
+            .reader
+            .session_summary_scoped(
+                state.workspace_id,
+                state.project_id,
+                sid,
+                ai_memory_core::OwnerFilter::Any,
+            )
+            .await
+            .unwrap();
+        assert!(session.unwrap().ended_at.is_none());
     }
 
     /// Token-cost visibility: the native hook splices this object
