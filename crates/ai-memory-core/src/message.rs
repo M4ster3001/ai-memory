@@ -42,6 +42,9 @@ pub enum MessageState {
     Claimed,
     /// The sender retracted it before it was popped.
     Cancelled,
+    /// The sender took it out of the queue to edit it. It cannot be popped
+    /// until the edit is saved or released, which returns it to `Pending`.
+    Editing,
 }
 
 impl MessageState {
@@ -52,6 +55,7 @@ impl MessageState {
             Self::Pending => "pending",
             Self::Claimed => "claimed",
             Self::Cancelled => "cancelled",
+            Self::Editing => "editing",
         }
     }
 }
@@ -64,6 +68,7 @@ impl std::str::FromStr for MessageState {
             "pending" => Ok(Self::Pending),
             "claimed" => Ok(Self::Claimed),
             "cancelled" => Ok(Self::Cancelled),
+            "editing" => Ok(Self::Editing),
             other => Err(crate::MemoryError::MalformedRecord(format!(
                 "unknown message state: {other}"
             ))),

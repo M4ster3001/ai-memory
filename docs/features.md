@@ -148,6 +148,12 @@ Verify: inspect "Sent". "Queued" means pending; "Collected" means an
 agent claimed the message, not that it completed the work. Reading the web
 inbox never claims mail or launches an agent.
 
+To change a message that is still queued, open it in "Received" and select
+"Edit". The message leaves the queue while you edit, so no agent can collect it.
+"Save and requeue" puts the new text back in its original place, and "Discard
+changes" puts the old text back. Held messages show as "Editing" and are counted
+above the list. A message an agent already collected cannot be edited.
+
 A static MCP client explicitly names the project and receiving harness:
 
 ```json

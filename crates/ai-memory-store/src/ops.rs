@@ -5930,6 +5930,114 @@ pub fn cancel_messages(
     Ok(changed as u64)
 }
 
+/// Take a pending message out of its recipient's queue so it can be edited.
+///
+/// `pending` becomes `editing` in one guarded `UPDATE` scoped to the recipient
+/// coordinate, so a message that another session already popped, a foreign
+/// project's message and an unknown id all change nothing and return `None`.
+/// While the row is `editing` no claim path can select it. The returned row is
+/// the content to edit.
+pub fn begin_message_edit(
+    conn: &mut Connection,
+    to_workspace_id: &WorkspaceId,
+    to_project_id: &ProjectId,
+    id: MessageId,
+) -> StoreResult<Option<ai_memory_core::AgentMessage>> {
+    let now = Timestamp::now().as_microsecond();
+    let tx = conn.transaction()?;
+    let changed = tx.execute(
+        "UPDATE agent_messages SET state = 'editing' \
+         WHERE id = ?1 AND to_workspace_id = ?2 AND to_project_id = ?3 \
+           AND state = 'pending'",
+        params![
+            id.as_bytes(),
+            to_workspace_id.as_bytes(),
+            to_project_id.as_bytes()
+        ],
+    )?;
+    if changed == 0 {
+        return Ok(None);
+    }
+    let message = tx.query_row(
+        &format!("SELECT {MESSAGE_COLUMNS} FROM agent_messages WHERE id = ?1"),
+        params![id.as_bytes()],
+        row_to_agent_message,
+    )??;
+    audit(
+        &tx,
+        "edit_message_begin",
+        Some(to_workspace_id.as_bytes()),
+        Some(to_project_id.as_bytes()),
+        None,
+        None,
+        now,
+    )?;
+    tx.commit()?;
+    Ok(Some(message))
+}
+
+/// Put an `editing` message back in the queue, optionally with new text.
+///
+/// With `replacement` the subject and body are replaced (bounded like a new
+/// message) and `edited_at` is stamped; without it the message returns
+/// unchanged. The `UPDATE` only matches a row still in `editing` inside the
+/// recipient coordinate, so a message that was already released, collected or
+/// belongs to another project is left alone and `false` is returned. The
+/// message keeps its `created_at`, so it returns to its original place.
+pub fn finish_message_edit(
+    conn: &mut Connection,
+    to_workspace_id: &WorkspaceId,
+    to_project_id: &ProjectId,
+    id: MessageId,
+    replacement: Option<(Option<&str>, &str)>,
+) -> StoreResult<bool> {
+    let now = Timestamp::now().as_microsecond();
+    let tx = conn.transaction()?;
+    let changed = match replacement {
+        Some((subject, body)) => tx.execute(
+            "UPDATE agent_messages \
+             SET state = 'pending', subject = ?4, body = ?5, edited_at = ?6 \
+             WHERE id = ?1 AND to_workspace_id = ?2 AND to_project_id = ?3 \
+               AND state = 'editing'",
+            params![
+                id.as_bytes(),
+                to_workspace_id.as_bytes(),
+                to_project_id.as_bytes(),
+                subject.map(bound_message_field),
+                bound_message_field(body),
+                now,
+            ],
+        )?,
+        None => tx.execute(
+            "UPDATE agent_messages SET state = 'pending' \
+             WHERE id = ?1 AND to_workspace_id = ?2 AND to_project_id = ?3 \
+               AND state = 'editing'",
+            params![
+                id.as_bytes(),
+                to_workspace_id.as_bytes(),
+                to_project_id.as_bytes()
+            ],
+        )?,
+    };
+    if changed > 0 {
+        audit(
+            &tx,
+            if replacement.is_some() {
+                "edit_message_save"
+            } else {
+                "edit_message_release"
+            },
+            Some(to_workspace_id.as_bytes()),
+            Some(to_project_id.as_bytes()),
+            None,
+            None,
+            now,
+        )?;
+    }
+    tx.commit()?;
+    Ok(changed > 0)
+}
+
 fn observation_kind_as_str(kind: ObservationKind) -> &'static str {
     kind.as_str()
 }

@@ -345,6 +345,71 @@ impl Wiki {
         Ok(id)
     }
 
+    /// Take a pending message out of its recipient's queue so its sender can
+    /// edit it. Until it is saved or released no harness can collect it.
+    /// Returns `None` when the message is not pending in that project.
+    /// Callers must authorize both project coordinates.
+    pub async fn begin_agent_message_edit(
+        &self,
+        to_workspace_id: ai_memory_core::WorkspaceId,
+        to_project_id: ai_memory_core::ProjectId,
+        id: ai_memory_core::MessageId,
+    ) -> WikiResult<Option<ai_memory_core::AgentMessage>> {
+        Ok(self
+            .writer
+            .begin_message_edit(to_workspace_id, to_project_id, id)
+            .await?)
+    }
+
+    /// Return a held message to the queue unchanged. Returns `false` when it
+    /// is not being edited in that project.
+    pub async fn release_agent_message_edit(
+        &self,
+        to_workspace_id: ai_memory_core::WorkspaceId,
+        to_project_id: ai_memory_core::ProjectId,
+        id: ai_memory_core::MessageId,
+    ) -> WikiResult<bool> {
+        Ok(self
+            .writer
+            .finish_message_edit(to_workspace_id, to_project_id, id, None)
+            .await?)
+    }
+
+    /// Save new text for a held message and return it to the queue. The text
+    /// goes through the same sanitization, size caps and `message_send`
+    /// admission as a new message. Returns `false` when the message is not
+    /// being edited in that project.
+    pub async fn save_agent_message_edit(
+        &self,
+        to_workspace_id: ai_memory_core::WorkspaceId,
+        to_project_id: ai_memory_core::ProjectId,
+        id: ai_memory_core::MessageId,
+        subject: Option<String>,
+        body: String,
+        actor: ActorContext,
+    ) -> WikiResult<bool> {
+        let body: String = self.sanitizer.scrub(&body).chars().take(8_000).collect();
+        let subject =
+            subject.map(|s| -> String { self.sanitizer.scrub(&s).chars().take(200).collect() });
+        let admission = self
+            .authorize_operation(
+                to_workspace_id,
+                to_project_id,
+                AdmissionOp::MessageSend,
+                actor,
+                Vec::new(),
+            )
+            .await?;
+        let saved = self
+            .writer
+            .finish_message_edit(to_workspace_id, to_project_id, id, Some((subject, body)))
+            .await?;
+        if saved && let Some(ctx) = admission.as_ref() {
+            self.notify_operation_observers(ctx);
+        }
+        Ok(saved)
+    }
+
     /// Attach an embedder. When set, every page-writing path (`write_page`,
     /// `apply_batch`, auto-improvement approval, checkpoint restore and the
     /// watcher's reindex) computes + stores an embedding for the new version
