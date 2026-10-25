@@ -35,6 +35,7 @@ pub(crate) struct RecipientOption {
 pub(crate) struct MessageRow {
     pub id: String,
     pub subject: String,
+    pub raw_subject: String,
     pub body: String,
     pub from: String,
     pub to: String,
@@ -56,6 +57,8 @@ pub(crate) struct InboxView {
     pub recipients: Vec<RecipientOption>,
     pub rows: Vec<MessageRow>,
     pub inbox: bool,
+    pub editing_count: usize,
+    pub editing_href: String,
     pub state: String,
     pub inbox_href: String,
     pub outbox_href: String,

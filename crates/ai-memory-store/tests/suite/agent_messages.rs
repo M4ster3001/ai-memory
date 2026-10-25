@@ -9,7 +9,8 @@
 //! recipient inbox is bounded so a flood cannot exhaust its context/storage.
 
 use ai_memory_core::{
-    AgentKind, MessageBox, MessageClaim, MessageNature, NewAgentMessage, ProjectId, WorkspaceId,
+    AgentKind, MessageBox, MessageClaim, MessageNature, MessageState, NewAgentMessage, ProjectId,
+    WorkspaceId,
 };
 use ai_memory_store::{MAX_PENDING_INBOX_MESSAGES, Store};
 
@@ -552,4 +553,212 @@ async fn a_full_inbox_rejects_further_sends() {
         .insert_message(message(a, b, "now there is room"))
         .await
         .expect("a send succeeds once the inbox drops below the cap");
+}
+
+/// A message being edited leaves the queue: it cannot be popped, counted or held
+/// twice, and only its own recipient project can hold, save or release it.
+#[tokio::test]
+async fn a_message_being_edited_leaves_the_queue_until_it_is_saved() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let a = project(&store, "team", "sender").await;
+    let b = project(&store, "team", "receiver").await;
+    let other = project(&store, "team", "other").await;
+    let id = store
+        .writer
+        .insert_message(message(a, b, "first draft"))
+        .await
+        .unwrap();
+
+    assert!(
+        store
+            .writer
+            .begin_message_edit(other.0, other.1, id)
+            .await
+            .unwrap()
+            .is_none(),
+        "a project that does not own the mailbox cannot hold the message"
+    );
+    assert_eq!(
+        store.reader.pending_message_count(b.0, b.1).await.unwrap(),
+        1
+    );
+
+    let held = store
+        .writer
+        .begin_message_edit(b.0, b.1, id)
+        .await
+        .unwrap()
+        .expect("a pending message can be held");
+    assert_eq!(held.body, "first draft");
+    assert_eq!(held.state, MessageState::Editing);
+    assert_eq!(
+        store.reader.pending_message_count(b.0, b.1).await.unwrap(),
+        0
+    );
+    assert!(
+        store
+            .writer
+            .pop_message(claim(b), None)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .writer
+            .pop_message(claim(b), Some(id))
+            .await
+            .unwrap()
+            .is_none(),
+        "a held message cannot be popped even by id"
+    );
+    assert!(
+        store
+            .writer
+            .begin_message_edit(b.0, b.1, id)
+            .await
+            .unwrap()
+            .is_none(),
+        "a held message cannot be held again"
+    );
+    assert!(
+        !store
+            .writer
+            .finish_message_edit(other.0, other.1, id, None)
+            .await
+            .unwrap(),
+        "a foreign project cannot release the message"
+    );
+
+    assert!(
+        store
+            .writer
+            .finish_message_edit(
+                b.0,
+                b.1,
+                id,
+                Some((Some("new subject".into()), "second draft".into())),
+            )
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        store.reader.pending_message_count(b.0, b.1).await.unwrap(),
+        1
+    );
+    let popped = store
+        .writer
+        .pop_message(claim(b), None)
+        .await
+        .unwrap()
+        .expect("the saved message is back in the queue");
+    assert_eq!(popped.body, "second draft");
+    assert_eq!(popped.subject.as_deref(), Some("new subject"));
+    assert!(
+        !store
+            .writer
+            .finish_message_edit(b.0, b.1, id, None)
+            .await
+            .unwrap(),
+        "a message that is no longer held cannot be saved again"
+    );
+}
+
+/// Releasing an edit without changes puts the message back unchanged and in its
+/// original place in the queue.
+#[tokio::test]
+async fn releasing_an_edit_keeps_the_text_and_the_queue_order() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let a = project(&store, "team", "sender").await;
+    let b = project(&store, "team", "receiver").await;
+    let first = store
+        .writer
+        .insert_message(message(a, b, "one"))
+        .await
+        .unwrap();
+    store
+        .writer
+        .insert_message(message(a, b, "two"))
+        .await
+        .unwrap();
+    let before = store
+        .reader
+        .message_in_mailbox(b.0, b.1, first)
+        .await
+        .unwrap()
+        .unwrap();
+
+    store
+        .writer
+        .begin_message_edit(b.0, b.1, first)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        store
+            .writer
+            .finish_message_edit(b.0, b.1, first, None)
+            .await
+            .unwrap()
+    );
+    let after = store
+        .reader
+        .message_in_mailbox(b.0, b.1, first)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.state, MessageState::Pending);
+    assert_eq!(after.body, before.body);
+    assert_eq!(after.created_at, before.created_at);
+
+    let popped = store
+        .writer
+        .pop_message(claim(b), None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(popped.body, "one", "the released message is still first");
+}
+
+/// Only a pending message can be held: collected and cancelled mail is final.
+#[tokio::test]
+async fn collected_or_cancelled_mail_cannot_be_taken_for_editing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let a = project(&store, "team", "sender").await;
+    let b = project(&store, "team", "receiver").await;
+    let collected = store
+        .writer
+        .insert_message(message(a, b, "collected"))
+        .await
+        .unwrap();
+    store
+        .writer
+        .pop_message(claim(b), Some(collected))
+        .await
+        .unwrap()
+        .unwrap();
+    let cancelled = store
+        .writer
+        .insert_message(message(a, b, "cancelled"))
+        .await
+        .unwrap();
+    store
+        .writer
+        .cancel_messages(a.0, a.1, Some(cancelled))
+        .await
+        .unwrap();
+
+    for id in [collected, cancelled] {
+        assert!(
+            store
+                .writer
+                .begin_message_edit(b.0, b.1, id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
 }

@@ -389,6 +389,21 @@ pub(crate) enum WriteCmd {
         specific_id: Option<MessageId>,
         reply: oneshot::Sender<StoreResult<Option<AgentMessage>>>,
     },
+    /// Take a pending message out of the queue so its sender can edit it.
+    BeginMessageEdit {
+        to_workspace_id: WorkspaceId,
+        to_project_id: ProjectId,
+        message_id: MessageId,
+        reply: oneshot::Sender<StoreResult<Option<AgentMessage>>>,
+    },
+    /// Return an `editing` message to the queue, with new text or unchanged.
+    FinishMessageEdit {
+        to_workspace_id: WorkspaceId,
+        to_project_id: ProjectId,
+        message_id: MessageId,
+        replacement: Option<(Option<String>, String)>,
+        reply: oneshot::Sender<StoreResult<bool>>,
+    },
     /// Retract still-pending outbox messages a project has sent.
     CancelMessages {
         from_workspace_id: WorkspaceId,
@@ -2079,6 +2094,55 @@ impl WriterHandle {
         self.send(WriteCmd::PopMessage {
             claim,
             specific_id,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Take a pending message out of its recipient's queue so it can be
+    /// edited. Returns the message to edit, or `None` when it is no longer
+    /// pending in that project (already collected, held, or not there).
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn begin_message_edit(
+        &self,
+        to_workspace_id: WorkspaceId,
+        to_project_id: ProjectId,
+        message_id: MessageId,
+    ) -> StoreResult<Option<AgentMessage>> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::BeginMessageEdit {
+            to_workspace_id,
+            to_project_id,
+            message_id,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Return an `editing` message to the queue. With `replacement` the
+    /// subject and body are replaced; without it the message returns
+    /// unchanged. Returns `false` when the message is not in `editing` in that
+    /// project.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn finish_message_edit(
+        &self,
+        to_workspace_id: WorkspaceId,
+        to_project_id: ProjectId,
+        message_id: MessageId,
+        replacement: Option<(Option<String>, String)>,
+    ) -> StoreResult<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::FinishMessageEdit {
+            to_workspace_id,
+            to_project_id,
+            message_id,
+            replacement,
             reply: tx,
         })
         .await?;
@@ -4400,6 +4464,38 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             } => {
                 let result = ops::pop_message(&mut conn, &claim, specific_id);
                 send_or_warn(reply, result, "pop_message");
+            }
+            WriteCmd::BeginMessageEdit {
+                to_workspace_id,
+                to_project_id,
+                message_id,
+                reply,
+            } => {
+                let result = ops::begin_message_edit(
+                    &mut conn,
+                    &to_workspace_id,
+                    &to_project_id,
+                    message_id,
+                );
+                send_or_warn(reply, result, "begin_message_edit");
+            }
+            WriteCmd::FinishMessageEdit {
+                to_workspace_id,
+                to_project_id,
+                message_id,
+                replacement,
+                reply,
+            } => {
+                let result = ops::finish_message_edit(
+                    &mut conn,
+                    &to_workspace_id,
+                    &to_project_id,
+                    message_id,
+                    replacement
+                        .as_ref()
+                        .map(|(subject, body)| (subject.as_deref(), body.as_str())),
+                );
+                send_or_warn(reply, result, "finish_message_edit");
             }
             WriteCmd::CancelMessages {
                 from_workspace_id,

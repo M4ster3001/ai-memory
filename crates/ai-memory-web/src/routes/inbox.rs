@@ -152,6 +152,24 @@ pub(crate) async fn handler(
     };
     let more = messages.len() > 50;
     messages.truncate(50);
+    let editing_count = match (&scope, inbox) {
+        (Some(scope), true) => match state
+            .reader
+            .message_history_filtered(
+                scope.workspace_id,
+                scope.project_id,
+                MessageBox::Inbox,
+                Some(MessageState::Editing),
+                100,
+                0,
+            )
+            .await
+        {
+            Ok(held) => held.len(),
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        },
+        _ => 0,
+    };
     let rows = messages
         .into_iter()
         .map(|m| {
@@ -166,8 +184,10 @@ pub(crate) async fn handler(
                 .get(&(m.to_workspace_id.to_string(), m.to_project_id.to_string()))
                 .cloned()
                 .unwrap_or_else(|| "A project you cannot read".into());
+            let raw_subject = m.subject.clone().unwrap_or_default();
             MessageRow {
                 id: m.id.to_string(),
+                raw_subject,
                 subject: m
                     .subject
                     .filter(|s| !s.is_empty())
@@ -184,6 +204,7 @@ pub(crate) async fn handler(
                     MessageState::Pending => "Queued",
                     MessageState::Claimed => "Collected",
                     MessageState::Cancelled => "Cancelled",
+                    MessageState::Editing => "Editing",
                 },
                 when: humanize(&m.created_at.to_string()),
             }
@@ -211,6 +232,11 @@ pub(crate) async fn handler(
             .fold(0_u64, |total, s| total.saturating_add(s.pending)),
         pending_projects: scopes.iter().filter(|s| s.pending > 0).count(),
         scopes,
+        editing_count,
+        editing_href: format!(
+            "{}&state=editing",
+            mailbox_href(&workspace, &project, false, 0)
+        ),
         inbox_href: filtered_href(false, 0),
         outbox_href: filtered_href(true, 0),
         state: message_state.map_or("", |s| s.as_str()).into(),
@@ -256,6 +282,69 @@ fn error(status: StatusCode, message: &str) -> Response {
     (status, Json(serde_json::json!({"error":message}))).into_response()
 }
 
+/// What a browser write needs after the checks every write shares.
+struct BrowserWriter {
+    viewer: Option<ai_memory_core::UserId>,
+    distinguishes: bool,
+}
+
+/// The checks every browser write to the mailbox shares: the UI header, the
+/// same-origin check, a signed-in operator when operators are distinguished,
+/// and the normal-write capability.
+async fn authorize_browser_write(
+    state: &WebState,
+    viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
+    level: Option<axum::Extension<AuthLevel>>,
+    headers: &HeaderMap,
+) -> Result<BrowserWriter, Response> {
+    // A custom header plus JSON prevents a cross-site form from using cached
+    // Basic credentials. Cookie sessions additionally pass dual-auth CSRF.
+    if headers.get("x-ai-memory-ui").and_then(|h| h.to_str().ok()) != Some("1") {
+        return Err(error(
+            StatusCode::FORBIDDEN,
+            "Refresh the inbox and try again.",
+        ));
+    }
+    if let Some(origin) = headers.get("origin").and_then(|h| h.to_str().ok()) {
+        let authority = origin
+            .parse::<axum::http::Uri>()
+            .ok()
+            .and_then(|u| u.authority().map(|a| a.as_str().to_owned()));
+        if authority.as_deref() != headers.get("host").and_then(|h| h.to_str().ok()) {
+            return Err(error(
+                StatusCode::FORBIDDEN,
+                "Messages must be sent from this dashboard.",
+            ));
+        }
+    }
+    let distinguishes = state
+        .reader
+        .distinguishes_operators(state.trusted_proxy_identity)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())?;
+    let level = level.map_or(AuthLevel::Anonymous, |l| l.0);
+    if distinguishes && level == AuthLevel::Anonymous {
+        return Err(error(
+            StatusCode::UNAUTHORIZED,
+            "Sign in to send a message.",
+        ));
+    }
+    if level
+        .authorize(Capability::NormalWrite, distinguishes)
+        .is_err()
+    {
+        return Err(StatusCode::FORBIDDEN.into_response());
+    }
+    let viewer = viewer.map(|v| v.0.user());
+    if level == AuthLevel::User && viewer.is_none() {
+        return Err(StatusCode::FORBIDDEN.into_response());
+    }
+    Ok(BrowserWriter {
+        viewer,
+        distinguishes,
+    })
+}
+
 pub(crate) async fn send(
     State(state): State<Arc<WebState>>,
     viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
@@ -264,45 +353,13 @@ pub(crate) async fn send(
     headers: HeaderMap,
     Json(input): Json<ComposeMessage>,
 ) -> Response {
-    // A custom header plus JSON prevents a cross-site form from using cached
-    // Basic credentials. Cookie sessions additionally pass dual-auth CSRF.
-    if headers.get("x-ai-memory-ui").and_then(|h| h.to_str().ok()) != Some("1") {
-        return error(StatusCode::FORBIDDEN, "Refresh the inbox and try again.");
-    }
-    if let Some(origin) = headers.get("origin").and_then(|h| h.to_str().ok()) {
-        let authority = origin
-            .parse::<axum::http::Uri>()
-            .ok()
-            .and_then(|u| u.authority().map(|a| a.as_str().to_owned()));
-        if authority.as_deref() != headers.get("host").and_then(|h| h.to_str().ok()) {
-            return error(
-                StatusCode::FORBIDDEN,
-                "Messages must be sent from this dashboard.",
-            );
-        }
-    }
-    let distinguishes = match state
-        .reader
-        .distinguishes_operators(state.trusted_proxy_identity)
-        .await
-    {
-        Ok(v) => v,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    let BrowserWriter {
+        viewer,
+        distinguishes,
+    } = match authorize_browser_write(&state, viewer, level, &headers).await {
+        Ok(writer) => writer,
+        Err(refusal) => return refusal,
     };
-    let level = level.map_or(AuthLevel::Anonymous, |l| l.0);
-    if distinguishes && level == AuthLevel::Anonymous {
-        return error(StatusCode::UNAUTHORIZED, "Sign in to send a message.");
-    }
-    if level
-        .authorize(Capability::NormalWrite, distinguishes)
-        .is_err()
-    {
-        return StatusCode::FORBIDDEN.into_response();
-    }
-    let viewer = viewer.map(|v| v.0.user());
-    if level == AuthLevel::User && viewer.is_none() {
-        return StatusCode::FORBIDDEN.into_response();
-    }
     let source = match lookup_existing_scope_guarded(
         &state.reader,
         &input.from_workspace,
@@ -392,5 +449,208 @@ pub(crate) async fn send(
                 "The message could not be queued. Check project access and message admission policy.",
             )
         }
+    }
+}
+
+#[derive(Deserialize)]
+pub(crate) struct EditMessage {
+    workspace: String,
+    project: String,
+    #[serde(default)]
+    subject: Option<String>,
+    #[serde(default)]
+    body: Option<String>,
+}
+
+/// Resolve the message a browser edit targets, and refuse unless the caller
+/// could have sent it: write access to the recipient mailbox it sits in and to
+/// the project it came from. Without the second check, anyone who can write to
+/// a project could rewrite what another project's agent asked it to do.
+async fn editable_message(
+    state: &WebState,
+    writer: &BrowserWriter,
+    raw_id: &str,
+    input: &EditMessage,
+) -> Result<
+    (
+        ai_memory_core::WorkspaceId,
+        ai_memory_core::ProjectId,
+        ai_memory_core::MessageId,
+    ),
+    Response,
+> {
+    let id = raw_id
+        .parse::<ai_memory_core::MessageId>()
+        .map_err(|_| error(StatusCode::BAD_REQUEST, "That is not a message id."))?;
+    let target = lookup_existing_scope_guarded(
+        &state.reader,
+        &input.workspace,
+        &input.project,
+        writer.viewer,
+        ProjectAccess::Write,
+    )
+    .await
+    .map_err(|e| super::page::refusal_response(&e))?;
+    let message = state
+        .reader
+        .message_in_mailbox(target.workspace_id, target.project_id, id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())?
+        .ok_or_else(|| {
+            error(
+                StatusCode::NOT_FOUND,
+                "That message is not in this mailbox.",
+            )
+        })?;
+    let visible = state
+        .reader
+        .list_projects_with_stats(writer.viewer)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())?;
+    let Some(origin) = visible.into_iter().find(|p| {
+        p.workspace_id == message.origin.from_workspace_id.to_string()
+            && p.project_id == message.origin.from_project_id.to_string()
+    }) else {
+        return Err(error(
+            StatusCode::FORBIDDEN,
+            "You cannot edit mail sent from a project you cannot write to.",
+        ));
+    };
+    lookup_existing_scope_guarded(
+        &state.reader,
+        &origin.workspace_name,
+        &origin.project_name,
+        writer.viewer,
+        ProjectAccess::Write,
+    )
+    .await
+    .map_err(|e| super::page::refusal_response(&e))?;
+    Ok((target.workspace_id, target.project_id, id))
+}
+
+/// Take a queued message out of the queue so it can be edited.
+pub(crate) async fn begin_edit(
+    State(state): State<Arc<WebState>>,
+    viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
+    level: Option<axum::Extension<AuthLevel>>,
+    headers: HeaderMap,
+    axum::extract::Path(raw_id): axum::extract::Path<String>,
+    Json(input): Json<EditMessage>,
+) -> Response {
+    let writer = match authorize_browser_write(&state, viewer, level, &headers).await {
+        Ok(writer) => writer,
+        Err(refusal) => return refusal,
+    };
+    let (workspace_id, project_id, id) =
+        match editable_message(&state, &writer, &raw_id, &input).await {
+            Ok(target) => target,
+            Err(refusal) => return refusal,
+        };
+    match state
+        .wiki
+        .begin_agent_message_edit(workspace_id, project_id, id)
+        .await
+    {
+        Ok(Some(message)) => Json(serde_json::json!({
+            "message_id": message.id.to_string(),
+            "state": message.state.as_str(),
+            "subject": message.subject.unwrap_or_default(),
+            "body": message.body,
+        }))
+        .into_response(),
+        Ok(None) => error(
+            StatusCode::CONFLICT,
+            "An agent already collected this message, or it is no longer queued.",
+        ),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// Save new text for a held message and return it to the queue.
+pub(crate) async fn save_edit(
+    State(state): State<Arc<WebState>>,
+    viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
+    actor: Option<axum::Extension<ActorContext>>,
+    level: Option<axum::Extension<AuthLevel>>,
+    headers: HeaderMap,
+    axum::extract::Path(raw_id): axum::extract::Path<String>,
+    Json(input): Json<EditMessage>,
+) -> Response {
+    let writer = match authorize_browser_write(&state, viewer, level, &headers).await {
+        Ok(writer) => writer,
+        Err(refusal) => return refusal,
+    };
+    let (workspace_id, project_id, id) =
+        match editable_message(&state, &writer, &raw_id, &input).await {
+            Ok(target) => target,
+            Err(refusal) => return refusal,
+        };
+    let body = input.body.clone().unwrap_or_default();
+    let subject = input.subject.clone().unwrap_or_default();
+    if body.trim().is_empty() || body.chars().count() > 8_000 || subject.chars().count() > 200 {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "Enter a message up to 8,000 characters and a subject up to 200 characters.",
+        );
+    }
+    let actor = actor.map_or_else(ActorContext::anonymous, |a| a.0);
+    match state
+        .wiki
+        .save_agent_message_edit(
+            workspace_id,
+            project_id,
+            id,
+            Some(subject.trim().to_owned()),
+            body.trim().to_owned(),
+            actor,
+        )
+        .await
+    {
+        Ok(true) => Json(serde_json::json!({"message_id": id.to_string(), "state": "pending"}))
+            .into_response(),
+        Ok(false) => error(
+            StatusCode::CONFLICT,
+            "This message is no longer being edited.",
+        ),
+        Err(e) => {
+            tracing::warn!(error=%e,"browser message edit refused");
+            error(
+                StatusCode::FORBIDDEN,
+                "The message could not be saved. Check project access and message admission policy.",
+            )
+        }
+    }
+}
+
+/// Return a held message to the queue without changing it.
+pub(crate) async fn release_edit(
+    State(state): State<Arc<WebState>>,
+    viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
+    level: Option<axum::Extension<AuthLevel>>,
+    headers: HeaderMap,
+    axum::extract::Path(raw_id): axum::extract::Path<String>,
+    Json(input): Json<EditMessage>,
+) -> Response {
+    let writer = match authorize_browser_write(&state, viewer, level, &headers).await {
+        Ok(writer) => writer,
+        Err(refusal) => return refusal,
+    };
+    let (workspace_id, project_id, id) =
+        match editable_message(&state, &writer, &raw_id, &input).await {
+            Ok(target) => target,
+            Err(refusal) => return refusal,
+        };
+    match state
+        .wiki
+        .release_agent_message_edit(workspace_id, project_id, id)
+        .await
+    {
+        Ok(true) => Json(serde_json::json!({"message_id": id.to_string(), "state": "pending"}))
+            .into_response(),
+        Ok(false) => error(
+            StatusCode::CONFLICT,
+            "This message is no longer being edited.",
+        ),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }

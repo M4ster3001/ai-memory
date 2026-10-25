@@ -1022,6 +1022,14 @@ the UI header and the normal browser-session CSRF checks. It does not mutate
 wiki pages, pop messages or run an agent. See
 [agent messaging](agent-messaging.md#in-the-web-ui).
 
+Three more POST routes edit a queued message: `/web/messages/{id}/edit` holds it
+out of the queue and returns its text, `/web/messages/{id}/save` replaces the
+subject and text and requeues it, and `/web/messages/{id}/release` requeues it
+unchanged. The body names the mailbox (`workspace`, `project`), and `save` adds
+`subject` and `body`. They need the same checks as sending, plus write access to
+the project the message came from. A message that is not in the expected state
+answers 409.
+
 ## Bundled documentation for agents
 
 The documentation catalog is at `GET /api/v1/docs?q=token`. Each entry has an
