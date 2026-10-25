@@ -190,6 +190,30 @@ impl ReaderPool {
         .await
     }
 
+    /// Read one message addressed to this recipient project, in any state.
+    /// The recipient coordinate is part of the predicate, so an id belonging to
+    /// another project reads as absent.
+    pub async fn message_in_mailbox(
+        &self,
+        ws: WorkspaceId,
+        project: ProjectId,
+        id: ai_memory_core::MessageId,
+    ) -> StoreResult<Option<AgentMessage>> {
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {} FROM agent_messages \
+                 WHERE id=?1 AND to_workspace_id=?2 AND to_project_id=?3",
+                crate::ops::MESSAGE_COLUMNS
+            ))?;
+            let mut rows = stmt.query_map(
+                params![id.as_bytes(), ws.as_bytes(), project.as_bytes()],
+                crate::ops::row_to_agent_message,
+            )?;
+            rows.next().map(|r| r?).transpose()
+        })
+        .await
+    }
+
     /// Read this session's response ledger after applying scope and ownership.
     pub async fn session_token_usage(
         &self,

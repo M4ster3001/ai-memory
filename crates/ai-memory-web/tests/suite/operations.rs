@@ -1305,3 +1305,406 @@ async fn operations_response_search_and_pagination_cover_the_full_project_and_se
         }
     }
 }
+
+fn edit(id: &str, action: &str) -> axum::http::request::Builder {
+    Request::builder()
+        .method("POST")
+        .uri(format!("/messages/{id}/{action}"))
+        .header("content-type", "application/json")
+        .header("x-ai-memory-ui", "1")
+}
+
+fn codex_claim(
+    ws: ai_memory_core::WorkspaceId,
+    project: ai_memory_core::ProjectId,
+) -> ai_memory_core::MessageClaim {
+    ai_memory_core::MessageClaim {
+        workspace_id: ws,
+        project_id: project,
+        claiming_agent: AgentKind::Codex,
+        claiming_session: None,
+        claiming_user: None,
+    }
+}
+
+async fn queue_message(app: &axum::Router) -> String {
+    let response = app
+        .clone()
+        .oneshot(send().body(Body::from(body().to_string())).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let created: Value = serde_json::from_str(&text(response).await).unwrap();
+    created["message_id"].as_str().unwrap().to_owned()
+}
+
+#[tokio::test]
+async fn operations_edit_holds_a_queued_message_until_it_is_saved_or_discarded() {
+    let (_tmp, store, wiki, ws, project, _) = fixture().await;
+    let app = router(store.reader.clone(), wiki);
+    let scope = json!({"workspace": "team", "project": "app"});
+    let id = queue_message(&app).await;
+
+    let held = app
+        .clone()
+        .oneshot(
+            edit(&id, "edit")
+                .body(Body::from(scope.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(held.status(), StatusCode::OK);
+    let held: Value = serde_json::from_str(&text(held).await).unwrap();
+    assert_eq!(held["state"], "editing");
+    assert_eq!(held["body"], "Please inspect the large context.");
+    assert_eq!(
+        store
+            .reader
+            .pending_message_count(ws, project)
+            .await
+            .unwrap(),
+        0,
+        "a held message leaves the queue"
+    );
+    assert!(
+        store
+            .writer
+            .pop_message(codex_claim(ws, project), None)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let page = text(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/inbox?workspace=team&project=app")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(page.contains("1 held for editing"), "{page}");
+    let held_rows = text(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/inbox?workspace=team&project=app&state=editing")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(held_rows.contains("data-message-action=\"resume\""));
+    assert!(held_rows.contains("data-message-action=\"release\""));
+    assert!(!held_rows.contains("data-message-action=\"begin\""));
+
+    let mut edited = scope.clone();
+    edited["subject"] = json!("Updated subject");
+    edited["body"] = json!("Updated request body.");
+    let saved = app
+        .clone()
+        .oneshot(
+            edit(&id, "save")
+                .body(Body::from(edited.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(saved.status(), StatusCode::OK);
+    assert_eq!(
+        store
+            .reader
+            .pending_message_count(ws, project)
+            .await
+            .unwrap(),
+        1
+    );
+    let popped = store
+        .writer
+        .pop_message(codex_claim(ws, project), None)
+        .await
+        .unwrap()
+        .expect("the saved message is back in the queue");
+    assert_eq!(popped.body, "Updated request body.");
+    assert_eq!(popped.subject.as_deref(), Some("Updated subject"));
+
+    let second = queue_message(&app).await;
+    for action in ["edit", "release"] {
+        let response = app
+            .clone()
+            .oneshot(
+                edit(&second, action)
+                    .body(Body::from(scope.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{action}");
+    }
+    let back = store
+        .writer
+        .pop_message(codex_claim(ws, project), None)
+        .await
+        .unwrap()
+        .expect("a discarded edit returns the message to the queue");
+    assert_eq!(back.body, "Please inspect the large context.");
+}
+
+#[tokio::test]
+async fn operations_edit_refuses_foreign_collected_and_malformed_requests() {
+    let (_tmp, store, wiki, ws, project, _) = fixture().await;
+    store
+        .writer
+        .get_or_create_project(ws, "other", None)
+        .await
+        .unwrap();
+    let app = router(store.reader.clone(), wiki);
+    let scope = json!({"workspace": "team", "project": "app"});
+    let id = queue_message(&app).await;
+    let status = |request: Request<Body>| {
+        let app = app.clone();
+        async move { app.oneshot(request).await.unwrap().status() }
+    };
+
+    assert_eq!(
+        status(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/messages/{id}/edit"))
+                .header("content-type", "application/json")
+                .body(Body::from(scope.to_string()))
+                .unwrap()
+        )
+        .await,
+        StatusCode::FORBIDDEN,
+        "the UI header is required"
+    );
+    assert_eq!(
+        status(
+            edit(&id, "edit")
+                .header("origin", "https://elsewhere.example")
+                .header("host", "localhost")
+                .body(Body::from(scope.to_string()))
+                .unwrap()
+        )
+        .await,
+        StatusCode::FORBIDDEN,
+        "a cross-origin edit is refused"
+    );
+    assert_eq!(
+        status(
+            edit("not-a-message-id", "edit")
+                .body(Body::from(scope.to_string()))
+                .unwrap()
+        )
+        .await,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        status(
+            edit(&ai_memory_core::MessageId::new().to_string(), "edit")
+                .body(Body::from(scope.to_string()))
+                .unwrap()
+        )
+        .await,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        status(
+            edit(&id, "edit")
+                .body(Body::from(
+                    json!({"workspace": "team", "project": "other"}).to_string()
+                ))
+                .unwrap()
+        )
+        .await,
+        StatusCode::NOT_FOUND,
+        "a message cannot be held through another project's mailbox"
+    );
+    assert_eq!(
+        store
+            .reader
+            .pending_message_count(ws, project)
+            .await
+            .unwrap(),
+        1,
+        "the refused requests left the message queued"
+    );
+
+    // Saving or releasing a message nobody is editing changes nothing.
+    for action in ["save", "release"] {
+        let mut payload = scope.clone();
+        payload["body"] = json!("replacement");
+        assert_eq!(
+            status(
+                edit(&id, action)
+                    .body(Body::from(payload.to_string()))
+                    .unwrap()
+            )
+            .await,
+            StatusCode::CONFLICT,
+            "{action}"
+        );
+    }
+    assert_eq!(
+        status(
+            edit(&id, "edit")
+                .body(Body::from(scope.to_string()))
+                .unwrap()
+        )
+        .await,
+        StatusCode::OK,
+        "the owning mailbox can hold the same message"
+    );
+    assert_eq!(
+        status(
+            edit(&id, "save")
+                .body(Body::from(
+                    json!({"workspace": "team", "project": "app", "body": "  "}).to_string()
+                ))
+                .unwrap()
+        )
+        .await,
+        StatusCode::BAD_REQUEST,
+        "an empty message cannot be saved"
+    );
+    assert_eq!(
+        status(
+            edit(&id, "release")
+                .body(Body::from(scope.to_string()))
+                .unwrap()
+        )
+        .await,
+        StatusCode::OK
+    );
+
+    // Collected mail is final.
+    store
+        .writer
+        .pop_message(codex_claim(ws, project), Some(id.parse().unwrap()))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        status(
+            edit(&id, "edit")
+                .body(Body::from(scope.to_string()))
+                .unwrap()
+        )
+        .await,
+        StatusCode::CONFLICT
+    );
+}
+
+#[tokio::test]
+async fn operations_edit_needs_write_access_to_the_sender_project_too() {
+    let (_tmp, store, wiki, ws, source, _) = fixture().await;
+    let dest = store
+        .writer
+        .get_or_create_project(ws, "dest", None)
+        .await
+        .unwrap();
+    for project in [source, dest] {
+        store
+            .writer
+            .set_access_mode(project, ai_memory_store::AccessMode::Restricted)
+            .await
+            .unwrap();
+    }
+    let user = store
+        .writer
+        .create_human_user(
+            NewUser {
+                username: "alice".into(),
+                name: None,
+                email: None,
+            },
+            UserRole::User,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    store
+        .writer
+        .grant_memory(user, dest, GrantLevel::Write, None)
+        .await
+        .unwrap();
+    store
+        .writer
+        .grant_memory(user, source, GrantLevel::Read, None)
+        .await
+        .unwrap();
+    let id = store
+        .writer
+        .insert_message(ai_memory_core::NewAgentMessage {
+            from_workspace_id: ws,
+            from_project_id: source,
+            from_agent: AgentKind::Other,
+            from_session_id: None,
+            from_owner_user: None,
+            to_workspace_id: ws,
+            to_project_id: dest,
+            to_agent: Some(AgentKind::Codex),
+            subject: Some("from the source project".into()),
+            body: "do the thing".into(),
+            nature: ai_memory_core::MessageNature::Unknown,
+            evidence: None,
+        })
+        .await
+        .unwrap()
+        .to_string();
+    let app = router(store.reader.clone(), wiki);
+    let scope = json!({"workspace": "team", "project": "dest"});
+    let as_user = || {
+        edit(&id, "edit")
+            .extension(AuthLevel::User)
+            .extension(AuthorizedViewer(user))
+            .body(Body::from(scope.to_string()))
+            .unwrap()
+    };
+
+    assert_eq!(
+        app.clone().oneshot(as_user()).await.unwrap().status(),
+        StatusCode::FORBIDDEN,
+        "write access to the mailbox alone does not let a user rewrite another project's mail"
+    );
+    assert_eq!(
+        store.reader.pending_message_count(ws, dest).await.unwrap(),
+        1,
+        "the refusal left the message queued"
+    );
+    store
+        .writer
+        .grant_memory(user, source, GrantLevel::Write, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(as_user()).await.unwrap().status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        store.reader.pending_message_count(ws, dest).await.unwrap(),
+        0
+    );
+    assert_eq!(
+        app.oneshot(
+            edit(&id, "release")
+                .extension(AuthLevel::Root)
+                .body(Body::from(scope.to_string()))
+                .unwrap()
+        )
+        .await
+        .unwrap()
+        .status(),
+        StatusCode::OK,
+        "root can release a held message"
+    );
+}

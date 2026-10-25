@@ -987,7 +987,10 @@ Expanding a row shows its plain text. New message picks a source project and a
 recipient harness from the agents that already have sessions in visible
 projects. Sending needs write access to both projects and goes through the
 configured sanitizer and message admission policy. Browser sessions use the
-existing CSRF checks.
+existing CSRF checks. A queued message has an Edit button. It takes the message
+out of the queue while you change its subject or text, and it goes back, in its
+original place, when you save or discard. A message an agent already collected
+cannot be edited.
 
 A queued request does not launch an agent. The addressed harness collects it the
 next time it checks its inbox, and "Collected" records that claim, not that the

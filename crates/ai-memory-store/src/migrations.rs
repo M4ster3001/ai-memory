@@ -212,6 +212,110 @@ mod tests {
         assert_eq!(claude, 1000);
     }
 
+    /// V93 rebuilds `agent_messages` so a message can be held in `editing`.
+    /// Existing mail keeps its text, state, order and addressee, the three
+    /// indexes come back, and `editing` is the only value the constraint gained.
+    #[test]
+    fn v93_accepts_the_editing_state_and_keeps_existing_messages() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        run_to(&mut conn, 92).unwrap();
+        conn.execute_batch(
+            "INSERT INTO workspaces(id,name,created_at) VALUES(zeroblob(16),'mail',1);
+             INSERT INTO projects(id,workspace_id,name,created_at) VALUES(zeroblob(16),zeroblob(16),'mail',1);
+             INSERT INTO agent_messages(id,from_workspace_id,from_project_id,from_agent,to_workspace_id,to_project_id,subject,body,state,created_at,to_agent,from_owner_user)
+                 VALUES(x'01000000000000000000000000000000',zeroblob(16),zeroblob(16),'other',zeroblob(16),zeroblob(16),'s','queued','pending',5,'codex','user:sender');
+             INSERT INTO agent_messages(id,from_workspace_id,from_project_id,from_agent,to_workspace_id,to_project_id,body,state,created_at,claimed_at,claimed_by_agent)
+                 VALUES(x'02000000000000000000000000000000',zeroblob(16),zeroblob(16),'other',zeroblob(16),zeroblob(16),'done','claimed',6,7,'codex');",
+        )
+        .unwrap();
+        run(&mut conn).unwrap();
+        run(&mut conn).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+
+        let rows: Vec<(String, String, i64, Option<String>)> = conn
+            .prepare(
+                "SELECT state, body, created_at, to_agent FROM agent_messages ORDER BY created_at",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "pending".to_owned(),
+                    "queued".to_owned(),
+                    5,
+                    Some("codex".to_owned())
+                ),
+                ("claimed".to_owned(), "done".to_owned(), 6, None),
+            ]
+        );
+        conn.execute(
+            "UPDATE agent_messages SET state='editing' WHERE body='queued'",
+            [],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "UPDATE agent_messages SET state='held' WHERE body='queued'",
+                [],
+            )
+            .is_err(),
+            "the state constraint must still reject unknown values"
+        );
+        let indexes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND tbl_name='agent_messages' \
+                 AND name IN ('idx_agent_messages_inbox','idx_agent_messages_outbox','idx_messages_agent_inbox')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexes, 3);
+        let edited_at: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('agent_messages') WHERE name='edited_at'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(edited_at, 1);
+        let provenance: (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT from_owner_user, subject FROM agent_messages WHERE body='queued'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            provenance,
+            (Some("user:sender".to_owned()), Some("s".to_owned())),
+            "the sender identity and subject survive the rebuild"
+        );
+        assert!(
+            conn.execute(
+                "UPDATE agent_messages SET from_session_id=zeroblob(16) WHERE body='queued'",
+                [],
+            )
+            .is_err(),
+            "the sender-session foreign key survives the rebuild"
+        );
+        conn.execute_batch("INSERT INTO sessions(id,workspace_id,project_id,agent_kind,started_at) VALUES(zeroblob(16),zeroblob(16),zeroblob(16),'codex',1);
+            UPDATE agent_messages SET from_session_id=zeroblob(16) WHERE body='queued';").unwrap();
+        let dangling: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_foreign_key_check('agent_messages')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(dangling, 0);
+    }
+
     /// A store migrated by a newer build (an applied version above anything
     /// this binary embeds) must fail to open with the actionable
     /// `DataSchemaAhead` error, not refinery's raw "missing from the

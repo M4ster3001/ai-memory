@@ -123,6 +123,9 @@ pub(crate) fn build(state: Arc<WebState>) -> Router {
         .route("/inbox", get(inbox::handler))
         .route("/inbox/notifications", get(notifications::handler))
         .route("/messages", post(inbox::send))
+        .route("/messages/{id}/edit", post(inbox::begin_edit))
+        .route("/messages/{id}/save", post(inbox::save_edit))
+        .route("/messages/{id}/release", post(inbox::release_edit))
         .route(
             "/w/{workspace}/{project}/agents/{agent}",
             get(agents::handler),
