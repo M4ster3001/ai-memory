@@ -478,21 +478,34 @@ async fn a_message_being_edited_leaves_the_queue_until_it_is_saved() {
     let a = project(&store, "team", "sender").await;
     let b = project(&store, "team", "receiver").await;
     let other = project(&store, "team", "other").await;
+    let other_workspace = project(&store, "other-team", "receiver").await;
     let id = store
         .writer
         .insert_message(message(a, b, "first draft"))
         .await
         .unwrap();
 
-    assert!(
-        store
-            .writer
-            .begin_message_edit(other.0, other.1, id)
-            .await
-            .unwrap()
-            .is_none(),
-        "a project that does not own the mailbox cannot hold the message"
-    );
+    for foreign in [other, other_workspace] {
+        assert!(
+            store
+                .writer
+                .begin_message_edit(foreign.0, foreign.1, id)
+                .await
+                .unwrap()
+                .is_none(),
+            "another project or workspace cannot hold the message"
+        );
+    }
+    for replacement in [None, Some((Some("unheld".into()), "unheld".into()))] {
+        assert!(
+            !store
+                .writer
+                .finish_message_edit(b.0, b.1, id, replacement)
+                .await
+                .unwrap(),
+            "save and release require a held message"
+        );
+    }
     assert_eq!(
         store.reader.pending_message_count(b.0, b.1).await.unwrap(),
         1
@@ -536,14 +549,18 @@ async fn a_message_being_edited_leaves_the_queue_until_it_is_saved() {
             .is_none(),
         "a held message cannot be held again"
     );
-    assert!(
-        !store
-            .writer
-            .finish_message_edit(other.0, other.1, id, None)
-            .await
-            .unwrap(),
-        "a foreign project cannot release the message"
-    );
+    for foreign in [other, other_workspace] {
+        for replacement in [None, Some((Some("foreign".into()), "foreign".into()))] {
+            assert!(
+                !store
+                    .writer
+                    .finish_message_edit(foreign.0, foreign.1, id, replacement)
+                    .await
+                    .unwrap(),
+                "another project or workspace cannot save or release the held message"
+            );
+        }
+    }
 
     assert!(
         store

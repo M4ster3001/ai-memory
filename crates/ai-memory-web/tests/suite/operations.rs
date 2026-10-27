@@ -1663,36 +1663,109 @@ async fn operations_edit_needs_write_access_to_the_sender_project_too() {
         .to_string();
     let app = router(store.reader.clone(), wiki);
     let scope = json!({"workspace": "team", "project": "dest"});
-    let as_user = || {
-        edit(&id, "edit")
+    let as_user = |action: &str| {
+        let mut payload = scope.clone();
+        payload["subject"] = json!("Edited subject");
+        payload["body"] = json!("Edited request.");
+        edit(&id, action)
             .extension(AuthLevel::User)
             .extension(AuthorizedViewer(user))
-            .body(Body::from(scope.to_string()))
+            .body(Body::from(payload.to_string()))
             .unwrap()
     };
 
-    assert_eq!(
-        app.clone().oneshot(as_user()).await.unwrap().status(),
-        StatusCode::FORBIDDEN,
-        "write access to the mailbox alone does not let a user rewrite another project's mail"
-    );
+    for action in ["edit", "save", "release"] {
+        let anonymous = edit(&id, action)
+            .extension(AuthLevel::Anonymous)
+            .body(Body::from(scope.to_string()))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(anonymous).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED,
+            "{action}: an anonymous caller cannot edit a human operator's mail"
+        );
+    }
+    for action in ["edit", "save", "release"] {
+        assert_eq!(
+            app.clone().oneshot(as_user(action)).await.unwrap().status(),
+            StatusCode::FORBIDDEN,
+            "{action}: mailbox write access cannot rewrite a sender with only read access"
+        );
+    }
     assert_eq!(
         store.reader.pending_message_count(ws, dest).await.unwrap(),
-        1,
-        "the refusal left the message queued"
+        1
     );
     store
         .writer
         .grant_memory(user, source, GrantLevel::Write, None)
         .await
         .unwrap();
+    store
+        .writer
+        .grant_memory(user, dest, GrantLevel::Read, None)
+        .await
+        .unwrap();
+    for action in ["edit", "save", "release"] {
+        assert_eq!(
+            app.clone().oneshot(as_user(action)).await.unwrap().status(),
+            StatusCode::FORBIDDEN,
+            "{action}: sender write access cannot rewrite a read-only mailbox"
+        );
+    }
     assert_eq!(
-        app.clone().oneshot(as_user()).await.unwrap().status(),
+        store.reader.pending_message_count(ws, dest).await.unwrap(),
+        1
+    );
+    store
+        .writer
+        .grant_memory(user, dest, GrantLevel::Write, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(as_user("edit")).await.unwrap().status(),
         StatusCode::OK
     );
     assert_eq!(
         store.reader.pending_message_count(ws, dest).await.unwrap(),
         0
+    );
+
+    // Recheck authorization on a held message: a grant may change after Edit.
+    for restricted in [source, dest] {
+        store
+            .writer
+            .grant_memory(user, restricted, GrantLevel::Read, None)
+            .await
+            .unwrap();
+        for action in ["save", "release"] {
+            assert_eq!(
+                app.clone().oneshot(as_user(action)).await.unwrap().status(),
+                StatusCode::FORBIDDEN,
+                "{action}: losing either write grant must keep the message held"
+            );
+        }
+        assert_eq!(
+            store.reader.pending_message_count(ws, dest).await.unwrap(),
+            0
+        );
+        store
+            .writer
+            .grant_memory(user, restricted, GrantLevel::Write, None)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        app.clone().oneshot(as_user("save")).await.unwrap().status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        store.reader.pending_message_count(ws, dest).await.unwrap(),
+        1
+    );
+    assert_eq!(
+        app.clone().oneshot(as_user("edit")).await.unwrap().status(),
+        StatusCode::OK
     );
     assert_eq!(
         app.oneshot(
@@ -1707,4 +1780,11 @@ async fn operations_edit_needs_write_access_to_the_sender_project_too() {
         StatusCode::OK,
         "root can release a held message"
     );
+    let popped = store
+        .writer
+        .pop_message(codex_claim(ws, dest), Some(id.parse().unwrap()))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(popped.body, "Edited request.");
 }

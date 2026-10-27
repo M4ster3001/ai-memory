@@ -22,6 +22,7 @@ function contrast(a, b) {
   return (values[0] + 0.05) / (values[1] + 0.05);
 }
 const mutation = process.argv.find(arg => arg.startsWith('--mutation='))?.split('=')[1];
+const selectedCase = process.argv.find(arg => arg.startsWith('--case='))?.split('=')[1];
 const mutations = {
   'all-panels-visible': {test: 'tabs', from: 'panel.hidden=!selected', to: 'panel.hidden=false'},
   'ignore-recipient-workspace': {test: 'recipients', from: 'option.dataset.workspace===scope.dataset.workspace&&', to: ''},
@@ -40,6 +41,9 @@ const mutations = {
   'ignore-mailbox-workspace': {test: 'mailbox-context', from: 'url.searchParams.set("workspace",o.dataset.workspace);', to: 'url.searchParams.set("workspace","team");'},
   'disable-inbox-notifications': {test: 'notifications', from: '  refreshInboxNotifications();\n})();', to: '  void refreshInboxNotifications;\n})();'},
   'ignore-notification-workspace': {test: 'notifications', from: 'url.searchParams.set("workspace",project.workspace);', to: 'url.searchParams.set("workspace","team");'},
+  'skip-message-edit-hold': {test: 'message-editing', from: 'var data=await call(id,"edit");', to: 'var data={subject:row.dataset.subject||"",body:row.querySelector(".message-body").textContent};'},
+  'lose-saved-message-text': {test: 'message-editing', from: 'subject:subjectInput.value,body:bodyInput.value', to: 'subject:subjectInput.value,body:"Lost edited request."'},
+  'save-discarded-message-text': {test: 'message-editing', from: 'await call(id,"release");', to: 'await call(id,"save",{subject:"Discard mutation",body:"Discard mutation"});'},
 };
 assert(!mutation || mutations[mutation], 'Unknown mutation');
 const report = {mutation: mutation || null, mutationApplied: 0, cases: []};
@@ -312,6 +316,69 @@ async function main() {
       };
       assert.equal(pop('codex'), null);assert.equal(pop('gemini-cli').id, messageId);assert.equal(pop('gemini-cli'), null);
     },
+    async 'message-editing'() {
+      const inbox = base + '/web/inbox?workspace=team&project=app';
+      const row = messageId => '.mail-row[data-message-id="' + messageId + '"]';
+      const queue = async (subject, body) => (await (await request('/web/messages', {from_workspace:'team',from_project:'other',to_workspace:'team',to_project:'app',to_agent:'codex',subject,body})).json()).message_id;
+      const pop = messageId => {
+        const result = spawnSync(binary, ['message','pop','--workspace','team','--project','app','--agent','codex','--id',messageId,'--json'], {env:{...env,AI_MEMORY_SERVER_URL:base,AI_MEMORY_DATA_DIR:path.join(artifacts,'edit-client')},encoding:'utf8',timeout:15000});
+        assert.equal(result.status, 0, 'Native claim failed: ' + result.stderr);return JSON.parse(result.stdout).message;
+      };
+      const open = async (messageId, action) => {
+        await cdp.evaluate(`(()=>{const row=document.querySelector(${literal(row(messageId))});if(!row.open)row.querySelector('summary').click();row.querySelector('[data-message-action="${action}"]').click();})()`);
+        await until(() => cdp.evaluate(`!!document.querySelector(${literal(row(messageId) + ' .mail-editor')})`), 'Message editor did not open');
+      };
+      const fill = async (messageId, subject, body) => cdp.evaluate(`document.getElementById(${literal('edit-subject-' + messageId)}).value=${literal(subject)};document.getElementById(${literal('edit-body-' + messageId)}).value=${literal(body)}`);
+      const requeued = messageId => until(() => cdp.evaluate(`document.readyState==='complete'&&!!document.querySelector(${literal(row(messageId) + '[data-state=pending]')})`), 'Edited message did not return to the queue');
+      const savedId = await queue('Original subject', 'Original request.');
+      await cdp.goto(inbox, row(savedId));
+      assert.equal(await cdp.evaluate(`document.querySelector(${literal(row(savedId) + ' [data-message-action]')})`), null, 'Legacy read-only login must not offer editing');
+      assert.equal(await cdp.evaluate(`fetch(new URL('messages/'+${literal(savedId)}+'/edit',document.baseURI),{method:'POST',headers:{'Content-Type':'application/json','X-Ai-Memory-UI':'1'},body:JSON.stringify({workspace:'team',project:'app'})}).then(r=>r.status)`), 401, 'Legacy read-only credentials must not hold mail through the edit route');
+      // The normal suite uses the legacy read-only cookie. This case supplies
+      // an actual root bearer to exercise writes without persisting credentials.
+      await cdp.send('Network.setExtraHTTPHeaders', {headers:{Authorization:'Bearer ' + token}});
+      try {
+        await cdp.reload();await open(savedId, 'begin');
+        assert.equal(await cdp.evaluate(`document.getElementById(${literal('edit-body-' + savedId)}).value`), 'Original request.');
+        assert.equal(pop(savedId), null, 'Opening the editor must hold the real queued message, even for a claim by id');
+        const editedBody = 'Updated <b>literal text</b> for the agent.';
+        await fill(savedId, 'Updated subject', editedBody);
+        await cdp.evaluate(`document.querySelector(${literal(row(savedId) + ' .mail-editor button[type=submit]')}).click()`);
+        await requeued(savedId);
+        assert(await cdp.evaluate(`document.querySelector(${literal(row(savedId) + ' .message-body')}).textContent===${literal(editedBody)}&&!document.querySelector(${literal(row(savedId) + ' .message-body b')})`), 'Saved text must render escaped');
+        const saved = pop(savedId);assert.equal(saved.id, savedId);assert.equal(saved.subject, 'Updated subject');assert.equal(saved.body, editedBody);assert.equal(pop(savedId), null);
+
+        const discardId = await queue('Keep this subject', 'Keep this request.');
+        await cdp.goto(inbox, row(discardId));await open(discardId, 'begin');
+        assert.equal(pop(discardId), null);
+        await fill(discardId, 'Unsaved subject', 'Unsaved request.');
+        await cdp.evaluate(`document.querySelector(${literal(row(discardId) + ' .mail-editor button[type=button]')}).click()`);
+        await requeued(discardId);
+        const discarded = pop(discardId);assert.equal(discarded.id, discardId);assert.equal(discarded.subject, 'Keep this subject');assert.equal(discarded.body, 'Keep this request.');
+
+        const resumedId = await queue('Recover this edit', 'Recover the original request.');
+        await cdp.goto(inbox, row(resumedId));await open(resumedId, 'begin');
+        await fill(resumedId, 'Unsaved before navigation', 'Unsaved before navigation.');
+        await cdp.goto(base + '/web/docs', '.docs-search');await cdp.goto(inbox, '.held-note');
+        assert(await cdp.evaluate('document.querySelector(".held-note").textContent.includes("1 held for editing")'));
+        assert.equal(pop(resumedId), null, 'Leaving the editor must not release held mail');
+        const heldHref = await cdp.evaluate('document.querySelector(".held-note a").href');
+        assert.equal(new URL(heldHref).searchParams.get('state'), 'editing');
+        await cdp.goto(heldHref, row(resumedId));await cdp.reload();await open(resumedId, 'resume');
+        assert.equal(await cdp.evaluate(`document.getElementById(${literal('edit-body-' + resumedId)}).value`), 'Recover the original request.');
+        await cdp.reload();
+        await cdp.evaluate(`(()=>{const row=document.querySelector(${literal(row(resumedId))});row.querySelector('summary').click();row.querySelector('[data-message-action=release]').click();})()`);
+        await until(() => cdp.evaluate(`document.readyState==='complete'&&!document.querySelector('.held-note')&&!document.querySelector(${literal(row(resumedId))})`), 'Discarding a recovered edit must clear the held list');
+        assert.equal(pop(resumedId).body, 'Recover the original request.');
+
+        const collectedId = await queue('Claim race', 'Collected before Edit.');
+        await cdp.goto(inbox, row(collectedId));assert.equal(pop(collectedId).id, collectedId);
+        await cdp.evaluate(`(()=>{const row=document.querySelector(${literal(row(collectedId))});row.querySelector('summary').click();row.querySelector('[data-message-action=begin]').click();})()`);
+        await until(() => cdp.evaluate(`document.querySelector(${literal(row(collectedId) + ' .edit-error')})?.textContent.includes('already collected')`), 'A stale Edit must explain that the agent already collected the message');
+        assert.equal(await cdp.evaluate(`document.querySelector(${literal(row(collectedId) + ' .mail-editor')})`), null);
+        assert.equal(pop(collectedId), null, 'A refused edit must not requeue collected mail');
+      } finally {await cdp.send('Network.setExtraHTTPHeaders', {headers:{}});}
+    },
     async 'live-usage'() {
       await cdp.goto(project + '?tab=tokens', '#token-usage');await selected('tokens');
       assert.equal(await cdp.evaluate('Number(document.querySelector(".usage-metrics strong").textContent)'), 5);
@@ -522,7 +589,10 @@ async function main() {
       }
     },
   };
+  assert(!selectedCase || Object.hasOwn(cases, selectedCase), 'Unknown browser case');
+  assert(!selectedCase || !mutation || mutations[mutation].test === selectedCase, 'Mutation targets another browser case');
   for (const [name, run] of Object.entries(cases)) {
+    if (selectedCase && selectedCase !== name) continue;
     if (mutation && mutations[mutation].test !== name) continue;
     try {await run();report.cases.push({name, passed: true});console.log('PASS ' + name);}
     catch (error) {
