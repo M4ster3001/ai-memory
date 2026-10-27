@@ -15,6 +15,8 @@ cargo build --locked --bin ai-memory
 npx --yes playwright@1.63.0 install --with-deps --only-shell chromium
 node tests/e2e/web_dashboard_browser.mjs
 node tests/e2e/web_dashboard_mutations.mjs
+# Focused edit flow, including its three browser faults.
+node tests/e2e/web_dashboard_mutations.mjs --case=message-editing
 python3 scripts/check-dashboard-core-mutations.py
 # Focused mailbox isolation probe (the CI gate runs every case).
 python3 scripts/check-dashboard-core-mutations.py --case expose-restricted-mailbox-projects
@@ -70,6 +72,8 @@ unknown data is a required outcome and is never replaced by guessed coordinates.
 | Pending notification links and the default received mailbox find older messages behind collected history; explicit all/claimed filters retain history | Rust `operations_pending_mail_is_filtered_before_history_pagination`; server state predicate runs before LIMIT/OFFSET |
 | Resumed substantive work reopens scoped API/detail reads, leaves completed listings, refuses a foreign project and closes after another SessionEnd | Browser `resumed-session`; store `session_activity` tests preserve the persisted watermark and owner/project controls |
 | Legacy browser reads cannot send; invalid tokens are refused and cleared; authorized sends reach the chosen harness once | Browser `delivery`, against real HTTP auth and native CLI claims; Rust `operations_message_write_obeys_root_user_and_project_grants`, `operations_message_requires_write_access_to_both_project_coordinates`, store `addressed_messages_are_claimed_once_only_by_the_selected_harness` |
+| Editing holds mail outside the native claim queue; save preserves the edited text and id, discard preserves the original, held edits survive navigation/reload, and stale edits refuse collected mail | Browser `message-editing`; its `skip-message-edit-hold`, `lose-saved-message-text` and `save-discarded-message-text` faults must fail the same case |
+| Every edit/save/release requires write access to both mailbox and sender, including after a grant changes; foreign workspaces/projects and invalid lifecycle states cannot be edited | Rust `operations_edit_needs_write_access_to_the_sender_project_too`, `a_message_being_edited_leaves_the_queue_until_it_is_saved`, `collected_or_cancelled_mail_cannot_be_taken_for_editing`; seven core mutation probes remove these guards |
 | Sanitization, admission rejection, foreign origin and unknown recipients | Rust `operations_browser_messages_use_the_configured_sanitizer_and_admission`, `operations_browser_send_refuses_cross_origin_unknown_recipient_and_empty_body`; browser `delivery` checks escaped message text |
 | Usage reaches the server before session-end, repeated reports do not add calls, refresh preserves active tab/filter/focus | Browser `live-usage`; hooks `live_token_calls_update_open_sessions_without_an_end_event` |
 | More than 256 responses and a transcript larger than 4 MiB recover across successive hook processes, without advancing on enqueue failure or duplicating responses | Browser `capture-backlog` uses native hooks, spool drain, the real server and dashboard; CLI `native_hook_recovers_a_response_backlog_and_does_not_advance_on_spool_failure`, `live_token_cursor_replays_until_commit_then_recovers_every_response`, `live_token_cursor_crosses_byte_windows_and_retries_partial_usage` |
@@ -123,6 +127,12 @@ counts only if the response was changed and the intended behavioral case failed.
 | Count Codex cache as fresh input | Codex transcript parser regression |
 | Overwrite a response with lower replayed counters | Response/session consistency regression |
 | Remove harness checks from the claim lookup and atomic update | Directed harness claim regression |
+| Open the editor without holding the message on the server | `message-editing` |
+| Send different text on save or overwrite the original on discard | `message-editing` |
+| Accept read-only access to the mailbox or sender during editing | Edit authorization regression, including grant changes on held mail |
+| Remove mailbox coordinates from hold or save/release | Foreign project/workspace edit regression |
+| Hold collected/cancelled mail or save/release unheld mail | Edit lifecycle regressions |
+| Let claim selection, metadata and atomic update accept held mail | Held-mail claim regression |
 
 Browser results are summarized in `target/web-dashboard-mutations.json`. The
 source anchors used to inject a fault need updating when the implementation is

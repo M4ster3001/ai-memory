@@ -26,10 +26,16 @@ const faults = [
   ['ignore-mailbox-workspace', 'mailbox-context'],
   ['disable-inbox-notifications', 'notifications'],
   ['ignore-notification-workspace', 'notifications'],
+  ['skip-message-edit-hold', 'message-editing'],
+  ['lose-saved-message-text', 'message-editing'],
+  ['save-discarded-message-text', 'message-editing'],
 ];
 
+const selectedCase = process.argv.find(arg => arg.startsWith('--case='))?.split('=')[1];
+assert(!selectedCase || faults.some(([, name]) => name === selectedCase), 'Unknown browser mutation case');
+
 async function run(mutation) {
-  const child = spawn(process.execPath, [path.join(here, 'web_dashboard_browser.mjs'), ...(mutation ? ['--mutation=' + mutation] : [])], {env: process.env});
+  const child = spawn(process.execPath, [path.join(here, 'web_dashboard_browser.mjs'), ...(mutation ? ['--mutation=' + mutation] : []), ...(selectedCase ? ['--case=' + selectedCase] : [])], {env: process.env});
   let output = '', errors = '';
   child.stdout.on('data', data => {output += data;});
   child.stderr.on('data', data => {errors += data;});
@@ -44,10 +50,11 @@ async function run(mutation) {
 try {
   const baseline = await run();
   assert.equal(baseline.code, 0, 'Baseline must pass; inspect ' + baseline.directory);
-  assert(baseline.result.cases.length >= 16 && baseline.result.cases.every(c => c.passed));
+  assert((selectedCase ? baseline.result.cases.length === 1 : baseline.result.cases.length >= 17) && baseline.result.cases.every(c => c.passed));
   manifest.baseline = baseline.directory;
   console.log('PASS unmodified server and browser baseline');
   for (const [fault, name] of faults) {
+    if (selectedCase && selectedCase !== name) continue;
     const mutant = await run(fault);
     assert.equal(mutant.code, 1, fault + ' survived or the runner crashed');
     assert(mutant.result.mutationApplied > 0, fault + ' never reached the served application');
