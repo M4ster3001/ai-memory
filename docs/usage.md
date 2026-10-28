@@ -259,11 +259,11 @@ when you need the full transcript or page. For a question like "what did this
 session do" or "where did it stop", a narrow `order: "desc"` read with a `kinds`
 filter such as `["user-prompt", "stop", "session-end"]` is usually enough.
 
-The other lever is the asking session, not ai-memory. A question sent into a
-long-idle agent session re-caches that session's entire context before the first
-tool call runs, and every later tool call re-reads it. A quick lookup like this
-costs far less in a fresh session or a subagent than appended to one that has
-been idle for hours.
+The asking session also affects cost independently of ai-memory. A question
+sent into a long-idle agent session re-caches its entire context before the
+first tool call, and each later tool call re-reads it. For a quick lookup, a
+fresh session or subagent costs far less than a session that has been idle for
+hours.
 
 ## Search from the terminal
 
