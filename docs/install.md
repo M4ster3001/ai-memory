@@ -389,7 +389,7 @@ docker run -d --name ai-memory \
     akitaonrails/ai-memory:latest
 ```
 
-> Replace `<server-ip>` with the address clients will actually use in
+> Replace `<server-ip>` with the address clients will use in
 > `AI_MEMORY_SERVER_URL`. The server checks it against the HTTP `Host` header of
 > every request, not against the caller's source IP. If the placeholder stays, or
 > the value differs from what clients connect to, every non-loopback request
@@ -421,10 +421,9 @@ browsers then correctly withhold the session cookie.
 > Scenario B, C or D, depending on whether you use Docker Desktop, a prebuilt
 > binary or a source build. Everywhere else see
 > [Running ai-memory without docker](#running-ai-memory-without-docker);
-> `mise use -g github:akitaonrails/ai-memory` is the one-liner for most setups.
-> Confirm with `ai-memory --version` before you continue. If that prints
-> "command not found", the install step did not put the binary on `PATH` for
-> this shell yet. On Windows, open a new terminal so the PATH change from the
+> `mise use -g github:akitaonrails/ai-memory` installs the client for most setups.
+> Run `ai-memory --version` to check the installation. If it prints
+> "command not found", the binary is not on `PATH` in this shell. On Windows, open a new terminal so the PATH change from the
 > installer takes effect.
 
 ```bash
