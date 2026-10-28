@@ -167,8 +167,8 @@ version in [`docs/changelog/`](docs/changelog/):
 - Added optional `max_chars` to `memory_read_page` (default 12000,
   minimum 500, maximum 64000). It caps the returned body with the same visible
   truncation marker as `memory_read_session_observations`. The response always
-  includes `truncated` and `total_chars`, which report whether the body was cut
-  and its full size (#NNN).
+  includes `truncated` and `total_chars` to report whether the body was cut
+  and the full body size (#NNN).
 
 ### Changed
 
