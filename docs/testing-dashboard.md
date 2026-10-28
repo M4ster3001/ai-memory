@@ -32,7 +32,7 @@ describes the test browser's system dependencies and headless shell.
 
 The browser runner starts its own Rust server, uses synthetic projects and a
 fake root token, and drives Chromium through its native debugging protocol. It
-does not modify the DOM or contact a running production server. Messages are sent
+does not replace the DOM or contact a running production server. Messages are sent
 over HTTP and claimed through the native CLI. Every run keeps logs and a JSON
 report in the printed artifact directory, and failed browser cases also keep a
 screenshot.
