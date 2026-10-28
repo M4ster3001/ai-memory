@@ -21,7 +21,7 @@ version in [`docs/changelog/`](docs/changelog/):
   with a count above the list and a way back into the editor. Editing needs
   write access to the mailbox project and to the project the message came from,
   and a message an agent already collected cannot be edited. Held messages use a
-  new `editing` state (migration V95) that no claim path selects (#NNN).
+  new `editing` state (migration V93) that no claim path selects (#NNN).
 
 - Added server-side response investigation to the project dashboard. Responses
   can be filtered by UTC period, exact model, harness, session, turn and tool,
