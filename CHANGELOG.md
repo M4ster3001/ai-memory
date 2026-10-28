@@ -164,24 +164,24 @@ version in [`docs/changelog/`](docs/changelog/):
   side is upgraded, and nothing showed it. When they differ in major version,
   the text report adds a warning to upgrade the older side (#1644).
 
-- The read-only web home now has a memory dashboard built on sanitized data:
+- Added a memory dashboard to the read-only web home, using sanitized data:
   projects, sessions, sanitized capture events, compiled pages, open-session
   continuity signals and last activity. Project cards separate captured work
   from compiled pages, so an active hook no longer looks empty just because
   its sessions have not ended (#NNN).
 
-- The web dashboard now shows hook-health counters: accepted, policy-dropped,
+- Added dashboard hook-health counters for accepted, policy-dropped,
   capacity-shed and rate-limited events. They count events since the process
   started, and prompt, command, path and payload data is neither persisted nor
   rendered (#NNN).
 
-- The project overview page now shows which agent CLIs produced a project's
-  memory. The stats card has an "Agents" badge row with session counts per
+- Added agent CLI attribution to the project overview to show which harnesses
+  produced a project's memory. The stats card has an "Agents" badge row with session counts per
   harness, and each Recent Activity entry shows the harness whose session last
   contributed evidence to that page version. Both are best effort: a page or
   project with no session evidence shows no badge (#NNN).
 
-- Added per-session token cost. At `session-end` the native hook (Claude Code
+- Added per-session token accounting. At `session-end` the native hook (Claude Code
   and Codex) reads the harness's own transcript and reports cumulative input,
   output, cache-write and cache-read totals. It scans Claude Code's JSONL in
   full and reads only the tail of Codex's rollout file, since both can reach
@@ -192,9 +192,9 @@ version in [`docs/changelog/`](docs/changelog/):
   sessions. A session whose harness never reported usage, an unsupported
   harness or an older client shows no number, never a zero (#NNN).
 
-- A session that never gets a graceful `session-end` no longer stays open
-  without tokens forever. This usually happens when a paid quota runs out
-  mid-task and the operator switches to another agent. When a new session
+- Added recovery of usage and closure for sessions missing a graceful
+  `session-end`, which previously stayed open without tokens. This usually
+  happens when a paid quota runs out mid-task and the operator switches agents. When a new session
   starts in the same scope and finds one quiet for at least 15 minutes, the
   client looks for the old session's own transcript (Claude Code and Codex),
   reports its usage and closes it with a normal synthetic `session-end`. That
@@ -206,9 +206,9 @@ version in [`docs/changelog/`](docs/changelog/):
   server cannot read a client's transcript outside a live hook request (#NNN).
 
 - Added live, deduplicated response token accounting for Claude Code and Codex.
-  The native hooks now send measured response usage on `post-tool-use`, `stop`,
-  `pre-compact` and `session-end` instead of only at the end of a session, so
-  an open session's totals stay current. Each response is stored once by its
+  Updated native hooks to send measured response usage on `post-tool-use`,
+  `stop`, `pre-compact` and `session-end`, keeping open-session totals current
+  rather than waiting for session end. Each response is stored once by its
   native identity in a new `token_calls` ledger (V92). A partial or replayed
   delivery raises the stored counters column by column and never adds the same
   response twice. Live extraction reads a bounded 4 MiB transcript tail and
@@ -254,14 +254,14 @@ version in [`docs/changelog/`](docs/changelog/):
   credentials. The source-built Docker image now copies `CHANGELOG.md` for this
   (#NNN).
 
-- Project pages now show one section at a time in accessible tabs: Overview,
+- Organized project pages into accessible tabs showing one section at a time: Overview,
   Agents, Token usage, Sessions and Knowledge. The selected tab is kept in the
   URL (`?tab=agents`), which keeps reload, shared links and browser history in
   sync, and the tabs support Left, Right, Home and End. Existing
   `#agents`-style section bookmarks still open the matching tab (#NNN).
 
-- The browser inbox composer now sets To project to the source project by
-  default and lists only harnesses with captured sessions in the destination
+- Updated the browser inbox composer to default To project to the source
+  project and list only harnesses with captured sessions in the destination
   workspace and project. It resets a stale recipient when a project changes,
   and it disables sending, with an explanation, for a project that has no
   registered agent (#NNN).
@@ -279,8 +279,8 @@ version in [`docs/changelog/`](docs/changelog/):
   readable source links, declared contradictions, expiration context and an
   on-page recall recomputation that reuses the original search filters (#NNN).
 
-- Feature guides and the authenticated `/api/v1/docs/features/status`
-  reference now report caller-aware installation states and next steps. They
+- Added caller-aware installation states and next steps to feature guides and
+  the authenticated `/api/v1/docs/features/status` reference. They
   separate effective settings from client facts the server cannot know, and
   administrative settings are masked for callers without admin rights (#NNN).
 
@@ -340,8 +340,8 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
-- A new agent session now gets a read-only recovery snapshot when the previous
-  substantive session in the project vanished without a `SessionEnd` (quota
+- Added a read-only recovery snapshot at agent startup when the previous
+  substantive session in the project ended without a `SessionEnd` (quota
   exhaustion, a killed process, a machine restart). The snapshot is built on
   demand from at most 64 sanitized observations and capped at 6,000
   characters, so no rolling copy of the transcript exists. It is scoped to the
@@ -360,15 +360,15 @@ version in [`docs/changelog/`](docs/changelog/):
   authorized calls before pagination. Response pages are independent, and
   session detail pages refresh usage live (#NNN).
 
-- Scoped session reads now treat substantive work after an old end as a resumed
-  session, matching the activity feed, without changing persisted lifecycle
-  watermarks. Completed-only listings exclude those resumed sessions (#NNN).
+- Updated scoped session reads to treat substantive work after an old end as a
+  resumed session, matching the activity feed while preserving persisted
+  lifecycle watermarks. Completed-only listings exclude those resumed sessions (#NNN).
 
-- Token model labels are now sanitized before truncation, so the size limit can
-  no longer expose a prefix of private text (#NNN).
+- Moved token model label sanitization before truncation to prevent the size
+  limit from exposing a prefix of private text (#NNN).
 
-- Selecting a release on the changelog page now loads its notes immediately and
-  keeps the URL, outline and Markdown reference in sync. The form still submits
+- Updated release selection on the changelog page to load notes immediately
+  and keep the URL, outline and Markdown reference in sync. The form still submits
   without JavaScript (#NNN).
 
 ## [3.2.8] - 2026-10-27

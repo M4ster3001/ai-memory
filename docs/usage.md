@@ -933,8 +933,8 @@ prose.
 
 ## Investigate token usage in the dashboard
 
-Use UTC From and Until (inclusive and exclusive), exact model, harness and
-session filters to narrow the complete authorized ledger before pagination. Turn
+Filter the complete authorized ledger before pagination by UTC period, exact
+model, harness and session. From is inclusive; Until is exclusive. Turn
 and tool filters connect a response to reported native context. "Turn & tools"
 separates a requested tool, an input result and a same-turn association, and
 shared context does not prove that a token cost belongs to one tool. Update
@@ -945,8 +945,8 @@ timestamp fallbacks, filtered totals and capture prerequisites.
 
 Open a project under `/web` and select the Token usage tab. Updated native Claude Code and
 Codex hooks send measured response usage on `post-tool-use`, `stop`,
-`pre-compact` and `session-end`. A session can stay open: usage is stored as it
-arrives, and the panel and the session totals refresh every ten seconds. To
+`pre-compact` and `session-end`. The server stores usage as it arrives, including while a
+session is open. The panel and session totals refresh every ten seconds. To
 enable capture, update the native client on each agent machine as well as the
 server.
 
@@ -985,11 +985,10 @@ System follows operating-system changes, and a manual choice overrides it.
 
 ### Explore agents and sessions
 
-The workspace sidebar keeps projects, the inbox, workstreams, the knowledge
-graph, learning review and server health within reach on desktop and mobile.
+The workspace sidebar links to projects, the inbox, workstreams, the knowledge
+graph, learning review and server health on desktop and mobile.
 Project cards show the recorded harnesses and can be filtered by name, open
-sessions or queued messages. An open session only means its end event has not
-arrived. It does not prove that an agent is online.
+sessions or queued messages. An open session has no recorded end event; the agent may no longer be online.
 
 Project tabs show one section at a time. Overview summarizes capture and pending
 messages, Agents groups harnesses, Token usage investigates responses, Sessions
