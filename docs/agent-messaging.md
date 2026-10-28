@@ -351,11 +351,10 @@ its original place in the queue. "Discard changes" puts it back unchanged. The
 message keeps its id either way. A message an agent collected in the meantime
 cannot be edited, and the editor says so. Editing needs write access to the
 project that holds the mailbox and to the project the message came from, the
-same access that sending it needed. While held, a message shows as Editing, a
-banner above the list counts the held messages and links to them, and Continue
-editing or Discard changes works from any tab. A held message stays out of the
-queue until someone saves or discards it, so an editor left open in a closed tab
-keeps it from the agent until it is released. The legacy GET-only login cannot
+same access that sending it needed. Held messages show as Editing. A banner above the list counts them and links
+to them; Continue editing and Discard changes work from any tab. Closing an
+editor tab leaves the message held outside the queue until someone saves or
+discards it. The legacy GET-only login cannot
 edit.
 
 
