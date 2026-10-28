@@ -357,7 +357,6 @@ editor tab leaves the message held outside the queue until someone saves or
 discards it. The legacy GET-only login cannot
 edit.
 
-
 Queuing a message does not start or wake an agent, or authorize it to follow
 the request. The recipient checks its inbox independently and evaluates the
 request under the same untrusted-input rules as other cross-project mail. Session-start notices count
