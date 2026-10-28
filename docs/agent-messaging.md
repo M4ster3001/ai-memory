@@ -18,8 +18,8 @@ ever sees mail addressed **to** it (its inbox) or sent **from** it (its outbox).
 
 - A message is addressed to a **project**, with an optional harness recipient
   such as `codex` or `claude-code`. Any session in the recipient project can
-  pop a shared message, and an addressed message needs that harness. Knowledge
-  is shared; the pop is the claim-once baton, the same rule handoffs follow.
+  pop a shared message; only the named harness can claim an addressed message.
+  Knowledge is shared, while messages and handoffs are claimed once.
 - **Claim-once queue.** A message is `pending` until a session in the recipient
   project pops it (→ `claimed`, exactly once) or the sender cancels it
   (→ `cancelled`). A second pop of the same message returns nothing.
@@ -314,8 +314,8 @@ Open Inbox in the workspace sidebar, or Message on a project's agent card.
 Select a project mailbox to see its received or sent history. The list is paged
 at fifty messages, shows queued, collected and cancelled states, and shows each
 body as escaped plain text when you expand the row. Reading never claims or
-cancels a message. "Collected" means an agent won the claim. It does not mean
-the agent finished the request.
+cancels a message. "Collected" records the agent's claim; completion of the
+request is not confirmed.
 
 The composer sets To project to the From project by default, and To agent lists
 only harnesses with captured sessions in the destination workspace and project.
@@ -358,9 +358,10 @@ queue until someone saves or discards it, so an editor left open in a closed tab
 keeps it from the agent until it is released. The legacy GET-only login cannot
 edit.
 
-A queued message does not start, wake or instruct an agent. The recipient
-checks its inbox on its own and weighs the request under the same
-untrusted-input rules as other cross-project mail. Session-start notices count
+
+Queuing a message does not start or wake an agent, or authorize it to follow
+the request. The recipient checks its inbox independently and evaluates the
+request under the same untrusted-input rules as other cross-project mail. Session-start notices count
 only shared mail and mail addressed to the receiving harness.
 
 A message belongs to its project's mailbox. Readers of that project can read
