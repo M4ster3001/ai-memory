@@ -17,7 +17,7 @@ version in [`docs/changelog/`](docs/changelog/):
   can be filtered by UTC period, exact model, harness, session, turn and tool,
   with complete pagination, filtered token totals and bounded native turn and
   tool provenance. The context lives in extra `token_calls` columns and a
-  `token_call_tools` table (migration V94). A response from an older hook keeps
+  `token_call_tools` table (migration V92). A response from an older hook keeps
   its provenance unknown instead of guessed. Filters apply after project
   authorization and the session-owner check and before counting, ranking and
   pagination (#NNN).
