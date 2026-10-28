@@ -962,11 +962,10 @@ System follows operating-system changes, and a manual choice overrides it.
 
 ### Explore agents and sessions
 
-The workspace sidebar keeps projects, the inbox, workstreams, the knowledge
-graph, learning review and server health within reach on desktop and mobile.
+The workspace sidebar links to projects, the inbox, workstreams, the knowledge
+graph, learning review and server health on desktop and mobile.
 Project cards show the recorded harnesses and can be filtered by name, open
-sessions or queued messages. An open session only means its end event has not
-arrived. It does not prove that an agent is online.
+sessions or queued messages. An open session has no recorded end event; the agent may no longer be online.
 
 Inside a project, agent cards add up reported usage across sessions and show how
 many sessions reported it. "Explore sessions" pages through one harness's
