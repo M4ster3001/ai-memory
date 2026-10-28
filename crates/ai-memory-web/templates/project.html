@@ -59,7 +59,6 @@
           <div class="min-w-0">
             <div class="text-sm font-medium text-slate-800 dark:text-slate-100 truncate">{{ message.subject }}</div>
             <div class="flex items-center gap-2 mt-1">
-              <span class="inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-400 shrink-0">{{ message.nature }}</span>
               {% if let Some(href) = message.sender_href %}
               <a href="{{ href }}" class="inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 hover:text-blue-600 dark:hover:text-blue-400 shrink-0">from {{ message.sender }}</a>
               {% else %}
