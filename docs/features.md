@@ -1,7 +1,7 @@
 # Features and activation
 
-Use this guide to choose a feature, enable its prerequisites, and check the
-result. It describes shipped behavior; the linked guides contain full options.
+This guide covers prerequisites, activation and verification for shipped
+features. Follow the linked guides for the full options.
 Configuration examples belong in `<data_dir>/config.toml` unless a section names
 `.ai-memory.toml`. Restart the server after changing server configuration.
 
@@ -36,8 +36,8 @@ server container does not update clients or hooks on a separate machine.
 
 ## Capture and agent integration
 
-Purpose: capture bounded, sanitized lifecycle observations from an agent.
-Prerequisite: a reachable server and a supported harness installed locally.
+Lifecycle hooks capture bounded, sanitized observations from an agent. They
+require a reachable server and a supported harness installed locally.
 
 The managed launcher can wire supported integrations on first launch:
 
@@ -64,9 +64,9 @@ registered sessions and captured-event counts should grow. If they do not, use
 
 ## Token accounting and investigation
 
-Purpose: inspect usage for individual model responses and totals per session
-and agent type. Enable: update the native Claude Code or Codex client and
-reinstall its hooks as above. There is no separate dashboard token switch.
+The dashboard shows usage for individual model responses and totals per session
+and agent type. Update the native Claude Code or Codex client and reinstall its
+hooks as above to enable capture. There is no separate dashboard token switch.
 The server records reports as they arrive; the session need not end.
 
 The Token usage form filters the whole authorized response ledger on the
@@ -105,8 +105,8 @@ monetary costs. See [dashboard usage](usage.md#investigate-token-usage-in-the-da
 
 ## Themes and responsive navigation
 
-Enable: choose "Light", "Dark" or "System" in the header. The preference
-is saved locally in that browser. No server setting or restart is required.
+Choose "Light", "Dark" or "System" in the header. The browser saves your
+preference locally. No server setting or restart is required.
 On small screens, open the menu for projects, inbox, search and documentation.
 
 Inside a project, "Overview", "Agents", "Token usage", "Sessions" and
@@ -120,9 +120,9 @@ destinations off-screen.
 
 ## Agent inbox and directed messages
 
-Purpose: queue a request for a project, optionally targeting a harness such
-as Codex or Claude Code. Prerequisite: the recipient must have a captured
-session in that project to appear in the browser selector.
+Queue a request for a project, optionally targeting a harness such as Codex
+or Claude Code. The recipient must have a captured session in that project to
+appear in the browser selector.
 
 Open "Inbox" to see queued counts by workspace and project, with a direct link
 to each mailbox. With no project in the URL, a mailbox with waiting messages is
@@ -167,8 +167,8 @@ shared queues, cancellation, sender provenance and untrusted-message handling.
 
 ## Handoffs and compaction recovery
 
-Purpose: carry useful context into the next session or harness.
-Enable: install lifecycle hooks. Handoff capture and recovery follow the
+Install lifecycle hooks to carry useful context into the next session or
+harness. Handoff capture and recovery follow the
 configured lifecycle policy; no LLM is required for the deterministic path.
 Use `ai-memory run` for managed cross-harness continuity.
 
@@ -178,8 +178,9 @@ is not evidence of a running process. See [handoffs and recovery](usage.md).
 
 ## Managed sessions and workstreams
 
-Enable: launch a supported harness with `ai-memory run <harness>` rather
-than a direct executable. This is opt-in per launch, not a global mode switch.
+Launch a supported harness with `ai-memory run <harness>` to enable managed
+sessions for that launch. Direct launches remain unmanaged; this setting does
+not change the global mode.
 Use the documented resume and launch-profile options for account-specific
 configuration. Root can inspect recorded lifecycle metadata in "Workstreams".
 
@@ -228,8 +229,8 @@ and the [configuration reference](ARCHITECTURE.md#configuration-configtoml).
 
 ## Embeddings and reranking
 
-Purpose: add semantic retrieval and optional candidate reranking.
-Enable: configure the embedding provider, model and credentials described in
+For semantic retrieval and optional candidate reranking, configure the
+embedding provider, model and credentials described in
 [LLM providers](llm-providers.md) and the [configuration reference](ARCHITECTURE.md#configuration-configtoml).
 Availability and defaults depend on the provider configuration and build.
 LLM reranking is separately opt-in through `AI_MEMORY_RERANKER=llm` and requires
@@ -241,9 +242,9 @@ vectors are ignored. Ordinary lexical recall remains available without them.
 
 ## LLM consolidation and provider fallback
 
-Purpose: compile captured evidence into maintained knowledge with an optional
-model provider. Enable: configure `llm_provider`, model and the provider's
-credential flow from [LLM providers](llm-providers.md). Provider support and
+To compile captured evidence into maintained knowledge with an optional model
+provider, configure `llm_provider`, the model and the provider's credential flow
+from [LLM providers](llm-providers.md). Provider support and
 credential types are documented there; do not paste credentials into pages.
 
 Without an LLM, capture, lexical recall and deterministic summaries still work.
