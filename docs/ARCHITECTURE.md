@@ -144,7 +144,7 @@ from hook paths.
    created, and nothing from other project scopes is loaded. When assistant
    `Stop` excerpts are enabled (they pass a privacy gate), the excerpt is the
    preferred latest checkpoint. Otherwise recent prompts and lifecycle or
-   tool metadata give the continuation trail.
+   tool metadata provide context for resuming work.
 4. When `AI_MEMORY_LLM_PROVIDER` is set, `memory_consolidate` rewrites
    that summary into a richer durable page or fans out into a
    multi-page batch under `concepts/`, `decisions/`, `gotchas/`. Consolidation
@@ -287,7 +287,7 @@ from hook paths.
    narrower than a real end (see the session-usage row below).
    A session that is continued, meaning a new session starts in the same
    scope while the old one has been quiet for 15 minutes or more, is closed
-   sooner and more completely on the client. Past that stricter threshold the
+   sooner on the client, including usage recovery. After that threshold the
    read-only recovery packet that `render_interrupted_session_context`
    (`ai-memory-hooks/src/router.rs`) builds also carries a machine-parsed
    marker. The client uses it to find the old session's transcript, report

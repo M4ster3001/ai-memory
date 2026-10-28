@@ -164,24 +164,24 @@ version in [`docs/changelog/`](docs/changelog/):
   side is upgraded, and nothing showed it. When they differ in major version,
   the text report adds a warning to upgrade the older side (#1644).
 
-- The read-only web home now has a memory dashboard built on sanitized data:
+- Added a memory dashboard to the read-only web home, using sanitized data:
   projects, sessions, sanitized capture events, compiled pages, open-session
   continuity signals and last activity. Project cards separate captured work
   from compiled pages, so an active hook no longer looks empty just because
   its sessions have not ended (#NNN).
 
-- The web dashboard now shows hook-health counters: accepted, policy-dropped,
+- Added dashboard hook-health counters for accepted, policy-dropped,
   capacity-shed and rate-limited events. They count events since the process
   started, and prompt, command, path and payload data is neither persisted nor
   rendered (#NNN).
 
-- The project overview page now shows which agent CLIs produced a project's
-  memory. The stats card has an "Agents" badge row with session counts per
+- Added agent CLI attribution to the project overview to show which harnesses
+  produced a project's memory. The stats card has an "Agents" badge row with session counts per
   harness, and each Recent Activity entry shows the harness whose session last
   contributed evidence to that page version. Both are best effort: a page or
   project with no session evidence shows no badge (#NNN).
 
-- Added per-session token cost. At `session-end` the native hook (Claude Code
+- Added per-session token accounting. At `session-end` the native hook (Claude Code
   and Codex) reads the harness's own transcript and reports cumulative input,
   output, cache-write and cache-read totals. It scans Claude Code's JSONL in
   full and reads only the tail of Codex's rollout file, since both can reach
@@ -192,9 +192,9 @@ version in [`docs/changelog/`](docs/changelog/):
   sessions. A session whose harness never reported usage, an unsupported
   harness or an older client shows no number, never a zero (#NNN).
 
-- A session that never gets a graceful `session-end` no longer stays open
-  without tokens forever. This usually happens when a paid quota runs out
-  mid-task and the operator switches to another agent. When a new session
+- Added recovery of usage and closure for sessions missing a graceful
+  `session-end`, which previously stayed open without tokens. This usually
+  happens when a paid quota runs out mid-task and the operator switches agents. When a new session
   starts in the same scope and finds one quiet for at least 15 minutes, the
   client looks for the old session's own transcript (Claude Code and Codex),
   reports its usage and closes it with a normal synthetic `session-end`. That
@@ -254,8 +254,8 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
-- A new agent session now gets a read-only recovery snapshot when the previous
-  substantive session in the project vanished without a `SessionEnd` (quota
+- Added a read-only recovery snapshot at agent startup when the previous
+  substantive session in the project ended without a `SessionEnd` (quota
   exhaustion, a killed process, a machine restart). The snapshot is built on
   demand from at most 64 sanitized observations and capped at 6,000
   characters, so no rolling copy of the transcript exists. It is scoped to the
