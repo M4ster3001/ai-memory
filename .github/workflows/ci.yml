@@ -24,9 +24,9 @@ jobs:
       matrix:
         include:
           - pr: 1803
-            commit: 0a5ca6f2877af7c082e29bc9a4fcbd78838672cb
+            commit: 487ad9a09fba4559979f284826e72ba7d5400d68
           - pr: 1804
-            commit: c0fa5f90e83f7f2fb53eb3d23da4d6f51308c958
+            commit: b09a131b5bd320c0c5fdb3650de863b07a30a621
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
