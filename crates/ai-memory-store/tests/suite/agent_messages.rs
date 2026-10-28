@@ -9,8 +9,7 @@
 //! recipient inbox is bounded so a flood cannot exhaust its context/storage.
 
 use ai_memory_core::{
-    AgentKind, MessageBox, MessageClaim, MessageState, NewAgentMessage, ProjectId,
-    WorkspaceId,
+    AgentKind, MessageBox, MessageClaim, MessageState, NewAgentMessage, ProjectId, WorkspaceId,
 };
 use ai_memory_store::{MAX_PENDING_INBOX_MESSAGES, Store};
 
