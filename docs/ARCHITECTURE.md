@@ -134,6 +134,17 @@ from hook paths.
    the tick's clock (the session's last activity is preserved in the audit
    detail), and the consolidation job is enqueued inside the stamp's
    transaction.
+   If a harness is cut off before `SessionEnd`, the next `SessionStart` also
+   looks for the most recently active substantive open session in the same
+   project and ownership boundary. It renders a read-only recovery snapshot
+   from the newest 64 stored observations, capped at 6,000 characters. A
+   handoff that covers the newest work suppresses the snapshot, and when a
+   handoff is delivered, other uncovered work stays a metadata-only pointer.
+   The source stays open (parallel agents are valid), no extra handoff row is
+   created, and nothing from other project scopes is loaded. When assistant
+   `Stop` excerpts are enabled (they pass a privacy gate), the excerpt is the
+   preferred latest checkpoint. Otherwise recent prompts and lifecycle or
+   tool metadata provide context for resuming work.
 4. When `AI_MEMORY_LLM_PROVIDER` is set, `memory_consolidate` rewrites
    that summary into a richer durable page or fans out into a
    multi-page batch under `concepts/`, `decisions/`, `gotchas/`. Consolidation
@@ -268,6 +279,22 @@ from hook paths.
    no pages, sessions, observations, handoffs, managed workstreams, or
    auto-improvement data; managed continuity history therefore keeps its
    project scope alive even when no lifecycle-hook session has been captured.
+   The same scheduled sweep tick also runs one store-wide
+   `close_abandoned_sessions` batched `UPDATE`. A session with no activity
+   for 48 hours and no `SessionEnd` gets `ended_at` set from its own last
+   activity, with no summary page and no usage. This keeps
+   `open_session_count` from growing on sessions nobody continues, and it is
+   narrower than a real end (see the session-usage row below).
+   A session that is continued, meaning a new session starts in the same
+   scope while the old one has been quiet for 15 minutes or more, is closed
+   sooner on the client, including usage recovery. After that threshold the
+   read-only recovery packet that `render_interrupted_session_context`
+   (`ai-memory-hooks/src/router.rs`) builds also carries a machine-parsed
+   marker. The client uses it to find the old session's transcript, report
+   its usage and send a normal synthetic `SessionEnd`. This is safe even if
+   the old session is still live: a later real `SessionEnd` with more
+   observations than the early close saw re-runs the full end path
+   (`SessionEndDisposition::ReEndWithNewWork`, issue #152).
 8. Backups: `ai-memory backup --to <tarball>` uses SQLite's online
    backup API so the source stays writable; `ai-memory restore`
    reverses. Or: `git push` the wiki dir + `rsync` the data dir.
@@ -583,6 +610,7 @@ prunable rather than only after it ages in place.
 | `page_evidence` | V63 append-only record of what produced or reaffirmed each page version: consolidation cites the `session` it ran on, written in the page-upsert transaction and cascaded on purge. Feeds a read-time, zero-LLM **belief-strength `confidence`** (`ai_memory_store::belief`, B1 / `docs/design-hindsight-borrowings.md` P2): a bounded `[0.0, 0.95]` function of distinct supporting sessions (breadth, not raw count), recency of the newest sighting, and live `contradicts` count. Exposed as `confidence` + `evidence_count` in `memory_query(explain=true)`, as `evidence_rows` in `memory_status`, and used to order the opt-in `settled_first` briefing, all **ranking-inert**. It folds into `PageAuthority` only behind `[retrieval] belief_authority_weight` (**default `0.0`/OFF, R2-gated**), as one bounded factor inside the `[0.55, 1.50]` clamp; a supersession always wins regardless of evidence (a superseded version is never boosted). |
 | `agent_messages` | V64 cross-project message inbox/queue (`docs/agent-messaging.md`). Directed, claim-once mail from a sender coordinate to a recipient coordinate; `pending`→`claimed` (popped exactly once, the handoff compare-and-set) or `pending`→`cancelled` (sender retracts). The one table that crosses per-project isolation, so reads are keyed by the recipient coordinate (inbox) or sender coordinate (outbox); `from_owner_user`/`claimed_by_user` are attribution only, never a read filter. Recipient inbox depth is capped. `ON DELETE CASCADE` on both coordinate pairs. |
 | `pages.compacted_at` | V65 nullable A2 tier-down marker (`docs/design-memory-aging.md` §A2). Set when the forget-sweep extractively compacts a cold episodic page (opt-in `[decay] compact_cold_episodic`) instead of evicting it; derived at the single page-upsert choke point from a `compacted: true` frontmatter mirror, so the marker and compacted body land in one transaction. Additive `ADD COLUMN`, no backfill; the sweep populates it lazily. The sweep and curator skip a marked page so it is never re-compacted, re-evicted, or re-reported as cold. Reversible: the full pre-compaction body stays in git + the supersession chain. |
+| `session_usage` | V89 one row per session: cumulative input/output/cache-write/cache-read tokens the harness's own transcript reported at `session-end`, plus the last-seen model name. Written client-side (`ai-memory-cli`'s `session_usage` module reads the transcript; `hook.rs` splices it into the session-end body as `_ai_memory_usage`; the writer upserts with `MAX(existing, reported)` per column). Cascades with its session on purge/delete. Surfaced on the /web project page's Tokens stat and Sessions table; `None` (not zero) for a session whose harness never reported usage. |
 | `client_activity` | Server-wide MCP tool-call counters split into reads/writes and bucketed by UTC day. The MCP request choke point flushes buffered calls on a one-minute background interval; failed batches retry from bounded memory. Each day stores at most 128 sanitized client labels plus `other`, so an untrusted `clientInfo.name` cannot create traffic-proportional rows. |
 | `auto_improve_proposals` | Staged learning and maintenance edits with immutable target snapshots and append-only decision events. Pending-target uniqueness is scoped by the qualified staging identity; unattributed proposals retain the historical shared bucket. |
 | `entities`, `entity_page_links` | V38 noun index derived from canonical frontmatter. Names are normalized and unique per project; links target immutable page versions while retrieval filters to the latest version. Scope-pairing triggers prevent cross-project links. Powers the fourth RRF retrieval stream. |

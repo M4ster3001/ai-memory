@@ -4888,3 +4888,135 @@ async fn same_operator_multiple_sessions_isolate_active_project_pointers_and_res
         .unwrap();
     assert!(body_beta.body.contains("written from session 2"));
 }
+
+#[tokio::test]
+async fn interrupted_recovery_refuses_foreign_scope_owner_and_receiver_with_controls() {
+    use ai_memory_core::{NewObservation, ObservationKind, Sanitized, Sanitizer};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (workspace, project) = scope(&store).await;
+    let sibling = store
+        .writer
+        .get_or_create_project(workspace, "sibling", None)
+        .await
+        .unwrap();
+    let other_workspace = store.writer.get_or_create_workspace("other").await.unwrap();
+    let other_project = store
+        .writer
+        .get_or_create_project(other_workspace, "shared-app", None)
+        .await
+        .unwrap();
+    let mut sessions = Vec::new();
+    for (index, (ws, proj, owner)) in [
+        (workspace, project, "alice"),
+        (workspace, sibling, "alice"),
+        (other_workspace, other_project, "alice"),
+        (workspace, project, "bob"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let session = SessionId::new();
+        let occurred = 1_790_812_800_000_i64 + i64::try_from(index).unwrap() * 1_000;
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: Some(occurred),
+                id: session,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Codex,
+                cwd: Some("/repo".into()),
+                actor_user: Some(operator(owner)),
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    occurred_at: Some(occurred),
+                    session_id: session,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: format!("{owner} unfinished task"),
+                    body: format!("private evidence {index}"),
+                    importance: 5,
+                },
+                &Sanitizer::builtin(),
+            ))
+            .await
+            .unwrap();
+        sessions.push(session);
+    }
+
+    let alice = OwnerFilter::User(operator("alice"));
+    let own = store
+        .reader
+        .latest_interrupted_session_candidate(workspace, project, alice.clone(), None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        own.session_id, sessions[0],
+        "newer foreign scope and owner rows must not replace the legitimate candidate"
+    );
+    assert!(
+        store
+            .reader
+            .latest_interrupted_session_candidate(workspace, project, alice, Some(sessions[0]))
+            .await
+            .unwrap()
+            .is_none(),
+        "the receiver cannot recover its own observations"
+    );
+    assert!(
+        store
+            .reader
+            .latest_interrupted_session_candidate(other_workspace, project, OwnerFilter::Any, None)
+            .await
+            .unwrap()
+            .is_none(),
+        "a project id under a foreign workspace must fail closed"
+    );
+    assert!(
+        store
+            .reader
+            .latest_interrupted_session_candidate(
+                workspace,
+                project,
+                OwnerFilter::Unattributed,
+                None
+            )
+            .await
+            .unwrap()
+            .is_none(),
+        "an unattributed caller cannot read owned recovery evidence"
+    );
+    let root = store
+        .reader
+        .latest_interrupted_session_candidate(workspace, project, OwnerFilter::Any, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        root.session_id, sessions[3],
+        "an authorized unfiltered caller can read the newer home session"
+    );
+    let foreign_control = store
+        .reader
+        .latest_interrupted_session_candidate(
+            other_workspace,
+            other_project,
+            OwnerFilter::User(operator("alice")),
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(foreign_control.session_id, sessions[2]);
+}

@@ -362,7 +362,19 @@ pub fn split_web_routers(
     wiki: Wiki,
     spec: WebMountSpec<'_>,
 ) -> Result<SplitWebRouters> {
-    let split = split_web_routers_unframed(enable_web, reader, wiki, spec)?;
+    split_web_routers_with_metrics(enable_web, reader, wiki, None, spec)
+}
+
+/// Metric-aware variant of [`split_web_routers`]. The optional input keeps
+/// the web crate embeddable without coupling custom frontends to hook state.
+pub fn split_web_routers_with_metrics(
+    enable_web: bool,
+    reader: ReaderPool,
+    wiki: Wiki,
+    ingest_metrics: Option<Arc<ai_memory_core::IngestMetrics>>,
+    spec: WebMountSpec<'_>,
+) -> Result<SplitWebRouters> {
+    let split = split_web_routers_unframed(enable_web, reader, wiki, ingest_metrics, spec)?;
     let layer = || axum::middleware::map_response(deny_framing);
     Ok(SplitWebRouters {
         public: split.public.layer(layer()),
@@ -375,6 +387,7 @@ fn split_web_routers_unframed(
     enable_web: bool,
     reader: ReaderPool,
     wiki: Wiki,
+    ingest_metrics: Option<Arc<ai_memory_core::IngestMetrics>>,
     spec: WebMountSpec<'_>,
 ) -> Result<SplitWebRouters> {
     if !enable_web && !spec.enable_api {
@@ -389,6 +402,9 @@ fn split_web_routers_unframed(
         .with_recall(spec.recall);
     if let Some(health) = spec.health {
         state = state.with_health(health);
+    }
+    if let Some(metrics) = ingest_metrics {
+        state = state.with_ingest_metrics(metrics);
     }
     let api = build_api_router(state.clone(), spec.cors_origins);
     let protected_api = axum::Router::new().nest("/api/v1", api);

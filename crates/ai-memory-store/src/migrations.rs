@@ -1764,6 +1764,83 @@ mod tests {
     }
 
     #[test]
+    fn v88_to_v89_preserves_existing_sessions_and_keeps_missing_usage_unknown() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_to(&mut conn, 88).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        let before = applied_versions(&conn);
+        let workspace = crate::ops::get_or_create_workspace(&mut conn, "upgrade").unwrap();
+        let project =
+            crate::ops::get_or_create_project(&mut conn, &workspace, "app", None).unwrap();
+        let session = SessionId::new();
+        crate::ops::begin_session(
+            &mut conn,
+            &NewSession {
+                occurred_at: None,
+                id: session,
+                workspace_id: workspace,
+                project_id: project,
+                agent_kind: AgentKind::Codex,
+                cwd: Some("/repo".into()),
+                actor_user: Some("user:alice".into()),
+            },
+        )
+        .unwrap();
+
+        run_to(&mut conn, 89).unwrap();
+        let mut expected = before;
+        expected.push(89);
+        assert_eq!(applied_versions(&conn), expected);
+        run(&mut conn).unwrap();
+        let preserved: (String, String, String) = conn
+            .query_row(
+                "SELECT agent_kind, cwd, actor_user FROM sessions WHERE id = ?1",
+                params![session.as_bytes()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            preserved,
+            ("codex".into(), "/repo".into(), "user:alice".into())
+        );
+        let missing: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_usage", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            missing, 0,
+            "upgrading must not invent usage for existing sessions"
+        );
+
+        let mut report = ai_memory_core::NewSessionUsage {
+            session_id: SessionId::new(),
+            input_tokens: 12,
+            output_tokens: 4,
+            cache_write_tokens: 0,
+            cache_read_tokens: 2,
+            model: Some("fixture-model".into()),
+        };
+        assert!(crate::ops::upsert_session_usage(&conn, &report).is_err());
+        report.session_id = session;
+        crate::ops::upsert_session_usage(&conn, &report).unwrap();
+        conn.execute(
+            "DELETE FROM sessions WHERE id = ?1",
+            params![session.as_bytes()],
+        )
+        .unwrap();
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_usage", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining, 0, "usage must not outlive its session");
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
     fn v81_to_v82_preserves_managed_runs_and_adds_previous_session_identity() {
         let mut conn = Connection::open_in_memory().unwrap();
         run_to(&mut conn, 81).unwrap();

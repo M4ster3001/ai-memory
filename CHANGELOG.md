@@ -11,7 +11,62 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Added
+
+- Added a memory dashboard to the read-only web home, using sanitized data:
+  projects, sessions, sanitized capture events, compiled pages, open-session
+  continuity signals and last activity. Project cards separate captured work
+  from compiled pages, so an active hook no longer looks empty just because
+  its sessions have not ended (#1803).
+
+- Added dashboard hook-health counters for accepted, policy-dropped,
+  capacity-shed and rate-limited events. They count events since the process
+  started, and prompt, command, path and payload data is neither persisted nor
+  rendered (#1803).
+
+- Added agent CLI attribution to the project overview to show which harnesses
+  produced a project's memory. The stats card has an "Agents" badge row with session counts per
+  harness, and each Recent Activity entry shows the harness whose session last
+  contributed evidence to that page version. Both are best effort: a page or
+  project with no session evidence shows no badge (#1803).
+
+- Added per-session token accounting. At `session-end` the native hook (Claude Code
+  and Codex) reads the harness's own transcript and reports cumulative input,
+  output, cache-write and cache-read totals. It scans Claude Code's JSONL in
+  full and reads only the tail of Codex's rollout file, since both can reach
+  hundreds of MB. The server stores the totals with a `MAX(existing, reported)`
+  upsert, so a replayed or out-of-order delivery never lowers a total. The
+  project overview page shows a "Tokens" total in the stats card and a Sessions
+  table (agent, start, duration, events, tokens) with the 20 most recent
+  sessions. A session whose harness never reported usage, an unsupported
+  harness or an older client shows no number, never a zero (#1803).
+
+- Added recovery of usage and closure for sessions missing a graceful
+  `session-end`, which previously stayed open without tokens. This usually
+  happens when a paid quota runs out mid-task and the operator switches agents. When a new session
+  starts in the same scope and finds one quiet for at least 15 minutes, the
+  client looks for the old session's own transcript (Claude Code and Codex),
+  reports its usage and closes it with a normal synthetic `session-end`. That
+  is safe if the old session turns out to be live, because a later real
+  `session-end` with more work runs the full end path again. A second, more
+  conservative scheduled sweep closes sessions nobody continues anywhere,
+  after 48 hours without activity in any scope, so `open_session_count` stops
+  growing. It attaches no usage and starts no consolidation, because the
+  server cannot read a client's transcript outside a live hook request (#1803).
+
 ### Fixed
+
+- Added a read-only recovery snapshot at agent startup when the previous
+  substantive session in the project ended without a `SessionEnd` (quota
+  exhaustion, a killed process, a machine restart). The snapshot is built on
+  demand from at most 64 sanitized observations and capped at 6,000
+  characters, so no rolling copy of the transcript exists. It is scoped to the
+  project and owner, leaves out the receiving session, keeps the
+  untrusted-memory boundary, and never closes or claims the source, which may
+  be a legitimate parallel agent. It skips work a handoff already covers and
+  never mixes another live session's transcript into a delivered handoff.
+  Normal single-use handoffs and managed workstream packets are unchanged
+  (#1803).
 
 - Refused empty and whitespace-only `--workspace` and `--project` flags at the
   shared CLI scope-resolution choke point (`resolve_scope`,
