@@ -69,8 +69,8 @@ and agent type. Update the native Claude Code or Codex client and reinstall its
 hooks as above to enable capture. There is no separate dashboard token switch.
 The server records reports as they arrive; the session need not end.
 
-The Token usage form filters the whole authorized response ledger on the
-server before it picks a 50-row page. From is inclusive and Until is exclusive,
+The Token usage form filters the complete authorized response ledger on the
+server before selecting a 50-row page. From is inclusive and Until is exclusive,
 both in UTC, and a date-only URL means midnight UTC. Model and tool names match
 exactly. Harness, session and native turn filters intersect the current project,
 session and ownership boundaries. Pagination and reload keep every filter. The
@@ -194,8 +194,8 @@ Each consulted page includes "Knowledge evidence and validity" for its indexed
 version. Readable source sessions link to their timelines, and an observation
 citation identifies the observation within its source. Source scope and session
 ownership are checked separately from shared page access. Opaque feedback and
-rewrite IDs get no invented source links. A missing citation means unknown, not
-unsupported. Expired pages stay available through an explicit URL but leave
+rewrite IDs get no invented source links. A missing citation leaves the evidence unknown; it does not establish that
+the page is unsupported. Expired pages stay available through an explicit URL but leave
 normal retrieval. Declared contradictions include only live, readable far ends,
 and they do not decide which statement is correct. Evidence pages hold twenty
 citations.

@@ -933,8 +933,8 @@ prose.
 
 ## Investigate token usage in the dashboard
 
-Use UTC From and Until (inclusive and exclusive), exact model, harness and
-session filters to narrow the complete authorized ledger before pagination. Turn
+Filter the complete authorized ledger before pagination by UTC period, exact
+model, harness and session. From is inclusive; Until is exclusive. Turn
 and tool filters connect a response to reported native context. "Turn & tools"
 separates a requested tool, an input result and a same-turn association, and
 shared context does not prove that a token cost belongs to one tool. Update

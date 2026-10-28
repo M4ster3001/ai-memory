@@ -279,8 +279,8 @@ version in [`docs/changelog/`](docs/changelog/):
   readable source links, declared contradictions, expiration context and an
   on-page recall recomputation that reuses the original search filters (#NNN).
 
-- Feature guides and the authenticated `/api/v1/docs/features/status`
-  reference now report caller-aware installation states and next steps. They
+- Added caller-aware installation states and next steps to feature guides and
+  the authenticated `/api/v1/docs/features/status` reference. They
   separate effective settings from client facts the server cannot know, and
   administrative settings are masked for callers without admin rights (#NNN).
 
@@ -360,15 +360,15 @@ version in [`docs/changelog/`](docs/changelog/):
   authorized calls before pagination. Response pages are independent, and
   session detail pages refresh usage live (#NNN).
 
-- Scoped session reads now treat substantive work after an old end as a resumed
-  session, matching the activity feed, without changing persisted lifecycle
-  watermarks. Completed-only listings exclude those resumed sessions (#NNN).
+- Updated scoped session reads to treat substantive work after an old end as a
+  resumed session, matching the activity feed while preserving persisted
+  lifecycle watermarks. Completed-only listings exclude those resumed sessions (#NNN).
 
-- Token model labels are now sanitized before truncation, so the size limit can
-  no longer expose a prefix of private text (#NNN).
+- Moved token model label sanitization before truncation to prevent the size
+  limit from exposing a prefix of private text (#NNN).
 
-- Selecting a release on the changelog page now loads its notes immediately and
-  keeps the URL, outline and Markdown reference in sync. The form still submits
+- Updated release selection on the changelog page to load notes immediately
+  and keep the URL, outline and Markdown reference in sync. The form still submits
   without JavaScript (#NNN).
 
 ## [3.2.8] - 2026-10-27
