@@ -23,14 +23,14 @@ version in [`docs/changelog/`](docs/changelog/):
   credentials. The source-built Docker image now copies `CHANGELOG.md` for this
   (#NNN).
 
-- Project pages now show one section at a time in accessible tabs: Overview,
+- Organized project pages into accessible tabs showing one section at a time: Overview,
   Agents, Token usage, Sessions and Knowledge. The selected tab is kept in the
   URL (`?tab=agents`), which keeps reload, shared links and browser history in
   sync, and the tabs support Left, Right, Home and End. Existing
   `#agents`-style section bookmarks still open the matching tab (#NNN).
 
-- The browser inbox composer now sets To project to the source project by
-  default and lists only harnesses with captured sessions in the destination
+- Updated the browser inbox composer to default To project to the source
+  project and list only harnesses with captured sessions in the destination
   workspace and project. It resets a stale recipient when a project changes,
   and it disables sending, with an explanation, for a project that has no
   registered agent (#NNN).
