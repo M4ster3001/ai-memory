@@ -931,8 +931,8 @@ prose.
 
 Open a project under `/web` to see Token usage. Updated native Claude Code and
 Codex hooks send measured response usage on `post-tool-use`, `stop`,
-`pre-compact` and `session-end`. A session can stay open: usage is stored as it
-arrives, and the panel and the session totals refresh every ten seconds. To
+`pre-compact` and `session-end`. The server stores usage as it arrives, including while a
+session is open. The panel and session totals refresh every ten seconds. To
 enable capture, update the native client on each agent machine as well as the
 server.
 
