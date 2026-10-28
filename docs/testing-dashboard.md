@@ -30,7 +30,7 @@ describes the test browser's system dependencies and headless shell.
 
 The browser runner starts its own Rust server, uses synthetic projects and a
 fake root token, and drives Chromium through its native debugging protocol. It
-replaces no DOM and contacts no running production server. Messages are sent
+does not modify the DOM or contact a running production server. Messages are sent
 over HTTP and claimed through the native CLI. Every run keeps logs and a JSON
 report in the printed artifact directory, and failed browser cases also keep a
 screenshot.
@@ -58,8 +58,8 @@ states, source navigation, on-page recall and mobile overflow. Rust regressions
 in `contextual.rs`, `live_token_usage.rs`, `session_usage.rs` and the hooks
 router also cover foreign source IDs, private contradictions, source ownership,
 root controls, redacted admin settings, transaction rollback, native cursor
-continuity, malformed gaps and sanitization before truncation. Historical
-unknown data is a required outcome and is never replaced by guessed coordinates.
+continuity, malformed gaps and sanitization before truncation. Tests require historical data with missing context to remain unknown, without
+guessed coordinates.
 
 | Behavior | Automated regression guard |
 | --- | --- |
@@ -129,8 +129,8 @@ source anchors used to inject a fault need updating when the implementation is
 reorganized, and a fault that was not injected fails the campaign. Assertions
 stay on the behavior above, not on a particular function body.
 
-These are bounded probes, not proof against every possible defect. Rust tests
-also run the existing authorization, isolation, concurrency and recovery suites.
-The browser gate covers Chromium on Linux only. It does not establish Firefox or
-Safari rendering or pixel-perfect appearance. A behavior-preserving refactor
-should pass the regression tests.
+The probes cover the deliberate faults listed above. Rust tests also run the
+existing authorization, isolation, concurrency and recovery suites. Browser
+coverage is limited to Chromium on Linux. This gate does not check Firefox,
+Safari or pixel-perfect appearance. Behavior-preserving refactors should pass
+the tests.
