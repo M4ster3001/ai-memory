@@ -7,6 +7,17 @@ Configuration examples belong in `<data_dir>/config.toml` unless a section names
 
 ## Start here
 
+The web version of this guide includes "Effective installation state and next
+steps", evaluated for the current caller. The authenticated
+`GET /api/v1/docs/features/status` endpoint exposes the same safe facts. Settings
+come from the server's startup snapshot, while permissions are checked on every
+request. Restart after changing server configuration. A configured provider can
+still be unhealthy, so use Health to diagnose it. The server cannot verify
+remote hooks, client versions, marker files or browser preferences. Missing host
+wiring reads "Not reported", and administrator settings read "Restricted"
+without the required capability. The Markdown version is a reference that
+matches the build, not a live configuration dump.
+
 The built-in dashboard and this documentation need the web surface enabled:
 
 ```bash
@@ -58,14 +69,39 @@ and agent type. Update the native Claude Code or Codex client and reinstall its
 hooks as above to enable capture. There is no separate dashboard token switch.
 The server records reports as they arrive; the session need not end.
 
-Verify: open the project, then the agent, then the session, and inspect "Token usage". The project
-panel refreshes every ten seconds. Input, output and cache are separate, and
-repeated reports for one response are deduplicated. Agent cards show coverage.
+The Token usage form filters the complete authorized response ledger on the
+server before selecting a 50-row page. From is inclusive and Until is exclusive,
+both in UTC, and a date-only URL means midnight UTC. Model and tool names match
+exactly. Harness, session and native turn filters intersect the current project,
+session and ownership boundaries. Pagination and reload keep every filter. The
+matching-token total covers the filtered ledger, while the summary cards keep
+the whole authorized scope for comparison. Response time is used when reported,
+and older rows fall back to capture time.
+
+Open "Turn & tools" on a response to see the native response ID, turn,
+timestamp basis, session and bounded tool references. Its links narrow the
+ledger to that turn or tool. Claude tool requests and results use explicit IDs.
+Codex tool names are marked as same-turn associations. An association does not
+split token cost across tools or show causation. Arguments, outputs and prompts
+are excluded. Update the native binary on each agent machine to capture this
+metadata, because updating the server container alone cannot update remote
+clients. Existing rows stay unknown unless a native client replays their
+original transcript. The extractor follows the
+[Claude tool-call schema](https://platform.claude.com/docs/en/agents-and-tools/tool-use/handle-tool-calls)
+and [Codex session usage records](https://github.com/openai/codex/blob/main/codex-rs/core/src/state/session.rs).
+
+Verify: open the project, then the agent, then the session, and inspect "Token
+usage". Project and session usage panels refresh every ten seconds. Search,
+signal filters and ordering cover all captured responses, and page controls show
+fifty at a time. Input, output and cache are separate, and repeated reports for
+one response are deduplicated. Agent cards show coverage.
 
 Missing reports mean unknown usage. Unsupported harnesses, older hooks, and
-historical responses outside the bounded transcript window can leave gaps.
-Large-context, long-output and above-average signals are investigation hints;
-they are not confirmed failures or monetary costs. See [dashboard usage](usage.md#investigate-token-usage-in-the-dashboard).
+deleted or unsupported transcript records can leave gaps. Updated hooks resume
+readable history in bounded batches on later events, so a large backlog may need
+several hooks before all responses appear. Large-context, long-output and
+above-average signals are investigation hints, not confirmed failures or
+monetary costs. See [dashboard usage](usage.md#investigate-token-usage-in-the-dashboard).
 
 ## Themes and responsive navigation
 
@@ -88,7 +124,17 @@ Queue a request for a project, optionally targeting a harness such as Codex
 or Claude Code. The recipient must have a captured session in that project to
 appear in the browser selector.
 
-Open "Inbox" and choose "From project". "To project" defaults to the same
+Open "Inbox" to see queued counts by workspace and project, with a direct link
+to each mailbox. With no project in the URL, a mailbox with waiting messages is
+selected first. The heading names the open mailbox, and opening it does not
+collect messages. The sidebar checks for pending messages right away and every
+ten seconds while the page is visible. A count and up to five project links
+appear only when mail is waiting for an agent, and they disappear after
+collection. Each link opens "Awaiting collection", so older pending mail is not
+buried behind collected history. Use "Message state" to switch back to all
+messages or another state.
+
+To compose, choose "From project". "To project" defaults to the same
 project; change it explicitly to send across projects. "To agent" lists only
 harnesses registered in that destination, and changing either project clears
 the chosen agent. Projects without captured sessions show an empty state and
@@ -143,6 +189,24 @@ recorded state; it does not infer live process state from prompt text.
 See [managed workstreams](managed-workstreams.md).
 
 ## Recall, project routing and memory pages
+
+Each consulted page includes "Knowledge evidence and validity" for its indexed
+version. Readable source sessions link to their timelines, and an observation
+citation identifies the observation within its source. Source scope and session
+ownership are checked separately from shared page access. Opaque feedback and
+rewrite IDs get no invented source links. A missing citation leaves the evidence unknown; it does not establish that
+the page is unsupported. Expired pages stay available through an explicit URL but leave
+normal retrieval. Declared contradictions include only live, readable far ends,
+and they do not decide which statement is correct. Evidence pages hold twenty
+citations.
+
+Search result links carry the query, filters, result limit and the project or
+global mode. "Recompute explanation" runs the same authorized ranker on demand
+and shows stream ranks, RRF contributions, authority and optional reranking
+beside the page. It may contact configured embedding or reranking providers. The
+result is a new computation, not a snapshot of the original search.
+Cross-project search reports its FTS-only stream, and a direct page URL has no
+inferred retrieval reason.
 
 Default: lexical retrieval and rule-based summaries work without an LLM.
 Connect MCP, then use the installed retrieval skills and `memory_query`.
@@ -288,6 +352,7 @@ The authenticated JSON endpoints are read-only product references:
 ```text
 GET /api/v1/docs?q=token
 GET /api/v1/docs/features
+GET /api/v1/docs/features/status
 GET /api/v1/docs/changelog?release=Unreleased
 ```
 
@@ -300,6 +365,10 @@ For Markdown, use `/web/docs/features.md` or
 `/web/docs/changelog.md?release=Unreleased`. Change `/web` to your configured
 web slug. The changelog defaults to one release; request `release=all` for its
 whole major series, or choose an archived series in the catalog.
+
+In the web changelog, selecting a release loads its notes immediately and updates
+the shareable URL, outline and Markdown link. Without JavaScript, use "Show
+release" to submit the selection.
 
 [Changelog](../CHANGELOG.md) separates Unreleased work from tagged releases.
 Guides and notes are bundled with this binary; references outside the embedded

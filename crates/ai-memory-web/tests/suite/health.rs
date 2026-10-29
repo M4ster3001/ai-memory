@@ -207,6 +207,7 @@ fn app(
             base_path: "",
             trusted_proxy_identity: false,
             recall,
+            runtime: None,
             health: health.map(Arc::new),
         },
     )

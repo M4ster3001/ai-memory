@@ -1,7 +1,8 @@
 //! Scoped metadata for the human operations dashboard.
 
 use ai_memory_core::{
-    AgentKind, AgentMessage, MessageBox, OwnerFilter, ProjectId, SessionId, UserId, WorkspaceId,
+    AgentKind, AgentMessage, MessageBox, MessageState, OwnerFilter, ProjectId, SessionId, UserId,
+    WorkspaceId,
 };
 use rusqlite::params;
 
@@ -145,6 +146,20 @@ impl ReaderPool {
         limit: usize,
         offset: usize,
     ) -> StoreResult<Vec<AgentMessage>> {
+        self.message_history_filtered(ws, project, mailbox, None, limit, offset)
+            .await
+    }
+
+    /// Read mailbox history with its state predicate applied before pagination.
+    pub async fn message_history_filtered(
+        &self,
+        ws: WorkspaceId,
+        project: ProjectId,
+        mailbox: MessageBox,
+        state: Option<MessageState>,
+        limit: usize,
+        offset: usize,
+    ) -> StoreResult<Vec<AgentMessage>> {
         self.with_conn(move |conn| {
             let scope = match mailbox {
                 MessageBox::Inbox => "to_workspace_id",
@@ -156,6 +171,7 @@ impl ReaderPool {
             };
             let mut stmt = conn.prepare(&format!(
                 "SELECT {} FROM agent_messages WHERE {scope}=?1 AND {proj}=?2 \
+                 AND (?5 IS NULL OR state=?5) \
                  ORDER BY created_at DESC,id DESC LIMIT ?3 OFFSET ?4",
                 crate::ops::MESSAGE_COLUMNS
             ))?;
@@ -164,7 +180,8 @@ impl ReaderPool {
                     ws.as_bytes(),
                     project.as_bytes(),
                     limit.clamp(1, 100) as i64,
-                    offset.min(i64::MAX as usize) as i64
+                    offset.min(i64::MAX as usize) as i64,
+                    state.map(|s| s.as_str()),
                 ],
                 crate::ops::row_to_agent_message,
             )?;

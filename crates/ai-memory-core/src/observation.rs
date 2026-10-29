@@ -243,4 +243,57 @@ pub struct TokenCall {
     pub cache_read_tokens: u64,
     /// Reported model, if available.
     pub model: Option<String>,
+    /// Optional transcript provenance; absent on older clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<TokenCallContext>,
+}
+
+/// Reported transcript coordinates, without prompts, tool arguments or outputs.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TokenCallContext {
+    /// Native user-turn identity, when explicitly present in the transcript.
+    pub turn_id: Option<String>,
+    /// Native provider response identity, when supplied independently of counters.
+    pub response_id: Option<String>,
+    /// RFC 3339 response timestamp reported by the harness.
+    pub recorded_at: Option<String>,
+    /// Bounded tool references with an explicit relationship.
+    #[serde(default)]
+    pub tools: Vec<TokenToolRef>,
+}
+
+/// A tool identity associated with a response or its turn; never its payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenToolRef {
+    /// Native tool-call identity.
+    pub id: String,
+    /// Sanitized tool label.
+    pub name: String,
+    /// Strength and direction of the association.
+    pub relation: TokenToolRelation,
+    /// Explicit tool-result error flag, if the harness reported it.
+    pub is_error: Option<bool>,
+}
+
+/// Exact response links remain distinct from a shared-turn association.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenToolRelation {
+    /// The response itself requested this tool.
+    Requested,
+    /// A tool result was supplied directly before this response.
+    Input,
+    /// Tool activity was recorded in the same native turn; causality is unknown.
+    Turn,
+}
+
+impl TokenToolRelation {
+    /// Stable storage and wire label.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Requested => "requested",
+            Self::Input => "input",
+            Self::Turn => "turn",
+        }
+    }
 }

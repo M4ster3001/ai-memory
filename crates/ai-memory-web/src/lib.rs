@@ -10,6 +10,7 @@
 //! - `GET /`                              → project list (cards)
 //! - `GET /docs` / `GET /docs/:id` / `GET /docs/:id.md` → bundled product guides
 //! - `GET /inbox`                         → scoped received/sent history
+//! - `GET /inbox/notifications`           → access-filtered pending counts
 //! - `POST /messages`                     → authorized harness-addressed request
 //! - `GET /w/:workspace/:project/agents/:agent` → agent sessions and usage
 //! - `GET /graph`                         → cross-project link graph (SVG + table)
@@ -44,8 +45,10 @@ use axum::Router;
 
 mod diff;
 mod documentation;
+pub mod features;
 pub mod health;
 mod html_auth;
+mod knowledge;
 #[cfg(feature = "management-ui")]
 pub mod management;
 mod markdown;
