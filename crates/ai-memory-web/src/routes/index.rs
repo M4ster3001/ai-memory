@@ -28,12 +28,20 @@ pub(crate) async fn handler(
     viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
 ) -> Result<Html<String>, StatusCode> {
     let viewer_id = viewer.map(|axum::Extension(viewer)| viewer.user());
-    let (summaries, counts) = tokio::try_join!(
+    let (summaries, counts, registered) = tokio::try_join!(
         state.reader.list_projects_with_stats(viewer_id),
         // One grouped query for every card; the badge shows only where mail waits.
         state.reader.pending_inbox_counts(viewer_id),
+        state.reader.registered_agents(viewer_id),
     )
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut agent_names: HashMap<(String, String), Vec<&'static str>> = HashMap::new();
+    for agent in registered {
+        agent_names
+            .entry((agent.workspace, agent.project))
+            .or_default()
+            .push(crate::templates::agent_label(agent.agent));
+    }
     let mut pending: HashMap<String, HashMap<String, u64>> = HashMap::new();
     for c in counts {
         pending
@@ -79,7 +87,17 @@ pub(crate) async fn handler(
                 .and_then(|projects| projects.get(&s.project_name))
                 .copied()
                 .unwrap_or(0);
+            let agent_summary = agent_names
+                .get(&(s.workspace_name.clone(), s.project_name.clone()))
+                .map(|v| v.join(" · "))
+                .unwrap_or_default();
             ProjectCard {
+                agent_summary,
+                inbox_href: format!(
+                    "inbox?workspace={}&project={}",
+                    crate::templates::encode_segment(&s.workspace_name),
+                    crate::templates::encode_segment(&s.project_name)
+                ),
                 workspace: s.workspace_name,
                 project: s.project_name,
                 page_count: s.page_count,

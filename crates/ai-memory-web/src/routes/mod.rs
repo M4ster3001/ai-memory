@@ -3,15 +3,17 @@
 use std::sync::Arc;
 
 use axum::Router;
-use axum::routing::get;
+use axum::routing::{get, post};
 
 use crate::html_auth::HtmlAuthRedirectConfig;
 use crate::state::WebState;
 
+mod agents;
 mod api;
 mod graph;
 mod health;
 mod history;
+mod inbox;
 mod index;
 mod login;
 mod page;
@@ -114,6 +116,12 @@ pub(crate) async fn require_admin(
 pub(crate) fn build(state: Arc<WebState>) -> Router {
     Router::new()
         .route("/", get(index::handler))
+        .route("/inbox", get(inbox::handler))
+        .route("/messages", post(inbox::send))
+        .route(
+            "/w/{workspace}/{project}/agents/{agent}",
+            get(agents::handler),
+        )
         .route("/graph", get(graph::global_handler))
         .route("/w/{workspace}/{project}", get(project::handler))
         .route(
@@ -143,6 +151,7 @@ pub(crate) fn build_public_auth(cfg: Arc<HtmlAuthRedirectConfig>) -> Router {
         .route("/change-password", get(login::change_password))
         .route("/static/tailwind.css", get(statics::tailwind_css))
         .route("/static/logo.png", get(statics::logo))
+        .route("/static/{font}", get(statics::font))
         .with_state(cfg)
 }
 

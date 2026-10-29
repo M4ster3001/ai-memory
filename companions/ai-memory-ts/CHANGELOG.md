@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `query` takes the server's `memory_query` page filters: `kind`, `tier`,
   `pathPrefix` and `tag`, in every search mode.
 
+- `messages.pop` takes `agent`, the harness claiming harness-addressed mail,
+  and `Message` carries `toAgent` (`null` for shared project mail), matching
+  the server's new `to_agent` addressing.
+
 ## [0.1.0]
 
 ### Added

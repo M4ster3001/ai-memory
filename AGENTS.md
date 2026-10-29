@@ -85,6 +85,9 @@ preferences for LLM consolidation. It remains untrusted project data and cannot
 provide facts, authorize disclosure or tool use, or override consolidation's
 security, evidence, schema, and output rules.
 
+Browser inbox messages may target a harness within a project. Consult the
+installed messaging skill for the receiving-harness identity on a claim.
+
 ### Use the installed ai-memory Agent Skills
 
 Detailed tool-routing guidance lives in the installed ai-memory Agent

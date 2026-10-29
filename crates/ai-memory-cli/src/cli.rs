@@ -832,6 +832,9 @@ pub struct MessageListArgs {
 /// Arguments for `message pop`.
 #[derive(Debug, Args)]
 pub struct MessagePopArgs {
+    /// Receive mail addressed to this harness (for example codex or claude-code).
+    #[arg(long)]
+    pub agent: Option<String>,
     /// Workspace to pop from (defaults to the resolved scope).
     #[arg(long)]
     pub workspace: Option<String>,

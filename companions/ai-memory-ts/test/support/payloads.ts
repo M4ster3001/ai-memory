@@ -129,6 +129,7 @@ export const messageRow = {
   from_project_id: "p",
   from_agent: "other",
   from_owner_user: null,
+  to_agent: null,
   subject: "hi",
   body: "please do X",
   state: "pending",

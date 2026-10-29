@@ -313,6 +313,38 @@ impl Wiki {
         &self.sanitizer
     }
 
+    /// Send a browser-composed message through sanitization, admission and
+    /// the single writer. Callers must authorize both project coordinates.
+    pub async fn send_agent_message(
+        &self,
+        mut message: ai_memory_core::NewAgentMessage,
+        actor: ActorContext,
+    ) -> WikiResult<ai_memory_core::MessageId> {
+        message.body = self
+            .sanitizer
+            .scrub(&message.body)
+            .chars()
+            .take(8_000)
+            .collect();
+        message.subject = message
+            .subject
+            .map(|s| self.sanitizer.scrub(&s).chars().take(200).collect());
+        let admission = self
+            .authorize_operation(
+                message.to_workspace_id,
+                message.to_project_id,
+                AdmissionOp::MessageSend,
+                actor,
+                Vec::new(),
+            )
+            .await?;
+        let id = self.writer.insert_message(message).await?;
+        if let Some(ctx) = admission.as_ref() {
+            self.notify_operation_observers(ctx);
+        }
+        Ok(id)
+    }
+
     /// Attach an embedder. When set, every page-writing path (`write_page`,
     /// `apply_batch`, auto-improvement approval, checkpoint restore and the
     /// watcher's reindex) computes + stores an embedding for the new version

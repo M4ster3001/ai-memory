@@ -5,6 +5,7 @@
 mod graph;
 mod health;
 mod history_replay;
+mod operations;
 mod pending;
 mod recall_trace;
 mod routes;
