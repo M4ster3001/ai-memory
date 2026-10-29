@@ -8,6 +8,7 @@
 //!
 //! Routes (all under whatever prefix the host nests this router at):
 //! - `GET /`                              → project list (cards)
+//! - `GET /docs` / `GET /docs/:id` / `GET /docs/:id.md` → bundled product guides
 //! - `GET /inbox`                         → scoped received/sent history
 //! - `POST /messages`                     → authorized harness-addressed request
 //! - `GET /w/:workspace/:project/agents/:agent` → agent sessions and usage
@@ -42,6 +43,7 @@ use ai_memory_wiki::Wiki;
 use axum::Router;
 
 mod diff;
+mod documentation;
 pub mod health;
 mod html_auth;
 #[cfg(feature = "management-ui")]

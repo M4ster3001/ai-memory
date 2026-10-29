@@ -13,6 +13,28 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- Added bundled product documentation to the web UI and the API. The guides and
+  release notes are compiled into the binary and served at `/web/docs`,
+  `/web/docs/changelog` and `/web/docs/{id}` (a `.md` suffix returns the
+  Markdown). They include searchable feature activation guides, per-release
+  changelogs, and authenticated `/api/v1/docs` JSON and Markdown references for
+  agents. No network access or LLM is needed, and the pages describe shipped
+  capabilities without exposing the running server's configuration or
+  credentials. The source-built Docker image now copies `CHANGELOG.md` for this
+  (#1829).
+
+- Organized project pages into accessible tabs showing one section at a time: Overview,
+  Agents, Token usage, Sessions and Knowledge. The selected tab is kept in the
+  URL (`?tab=agents`), which keeps reload, shared links and browser history in
+  sync, and the tabs support Left, Right, Home and End. Existing
+  `#agents`-style section bookmarks still open the matching tab (#1829).
+
+- Updated the browser inbox composer to default To project to the source
+  project and list only harnesses with captured sessions in the destination
+  workspace and project. It resets a stale recipient when a project changes,
+  and it disables sending, with an explanation, for a project that has no
+  registered agent (#1829).
+
 - Redesigned the responsive web dashboard. It has persistent workspace
   navigation, searchable project cards, per-agent consumption and coverage, and
   session drilldowns that show the token totals recorded for each agent (#1828).

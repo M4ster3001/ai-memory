@@ -7,7 +7,19 @@
 {% block content %}
 <nav class="breadcrumbs" aria-label="Breadcrumb"><a href=".">Projects</a><span>/</span><span>{{ workspace }}</span><span>/</span><span aria-current="page">{{ project }}</span></nav>
 <div class="page-heading"><div><p class="eyebrow">PROJECT WORKSPACE</p><h1>{{ project }}</h1><p>Understand your agents, inspect their sessions, and find expensive calls.</p></div><a href="{{ inbox_href }}#compose" class="primary-button">✉ Message an agent</a></div>
-<nav class="project-tabs" aria-label="Project"><a href="{{ project_href }}">Overview</a><a href="{{ project_href }}#agents">Agents</a><a href="{{ project_href }}#token-usage">Token usage</a><a href="{{ project_href }}#session-token-table">Sessions</a><a href="{{ inbox_href }}">Inbox</a><a href="{{ project_href }}#knowledge">Knowledge</a><a href="{{ graph_href }}">Link graph</a></nav>
+<div class="project-navigation">
+  <nav class="project-tabs" role="tablist" aria-label="Project sections">
+    <a id="project-tab-overview" href="{{ project_href }}?tab=overview" role="tab" aria-controls="project-panel-overview" aria-selected="true" data-project-tab="overview">Overview</a>
+    <a id="project-tab-agents" href="{{ project_href }}?tab=agents" role="tab" aria-controls="project-panel-agents" aria-selected="false" tabindex="-1" data-project-tab="agents">Agents</a>
+    <a id="project-tab-tokens" href="{{ project_href }}?tab=tokens" role="tab" aria-controls="project-panel-tokens" aria-selected="false" tabindex="-1" data-project-tab="tokens">Token usage</a>
+    <a id="project-tab-sessions" href="{{ project_href }}?tab=sessions" role="tab" aria-controls="project-panel-sessions" aria-selected="false" tabindex="-1" data-project-tab="sessions">Sessions</a>
+    <a id="project-tab-knowledge" href="{{ project_href }}?tab=knowledge" role="tab" aria-controls="project-panel-knowledge" aria-selected="false" tabindex="-1" data-project-tab="knowledge">Knowledge</a>
+  </nav>
+  <nav class="project-tools" aria-label="Project tools"><a href="{{ inbox_href }}">Inbox <span aria-hidden="true">↗</span></a><a href="{{ graph_href }}">Link graph <span aria-hidden="true">↗</span></a></nav>
+</div>
+<noscript><style>.project-panel[hidden]{display:block}</style></noscript>
+<section id="project-panel-overview" class="project-panel" role="tabpanel" aria-labelledby="project-tab-overview" tabindex="0">
+  <div class="section-heading"><div><p class="eyebrow">AT A GLANCE</p><h2>Project overview</h2><p>Capture, activity, and pending messages. Choose a tab to explore the details.</p></div></div>
 <section id="project-capture-summary" aria-label="Project capture summary" class="section-block">
   <div class="metric-grid project-memory-grid">
     <article class="metric-card"><span>Sessions</span><strong>{{ stats.session_count }}</strong><small>Registered activity</small></article>
@@ -31,10 +43,48 @@
   </div>
   {% endif %}
 </section>
+    <section class="surface panel-heading" aria-labelledby="mailbox-heading">
+      <div class="flex items-center gap-2 mb-3">
+        <a href="{{ inbox_href }}" class="secondary-button" style="float:right">Open inbox ↗</a><h2 id="mailbox-heading" class="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">Mailbox</h2>
+        {% if !mailbox.is_empty() %}
+        <span class="inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium border border-amber-200 dark:border-amber-900/50 bg-amber-50 dark:bg-amber-950/30 text-amber-800 dark:text-amber-300">{% if mailbox_capped %}{{ mailbox.len() }} of {{ mailbox_total }}{% else %}{{ mailbox_total }}{% endif %} pending</span>
+        {% endif %}
+      </div>
+      {% if mailbox.is_empty() %}
+      <p class="text-sm text-slate-500 dark:text-slate-400">No pending messages for this project.</p>
+      {% else %}
+      <ul class="divide-y divide-slate-100 dark:divide-slate-800">
+        {% for message in mailbox %}
+        <li class="py-3 flex items-start justify-between gap-4">
+          <div class="min-w-0">
+            <div class="text-sm font-medium text-slate-800 dark:text-slate-100 truncate">{{ message.subject }}</div>
+            <div class="flex items-center gap-2 mt-1">
+              {% if let Some(href) = message.sender_href %}
+              <a href="{{ href }}" class="inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 hover:text-blue-600 dark:hover:text-blue-400 shrink-0">from {{ message.sender }}</a>
+              {% else %}
+              <span class="inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 shrink-0">from {{ message.sender }}</span>
+              {% endif %}
+              <span class="text-xs text-slate-500 dark:text-slate-400 truncate">{{ message.snippet }}</span>
+            </div>
+          </div>
+          <span class="text-xs text-slate-500 dark:text-slate-400 whitespace-nowrap shrink-0">{{ message.created_relative }}</span>
+        </li>
+        {% endfor %}
+      </ul>
+      <p class="mt-2 text-xs text-slate-500 dark:text-slate-400">
+        {% if mailbox_capped %}Showing the oldest {{ mailbox.len() }} of {{ mailbox_total }}; <code class="font-mono">ai-memory message list --workspace {{ workspace }} --project {{ project }} --limit 200</code> lists up to 200. {% endif %}An agent in this project reads them with <code class="font-mono">memory_message_pop</code>.
+      </p>
+      {% endif %}
+    </section>
+</section>
+<section id="project-panel-agents" class="project-panel" role="tabpanel" aria-labelledby="project-tab-agents" tabindex="0" hidden>
 {% include "_agent_cards.html" %}
+</section>
+<section id="project-panel-tokens" class="project-panel" role="tabpanel" aria-labelledby="project-tab-tokens" tabindex="0" hidden>
 {% include "_usage_panel.html" %}
-{% include "_dashboard_refresh.html" %}
-
+</section>
+<section id="project-panel-knowledge" class="project-panel" role="tabpanel" aria-labelledby="project-tab-knowledge" tabindex="0" hidden>
+<div class="section-heading"><div><p class="eyebrow">COMPILED MEMORY</p><h2>Knowledge</h2><p>Browse saved pages or search this project's memory.</p></div></div>
 <div id="knowledge" class="surface knowledge-layout">
   <form action="search" method="get" class="knowledge-search">
     <input type="hidden" name="workspace" value="{{ workspace }}"><input type="hidden" name="project" value="{{ project }}">
@@ -102,39 +152,6 @@
 
   <!-- Main: recent pages -->
   <div class="flex-1 min-w-0">
-    <section class="mb-8" aria-labelledby="mailbox-heading">
-      <div class="flex items-center gap-2 mb-3">
-        <a href="{{ inbox_href }}" class="secondary-button" style="float:right">Open inbox ↗</a><h2 id="mailbox-heading" class="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">Mailbox</h2>
-        {% if !mailbox.is_empty() %}
-        <span class="inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium border border-amber-200 dark:border-amber-900/50 bg-amber-50 dark:bg-amber-950/30 text-amber-800 dark:text-amber-300">{% if mailbox_capped %}{{ mailbox.len() }} of {{ mailbox_total }}{% else %}{{ mailbox_total }}{% endif %} pending</span>
-        {% endif %}
-      </div>
-      {% if mailbox.is_empty() %}
-      <p class="text-sm text-slate-500 dark:text-slate-400">No pending messages for this project.</p>
-      {% else %}
-      <ul class="divide-y divide-slate-100 dark:divide-slate-800">
-        {% for message in mailbox %}
-        <li class="py-3 flex items-start justify-between gap-4">
-          <div class="min-w-0">
-            <div class="text-sm font-medium text-slate-800 dark:text-slate-100 truncate">{{ message.subject }}</div>
-            <div class="flex items-center gap-2 mt-1">
-              {% if let Some(href) = message.sender_href %}
-              <a href="{{ href }}" class="inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 hover:text-blue-600 dark:hover:text-blue-400 shrink-0">from {{ message.sender }}</a>
-              {% else %}
-              <span class="inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 shrink-0">from {{ message.sender }}</span>
-              {% endif %}
-              <span class="text-xs text-slate-500 dark:text-slate-400 truncate">{{ message.snippet }}</span>
-            </div>
-          </div>
-          <span class="text-xs text-slate-500 dark:text-slate-400 whitespace-nowrap shrink-0">{{ message.created_relative }}</span>
-        </li>
-        {% endfor %}
-      </ul>
-      <p class="mt-2 text-xs text-slate-500 dark:text-slate-400">
-        {% if mailbox_capped %}Showing the oldest {{ mailbox.len() }} of {{ mailbox_total }}; <code class="font-mono">ai-memory message list --workspace {{ workspace }} --project {{ project }} --limit 200</code> lists up to 200. {% endif %}An agent in this project reads them with <code class="font-mono">memory_message_pop</code>.
-      </p>
-      {% endif %}
-    </section>
     <h2 class="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-3">Recent Activity</h2>
     {% if recent.is_empty() %}
     <div class="rounded-lg border border-dashed border-slate-300 dark:border-slate-700 p-5 text-sm text-slate-500 dark:text-slate-400">
@@ -174,6 +191,8 @@
   </div>
 </div>
 
+</section>
+<section id="project-panel-sessions" class="project-panel" role="tabpanel" aria-labelledby="project-tab-sessions" tabindex="0" hidden>
 <div id="session-token-table" class="surface section-block">
   <div class="section-heading panel-heading"><div><p class="eyebrow">RECENT ACTIVITY</p><h2>Sessions</h2><p>Open a session to inspect its model responses and captured events.</p></div></div>
   {% if sessions.is_empty() %}
@@ -209,4 +228,7 @@
   </div>
   {% endif %}
 </div>
+</section>
+{% include "_project_tabs_script.html" %}
+{% include "_dashboard_refresh.html" %}
 {% endblock %}
