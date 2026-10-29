@@ -726,6 +726,7 @@ diagram, crate breakdown, schema notes, and invariants.
 
 | File | What it is |
 |---|---|
+| [`docs/testing-dashboard.md`](docs/testing-dashboard.md) | Dashboard behavior tests, real-browser CI and mutation probes that prove regression guards fail. |
 | [`docs/cookbook.md`](docs/cookbook.md) | **Task-oriented cheat sheet.** "I want to do X" → how: recall prior work, keep a project rule, import an existing knowledge base, get two agents/repos working together. Start here. |
 | [`docs/install.md`](docs/install.md) | **Installation cookbook.** Every agent CLI, every alternative (curl, source build, no-docker, no-auth), and the server-on-a-different-machine walkthrough. |
 | [`docs/usage.md`](docs/usage.md) | Handoffs, proactive memory queries, slim routing snippet + managed Agent Skills, web UI, raw-wiki inspection, and the rules, memory and profile precedence. |
