@@ -110,6 +110,24 @@ describe("pages", () => {
       include_related: true,
       related_depth: 2,
     });
+    server.tools.set("memory_read_page", () => ({
+      ...payloads.read,
+      truncated: true,
+      total_chars: 40_000,
+    }));
+    const capped = await memory.pages.read({ path: "notes/retries.md", maxChars: 500 });
+    assert.deepEqual(server.lastArgs(), {
+      workspace: "demo",
+      project: "app",
+      path: "notes/retries.md",
+      max_chars: 500,
+    });
+    assert.equal(capped.truncated, true);
+    assert.equal(capped.totalChars, 40_000);
+    server.tools.set("memory_read_page", () => payloads.read);
+    const older = await memory.pages.read({ path: "notes/retries.md" });
+    assert.equal(older.truncated, undefined);
+    assert.equal(older.totalChars, undefined);
     const before = server.requests.length;
     await assert.rejects(
       memory.pages.read({ path: "a", query: "b" } as never),
@@ -527,7 +545,7 @@ describe("wire names", () => {
         expectedPageId: "v",
       }),
       memory.pages.write({ path: "p", body: "b", createOnly: true }),
-      memory.pages.read({ path: "p", includeRelated: true, relatedDepth: 2 }),
+      memory.pages.read({ path: "p", includeRelated: true, relatedDepth: 2, maxChars: 500 }),
       memory.pages.read({ query: "q" }),
       memory.pages.delete({ path: "p", expectedPageId: "v" }),
       memory.query({

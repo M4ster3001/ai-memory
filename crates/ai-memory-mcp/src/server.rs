@@ -377,10 +377,12 @@ should be proposed from a completed session, or at explicit wrap-up \
   the client-aware project-scope rule above; session-aware clients add \
   explicit scope when reading a page from a named sibling workspace/project. Use \
   this instead of memory_query when the user wants the complete text, \
-  not just snippets. Pass `include_related: true` (with an optional \
-  `related_depth`, default 1, max 3) to also walk the link graph outward and \
-  get a `related` array of the pages reachable from this one, each tagged \
-  with its hop `depth` and `direction`.\n\
+  not just snippets. The body is capped by `max_chars` (default 12000); \
+  the response's `truncated`/`total_chars` tell you the real size. Pass \
+  `include_related: true` (with an optional `related_depth`, default 1, \
+  max 3) to also walk the link graph outward and get a `related` array of \
+  the pages reachable from this one, each tagged with its hop `depth` and \
+  `direction`.\n\
 - `memory_read_session_observations` — when the user asks what actually \
   happened in a session, wants to check a compiled page against its raw \
   evidence, or needs the exact prompt/tool text behind a `memory_query` \
@@ -1703,14 +1705,31 @@ struct ReadPageArgs {
     /// Ignored when `include_related` is false.
     #[serde(default)]
     related_depth: Option<u8>,
+    /// Cap the returned body at this many characters (default 12000, min
+    /// 500, max 64000). Longer bodies end with a visible truncation marker
+    /// and the response adds `truncated: true` and `total_chars`. Raise
+    /// this only when you actually need the whole page; most callers should
+    /// keep the default.
+    #[serde(default)]
+    max_chars: Option<usize>,
 }
 
+/// Bounds for `memory_read_page`'s `max_chars`. The default keeps a typical
+/// page read well under a context window while staying large enough that
+/// most pages never truncate; the ceiling still lets a caller read a long
+/// page whole by raising it explicitly.
+const READ_PAGE_DEFAULT_MAX_CHARS: usize = 12_000;
+const READ_PAGE_MIN_MAX_CHARS: usize = 500;
+const READ_PAGE_MAX_MAX_CHARS: usize = 64_000;
+
 /// Bounds for `memory_read_session_observations`. The defaults keep one call
-/// well under a context window; the ceilings match what the store keeps per
-/// body (16 KiB) so a caller can always read a whole observation in one go.
-const SESSION_OBSERVATIONS_DEFAULT_LIMIT: usize = 50;
+/// cheap — a "what did this session do" lookup should cost low thousands of
+/// tokens, not tens of thousands — while the ceilings still match what the
+/// store keeps per body (16 KiB) so a caller can always read a whole
+/// observation in one go by raising `limit`/`body_max_chars` explicitly.
+const SESSION_OBSERVATIONS_DEFAULT_LIMIT: usize = 20;
 const SESSION_OBSERVATIONS_MAX_LIMIT: usize = 200;
-const SESSION_OBSERVATIONS_DEFAULT_BODY_CHARS: usize = 4_000;
+const SESSION_OBSERVATIONS_DEFAULT_BODY_CHARS: usize = 1_000;
 const SESSION_OBSERVATIONS_MIN_BODY_CHARS: usize = 200;
 const SESSION_OBSERVATIONS_MAX_BODY_CHARS: usize = 16_384;
 /// Sessions with recent work the default read scans for one in the caller's
@@ -1729,7 +1748,7 @@ struct ReadSessionObservationsArgs {
     /// completed session.
     #[serde(default)]
     session_id: Option<String>,
-    /// Maximum observations per call (default 50, max 200).
+    /// Maximum observations per call (default 20, max 200).
     #[serde(default)]
     limit: Option<usize>,
     /// Observations to skip before the first returned one (default 0).
@@ -1749,7 +1768,7 @@ struct ReadSessionObservationsArgs {
     /// restricted to this session. Omit to list the session in order.
     #[serde(default)]
     query: Option<String>,
-    /// Cap each returned body at this many characters (default 4000, min
+    /// Cap each returned body at this many characters (default 1000, min
     /// 200, max 16384). Longer bodies end with a visible truncation marker.
     #[serde(default)]
     body_max_chars: Option<usize>,
@@ -4881,6 +4900,12 @@ impl AiMemoryServer {
         served from the DB fallback, and `expired: true` when the page's \
         `expires_at` TTL has passed: an exact-path read still returns such a \
         page, which `memory_query` and `memory_recent` no longer surface). \
+        The body is capped at `max_chars` \
+        (default 12000, max 64000) with a visible truncation marker when it \
+        is cut; the response always also carries `truncated` (bool) and \
+        `total_chars` (the untruncated length) so you know the real size \
+        even when it wasn't cut. Raise `max_chars` only when you need the \
+        whole page. \
         \
         Set `include_related: true` to also walk the link graph outward from \
         this page and get a `related` array of the reachable pages, each with \
@@ -4922,6 +4947,10 @@ impl AiMemoryServer {
             .as_deref()
             .is_none_or(|s| s.trim().is_empty())
             && args.project.as_deref().is_none_or(|s| s.trim().is_empty());
+        let max_chars = args
+            .max_chars
+            .unwrap_or(READ_PAGE_DEFAULT_MAX_CHARS)
+            .clamp(READ_PAGE_MIN_MAX_CHARS, READ_PAGE_MAX_MAX_CHARS);
 
         // A blank fill is not a supplied argument: an empty/whitespace `path`
         // would otherwise fail as "invalid path: empty path" with `query` never
@@ -5053,12 +5082,17 @@ impl AiMemoryServer {
                 // frontmatter title was never filled otherwise read back
                 // titleless despite a proper `# Heading` (#599).
                 let title = ai_memory_wiki::derive_title(&md.frontmatter, &md.body, &page_path);
+                let total_chars = md.body.chars().count();
+                let truncated = total_chars > max_chars;
+                let body = cap_text_with_marker(&md.body, max_chars, "body");
                 ok_json(&annotate(serde_json::json!({
                     "path": page_path.to_string(),
                     "page_id": page_id.map(|id| id.to_string()),
                     "title": title,
-                    "body": md.body,
+                    "body": body,
                     "frontmatter": md.frontmatter,
+                    "truncated": truncated,
+                    "total_chars": total_chars,
                 })))
             }
             Err(disk_err) if is_missing_wiki_file(&disk_err) => {
@@ -5077,13 +5111,18 @@ impl AiMemoryServer {
                             .and_then(|v| v.as_str())
                             .map(str::to_string)
                             .or(Some(stored.title));
+                        let total_chars = stored.body.chars().count();
+                        let truncated = total_chars > max_chars;
+                        let body = cap_text_with_marker(&stored.body, max_chars, "body");
                         ok_json(&annotate(serde_json::json!({
                             "path": page_path.to_string(),
                             "page_id": page_id.map(|id| id.to_string()),
                             "title": title,
-                            "body": stored.body,
+                            "body": body,
                             "frontmatter": frontmatter,
                             "served_from": "db-fallback",
+                            "truncated": truncated,
+                            "total_chars": total_chars,
                         })))
                     }
                     None => {
@@ -5146,9 +5185,9 @@ impl AiMemoryServer {
         work visible to you in the resolved project, other than your own \
         (one in your own cwd first; ended or not), or the latest completed \
         one when nothing worked in the last 30 days. Pages with \
-        `limit`/`offset` (default 50, max 200) and returns `total`, so loop on \
+        `limit`/`offset` (default 20, max 200) and returns `total`, so loop on \
         `offset` to read more. `order` is `asc` (capture order) or `desc`; \
-        `kinds` and `query` narrow the rows; `body_max_chars` (default 4000) \
+        `kinds` and `query` narrow the rows; `body_max_chars` (default 1000) \
         caps each body with a visible truncation marker. Only rows that landed \
         in the resolved project are returned; `elided_other_scope` counts rows \
         the same session left in another project. Follow the client-aware \
@@ -13789,6 +13828,7 @@ mod tests {
                     workspace: None,
                     include_related: false,
                     related_depth: None,
+                    max_chars: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -13832,6 +13872,7 @@ mod tests {
         let err = server
             .memory_read_page(
                 Parameters(ReadPageArgs {
+                    max_chars: None,
                     query: Some("  ".into()),
                     path: None,
                     project: None,
@@ -13853,6 +13894,7 @@ mod tests {
         let result = server
             .memory_read_page(
                 Parameters(ReadPageArgs {
+                    max_chars: None,
                     query: Some("zonkolite".into()),
                     path: Some(String::new()),
                     project: None,
@@ -13880,6 +13922,7 @@ mod tests {
         let result = server
             .memory_read_page(
                 Parameters(ReadPageArgs {
+                    max_chars: None,
                     query: Some("no-such-term-anywhere".into()),
                     path: Some("notes/blankfill.md".into()),
                     project: None,
@@ -13944,6 +13987,7 @@ mod tests {
                     workspace: Some("practice".into()),
                     include_related: false,
                     related_depth: None,
+                    max_chars: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -13999,6 +14043,7 @@ mod tests {
                     workspace: None,
                     include_related: false,
                     related_depth: None,
+                    max_chars: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -14018,6 +14063,110 @@ mod tests {
             text.contains("db-fallback"),
             "expected fallback diagnostic; got {text}"
         );
+    }
+
+    /// A body under `max_chars` is returned whole, and `truncated`/
+    /// `total_chars` still report the real (untruncated) size — the caller
+    /// should not have to guess whether a short page was cut.
+    #[tokio::test]
+    async fn memory_read_page_reports_size_without_truncating_a_short_body() {
+        let (tmp, store, server, ws, proj) = setup_server().await;
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        wiki.write_page(WritePageRequest {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new("notes/short.md").unwrap(),
+            frontmatter: serde_json::json!({"title": "Short"}),
+            body: "a short body".to_string(),
+            tier: Tier::Semantic,
+            pinned: false,
+            title: Some("Short".into()),
+            admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+        let page = call_tool_json(
+            server
+                .with_wiki(wiki)
+                .memory_read_page(
+                    Parameters(ReadPageArgs {
+                        query: None,
+                        path: Some("notes/short.md".into()),
+                        project: None,
+                        workspace: None,
+                        include_related: false,
+                        related_depth: None,
+                        max_chars: None,
+                    }),
+                    OptionalParts(test_parts_default()),
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(page["body"], "a short body");
+        assert_eq!(page["truncated"], false);
+        assert_eq!(page["total_chars"], "a short body".chars().count() as u64);
+    }
+
+    /// A body over `max_chars` is cut with a visible marker (default cap
+    /// 12000; this test passes an explicit small `max_chars` so it does not
+    /// depend on the exact default), and `truncated`/`total_chars` report
+    /// the real size so a caller knows to raise `max_chars` if it needs more.
+    #[tokio::test]
+    async fn memory_read_page_truncates_a_long_body_with_marker() {
+        let (tmp, store, server, ws, proj) = setup_server().await;
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let long_body = "x".repeat(2_000);
+        wiki.write_page(WritePageRequest {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new("notes/long.md").unwrap(),
+            frontmatter: serde_json::json!({"title": "Long"}),
+            body: long_body.clone(),
+            tier: Tier::Semantic,
+            pinned: false,
+            title: Some("Long".into()),
+            admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+        let page = call_tool_json(
+            server
+                .with_wiki(wiki)
+                .memory_read_page(
+                    Parameters(ReadPageArgs {
+                        query: None,
+                        path: Some("notes/long.md".into()),
+                        project: None,
+                        workspace: None,
+                        include_related: false,
+                        related_depth: None,
+                        max_chars: Some(500),
+                    }),
+                    OptionalParts(test_parts_default()),
+                )
+                .await
+                .unwrap(),
+        );
+        let body = page["body"].as_str().unwrap();
+        assert!(
+            body.starts_with(&"x".repeat(500)),
+            "must keep the first max_chars characters; got {body}"
+        );
+        assert!(
+            body.contains("[body truncated; 1500 chars omitted]"),
+            "body must end with a visible marker; got {body}"
+        );
+        assert_eq!(page["truncated"], true);
+        assert_eq!(page["total_chars"], 2_000);
     }
 
     #[tokio::test]
@@ -14077,6 +14226,7 @@ mod tests {
             let result = server
                 .memory_read_page(
                     Parameters(ReadPageArgs {
+                        max_chars: None,
                         query: None,
                         path: Some(path.into()),
                         project: None,
@@ -14123,6 +14273,7 @@ mod tests {
         let err = server
             .memory_read_page(
                 Parameters(ReadPageArgs {
+                    max_chars: None,
                     query: None,
                     path: Some("notes/does-not-exist.md".into()),
                     project: Some("scratch".into()),
@@ -14143,6 +14294,7 @@ mod tests {
         let err = server
             .memory_read_page(
                 Parameters(ReadPageArgs {
+                    max_chars: None,
                     query: Some("zzzz-no-such-term".into()),
                     path: None,
                     project: Some("scratch".into()),
@@ -14174,6 +14326,7 @@ mod tests {
         let err = server
             .memory_read_page(
                 Parameters(ReadPageArgs {
+                    max_chars: None,
                     query: None,
                     path: Some("blocked.md".into()),
                     project: Some("scratch".into()),
@@ -14209,6 +14362,7 @@ mod tests {
                     workspace: Some("default".into()),
                     include_related: false,
                     related_depth: None,
+                    max_chars: None,
                 }),
                 test_optional_parts(),
             )
@@ -14234,6 +14388,7 @@ mod tests {
                     workspace: None,
                     include_related: false,
                     related_depth: None,
+                    max_chars: None,
                 }),
                 test_optional_parts(),
             )
@@ -17137,6 +17292,7 @@ mod tests {
         let err = server
             .memory_read_page(
                 Parameters(ReadPageArgs {
+                    max_chars: None,
                     query: None,
                     path: Some("../x.md".into()),
                     project: None,
@@ -17411,6 +17567,7 @@ mod tests {
         server
             .memory_read_page(
                 Parameters(ReadPageArgs {
+                    max_chars: None,
                     include_related: false,
                     related_depth: None,
                     path: Some("notes/keep.md".into()),
@@ -17459,6 +17616,7 @@ mod tests {
         let seeded = server
             .memory_read_page(
                 Parameters(ReadPageArgs {
+                    max_chars: None,
                     include_related: false,
                     related_depth: None,
                     path: Some("notes/keep.md".into()),
@@ -17525,6 +17683,7 @@ mod tests {
             &server
                 .memory_read_page(
                     Parameters(ReadPageArgs {
+                        max_chars: None,
                         include_related: false,
                         related_depth: None,
                         path: Some("notes/keep.md".into()),
@@ -17567,6 +17726,7 @@ mod tests {
         server
             .memory_read_page(
                 Parameters(ReadPageArgs {
+                    max_chars: None,
                     include_related: false,
                     related_depth: None,
                     path: Some("notes/keep.md".into()),
@@ -17822,6 +17982,7 @@ mod tests {
         server
             .memory_read_page(
                 Parameters(ReadPageArgs {
+                    max_chars: None,
                     include_related: false,
                     related_depth: None,
                     path: Some("preferences.md".into()),
@@ -18085,6 +18246,7 @@ mod tests {
         server
             .memory_read_page(
                 Parameters(ReadPageArgs {
+                    max_chars: None,
                     include_related: false,
                     related_depth: None,
                     path: Some("profile/tools/pnpm.md".into()),
@@ -18554,6 +18716,7 @@ mod tests {
                 server
                     .memory_read_page(
                         Parameters(ReadPageArgs {
+                            max_chars: None,
                             include_related: false,
                             related_depth: None,
                             path: Some("secrets/rates.md".into()),
@@ -18621,7 +18784,7 @@ mod tests {
             project_id: project,
             path: ai_memory_core::PagePath::new(path).unwrap(),
             title: path.to_string(),
-            body: "body".into(),
+            body: "é".repeat(600),
             tier: ai_memory_core::Tier::Semantic,
             frontmatter_json: serde_json::json!({}),
             pinned: false,
@@ -18684,6 +18847,7 @@ mod tests {
                 let result = server
                     .memory_read_page(
                         Parameters(ReadPageArgs {
+                            max_chars: Some(500),
                             include_related: true,
                             related_depth: Some(3),
                             path: Some("notes/a.md".into()),
@@ -18695,7 +18859,11 @@ mod tests {
                     )
                     .await
                     .expect("the open project's page is readable");
-                call_tool_json(result)["related"]
+                let payload = call_tool_json(result);
+                assert_eq!(payload["truncated"], true);
+                assert_eq!(payload["total_chars"], 600);
+                assert_ne!(payload["body"], "é".repeat(600));
+                payload["related"]
                     .as_array()
                     .expect("include_related attaches a related block")
                     .iter()
@@ -19378,6 +19546,7 @@ mod tests {
                     workspace: None,
                     include_related: false,
                     related_depth: None,
+                    max_chars: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -19463,6 +19632,7 @@ mod tests {
                     workspace: None,
                     include_related: false,
                     related_depth: None,
+                    max_chars: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -19605,6 +19775,7 @@ mod tests {
             &server
                 .memory_read_page(
                     Parameters(ReadPageArgs {
+                        max_chars: None,
                         query: None,
                         path: Some("notes/retries.md".into()),
                         project: None,
@@ -19842,6 +20013,7 @@ mod tests {
                     workspace: None,
                     include_related: false,
                     related_depth: None,
+                    max_chars: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -19963,6 +20135,7 @@ mod tests {
                     workspace: Some("alpha".into()),
                     include_related: false,
                     related_depth: None,
+                    max_chars: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -19982,6 +20155,7 @@ mod tests {
                     workspace: Some("beta".into()),
                     include_related: false,
                     related_depth: None,
+                    max_chars: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -20806,6 +20980,7 @@ mod tests {
                         workspace: None,
                         include_related: false,
                         related_depth: None,
+                        max_chars: None,
                     }),
                     OptionalParts(alice_parts),
                 )
@@ -23075,6 +23250,7 @@ mod tests {
             let result = server
                 .memory_read_page(
                     Parameters(ReadPageArgs {
+                        max_chars: None,
                         query: None,
                         path: Some(path.into()),
                         project: Some("scratch".into()),

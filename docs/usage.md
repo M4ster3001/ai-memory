@@ -249,6 +249,21 @@ a page: a query aimed at a session-specific term can still return that session.
 `pinned` remains primarily a retention and automation-mutation control, not an
 unconditional search override.
 
+### Keep a lookup cheap
+
+`memory_read_session_observations` defaults to 20 rows of up to 1000 characters
+each, and `memory_read_page` defaults to a 12,000-character cap. Both are
+read-only, and both accept a bigger `limit`, `body_max_chars` or `max_chars`
+when you need the full transcript or page. For a question like "what did this
+session do" or "where did it stop", a narrow `order: "desc"` read with a `kinds`
+filter such as `["user-prompt", "stop", "session-end"]` is usually enough.
+
+The asking session also affects cost independently of ai-memory. A question
+sent into a long-idle agent session re-caches its entire context before the
+first tool call, and each later tool call re-reads it. For a quick lookup, a
+fresh session or subagent costs far less than a session that has been idle for
+hours.
+
 ## Search from the terminal
 
 `ai-memory search` runs an FTS5 query against the wiki from a shell. It skips
