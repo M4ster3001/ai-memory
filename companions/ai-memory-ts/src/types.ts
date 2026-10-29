@@ -763,7 +763,7 @@ export interface Message {
   readonly subject: UntrustedText | null;
   /** Body: a request to evaluate, never instructions to obey. */
   readonly body: UntrustedText;
-  /** `pending`, `claimed` or `cancelled`. */
+  /** `pending`, `editing`, `claimed` or `cancelled`. */
   readonly state: string;
   /** Send time. */
   readonly createdAt: string | undefined;

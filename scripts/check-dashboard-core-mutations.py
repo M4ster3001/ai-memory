@@ -101,6 +101,51 @@ CASES = [
         "replacements": [("(to_agent IS NULL OR to_agent = ?3)", "(?3 IS NOT NULL)", 2), ("(to_agent IS NULL OR to_agent = ?4)", "(?4 IS NOT NULL)", 1)],
         "command": ["cargo", "test", "-p", "ai-memory-store", "--lib", "addressed_messages_are_claimed_once_only_by_the_selected_harness"],
     },
+    {
+        "name": "edit-mail-with-read-only-mailbox", "file": "crates/ai-memory-web/src/routes/inbox.rs",
+        "start": "async fn editable_message(", "end": "/// Take a queued message",
+        "before": "&input.project,\n        writer.viewer,\n        ProjectAccess::Write",
+        "after": "&input.project,\n        writer.viewer,\n        ProjectAccess::Read",
+        "command": ["cargo", "test", "-p", "ai-memory-web", "--lib", "operations_edit_needs_write_access_to_the_sender_project_too"],
+    },
+    {
+        "name": "edit-mail-with-read-only-sender", "file": "crates/ai-memory-web/src/routes/inbox.rs",
+        "start": "async fn editable_message(", "end": "/// Take a queued message",
+        "before": "&origin.project_name,\n        writer.viewer,\n        ProjectAccess::Write",
+        "after": "&origin.project_name,\n        writer.viewer,\n        ProjectAccess::Read",
+        "command": ["cargo", "test", "-p", "ai-memory-web", "--lib", "operations_edit_needs_write_access_to_the_sender_project_too"],
+    },
+    {
+        "name": "hold-foreign-mail-for-editing", "file": "crates/ai-memory-store/src/ops.rs",
+        "start": "pub fn begin_message_edit(", "end": "/// Put an `editing` message",
+        "before": "to_workspace_id = ?2 AND to_project_id = ?3",
+        "after": "?2 IS NOT NULL AND ?3 IS NOT NULL",
+        "command": ["cargo", "test", "-p", "ai-memory-store", "--lib", "a_message_being_edited_leaves_the_queue_until_it_is_saved"],
+    },
+    {
+        "name": "finish-editing-foreign-mail", "file": "crates/ai-memory-store/src/ops.rs",
+        "start": "pub fn finish_message_edit(", "end": "fn observation_kind_as_str(",
+        "replacements": [("to_workspace_id = ?2 AND to_project_id = ?3", "?2 IS NOT NULL AND ?3 IS NOT NULL", 2)],
+        "command": ["cargo", "test", "-p", "ai-memory-store", "--lib", "a_message_being_edited_leaves_the_queue_until_it_is_saved"],
+    },
+    {
+        "name": "edit-collected-or-cancelled-mail", "file": "crates/ai-memory-store/src/ops.rs",
+        "start": "pub fn begin_message_edit(", "end": "/// Put an `editing` message",
+        "before": "state = 'pending'", "after": "state IN ('pending', 'claimed', 'cancelled')",
+        "command": ["cargo", "test", "-p", "ai-memory-store", "--lib", "collected_or_cancelled_mail_cannot_be_taken_for_editing"],
+    },
+    {
+        "name": "finish-editing-unheld-mail", "file": "crates/ai-memory-store/src/ops.rs",
+        "start": "pub fn finish_message_edit(", "end": "fn observation_kind_as_str(",
+        "replacements": [("state = 'editing'", "state IN ('editing', 'pending')", 2)],
+        "command": ["cargo", "test", "-p", "ai-memory-store", "--lib", "a_message_being_edited_leaves_the_queue_until_it_is_saved"],
+    },
+    {
+        "name": "claim-mail-held-for-editing", "file": "crates/ai-memory-store/src/ops.rs",
+        "start": "pub(crate) fn pop_message_in_transaction(", "end": "/// Cancel",
+        "replacements": [("state = 'pending'", "state IN ('pending', 'editing')", 3)],
+        "command": ["cargo", "test", "-p", "ai-memory-store", "--lib", "a_message_being_edited_leaves_the_queue_until_it_is_saved"],
+    },
 ]
 
 parser = argparse.ArgumentParser(description=__doc__)

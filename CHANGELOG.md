@@ -13,6 +13,16 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- Added editing for queued messages in the web inbox. Edit takes a message that
+  is still waiting out of the queue, so no agent can collect it, and opens an
+  inline editor. Saving puts the new text back at the message's original place
+  in the queue, after the usual sanitizer, size caps and `message_send`
+  admission. Discarding returns it unchanged. A held message shows as Editing,
+  with a count above the list and a way back into the editor. Editing needs
+  write access to the mailbox project and to the project the message came from,
+  and a message an agent already collected cannot be edited. Held messages use a
+  new `editing` state (migration V93) that no claim path selects (#1832).
+
 - Added server-side response investigation to the project dashboard. Responses
   can be filtered by UTC period, exact model, harness, session, turn and tool,
   with complete pagination, filtered token totals and bounded native turn and

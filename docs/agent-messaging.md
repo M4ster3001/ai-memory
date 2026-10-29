@@ -333,6 +333,20 @@ CLI senders keep `to_agent: null` and claim as before. The harness selector
 routes a request inside an authorized project. It is not a per-person
 confidentiality boundary.
 
+A queued message can be edited from the Received view. Edit takes it out of the
+queue, so no harness can collect it, and opens its subject and text in an inline
+editor. "Save and requeue" sends the new text through the same sanitizer, size
+caps and `message_send` admission as a new message and puts the message back in
+its original place in the queue. "Discard changes" puts it back unchanged. The
+message keeps its id either way. A message an agent collected in the meantime
+cannot be edited, and the editor says so. Editing needs write access to the
+project that holds the mailbox and to the project the message came from, the
+same access that sending it needed. Held messages show as Editing. A banner above the list counts them and links
+to them; Continue editing and Discard changes work from any tab. Closing an
+editor tab leaves the message held outside the queue until someone saves or
+discards it. The legacy GET-only login cannot
+edit.
+
 Queuing a message does not start or wake an agent, or authorize it to follow
 the request. The recipient checks its inbox independently and evaluates the
 request under the same untrusted-input rules as other cross-project mail. Session-start notices count
