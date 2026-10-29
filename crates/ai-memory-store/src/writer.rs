@@ -228,6 +228,11 @@ pub(crate) enum WriteCmd {
         session_id: SessionId,
         reply: oneshot::Sender<StoreResult<LifecycleOnlyEndOutcome>>,
     },
+    UpsertTokenCalls {
+        session_id: SessionId,
+        calls: Vec<ai_memory_core::TokenCall>,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
     UpsertSessionUsage {
         usage: NewSessionUsage,
         reply: oneshot::Sender<StoreResult<()>>,
@@ -1465,6 +1470,22 @@ impl WriterHandle {
         self.send(WriteCmd::EndSession {
             session_id,
             summary_page_id,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Record native response usage and refresh its session total atomically.
+    pub async fn upsert_token_calls(
+        &self,
+        session_id: SessionId,
+        calls: Vec<ai_memory_core::TokenCall>,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::UpsertTokenCalls {
+            session_id,
+            calls,
             reply: tx,
         })
         .await?;
@@ -4066,6 +4087,14 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             } => {
                 let result = ops::end_session(&mut conn, &session_id, summary_page_id.as_ref());
                 send_or_warn(reply, result, "end_session");
+            }
+            WriteCmd::UpsertTokenCalls {
+                session_id,
+                calls,
+                reply,
+            } => {
+                let result = ops::upsert_token_calls(&mut conn, session_id, &calls);
+                send_or_warn(reply, result, "upsert_token_calls");
             }
             WriteCmd::UpsertSessionUsage { usage, reply } => {
                 let result = ops::upsert_session_usage(&conn, &usage);

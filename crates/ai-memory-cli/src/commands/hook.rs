@@ -180,6 +180,38 @@ fn compute_session_usage(
     }
 }
 
+fn compute_live_calls(
+    agent: AgentKind,
+    json: &serde_json::Value,
+    session_id: Option<&str>,
+    runtime_env: &RuntimeEnv,
+    home: Option<&Path>,
+) -> Vec<ai_memory_core::TokenCall> {
+    let path = match agent {
+        AgentKind::ClaudeCode => json
+            .get("transcript_path")
+            .and_then(|v| v.as_str())
+            .map(PathBuf::from),
+        AgentKind::Codex => json
+            .get("transcript_path")
+            .or_else(|| json.get("rollout_path"))
+            .and_then(|v| v.as_str())
+            .map(PathBuf::from)
+            .or_else(|| {
+                session_id.and_then(|id| {
+                    let home = runtime_env
+                        .var_os("CODEX_HOME")
+                        .map(PathBuf::from)
+                        .or_else(|| home.map(|p| p.join(".codex")))?;
+                    super::session_usage::locate_codex_rollout(&home, id)
+                })
+            }),
+        _ => None,
+    };
+    path.map(|p| super::session_usage::extract_live_calls(&p, agent))
+        .unwrap_or_default()
+}
+
 /// A stale interrupted-session candidate found in the session-start handoff
 /// text, eligible for a best-effort backfill-close.
 struct BackfillCandidate {
@@ -1630,6 +1662,28 @@ where
         }
     }
 
+    if matches!(
+        args.event.as_str(),
+        "post-tool-use" | "stop" | "pre-compact" | "session-end"
+    ) {
+        let calls = compute_live_calls(
+            agent_kind,
+            &json,
+            canonical_session_id.as_deref(),
+            &runtime_env,
+            home.as_deref(),
+        );
+        if !calls.is_empty()
+            && let Some(object) = json.as_object_mut()
+        {
+            object.insert(
+                "_ai_memory_usage_calls".into(),
+                serde_json::to_value(calls)?,
+            );
+            payload = serde_json::to_string(&json)?;
+        }
+    }
+
     // Token-usage visibility (docs: token-cost tracking): only at
     // session-end, which fires once per session — never on the frequent
     // `stop`/`post-tool-use` path — so the bounded transcript read this
@@ -2153,7 +2207,9 @@ where
     if !external_capture && session_end_drains_in_process(agent_kind, &args.event) {
         drain_session_end_in_process(&spool, &dd, max_attempts).await;
     } else if !external_capture
-        && (incremental_background_drain || should_spawn_background_drainer(&args.event))
+        && (incremental_background_drain
+            || should_spawn_background_drainer(&args.event)
+            || json.get("_ai_memory_usage_calls").is_some())
         && let Err(err) = after_background_drain_event_enqueue(
             &dd,
             // The install's own token, resolved the same way an install-default
