@@ -192,6 +192,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Changed
 
+- The interface-language picker in the top bar now follows the dashboard's
+  control style instead of the browser's native grey select: the same border,
+  radius, surface colors and height as the search box beside it, its own
+  arrow, and the accent focus ring, in both the light and dark themes and on
+  narrow screens. Switching language still works through the
+  `ai_memory_language` cookie.
 - Changed the wake supervisor to count no wakes per hour. The per-agent and
   global budgets are gone; `max_wakes_per_hour`, `wakes_per_hour` and
   `wakes_per_day` are still accepted and ignored. New mail that arrives while
