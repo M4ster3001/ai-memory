@@ -385,6 +385,10 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Fixed the web inbox refusing to load when a project name was also another
+  project's legacy key. The default mailbox now opens through the project id,
+  and an explicit request by the clashing name keeps the page with a warning
+  that points to `merge-project` instead of returning a bare 400.
 - Fixed live response capture after transcript gaps. Bounded batches now resume
   from durable enqueue checkpoints, including across hook processes and
   transcript read windows (#1830).

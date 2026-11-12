@@ -3,6 +3,7 @@
 {% block content %}
 {% if project != "" %}<nav class="breadcrumbs" aria-label="Breadcrumb"><a href=".">Projects</a><span>/</span><span>{{ workspace }}</span><span>/</span><a href="{{ project_href }}">{{ project }}</a><span>/</span><span aria-current="page">Inbox</span></nav>{% endif %}
 <div class="page-heading"><div><p class="eyebrow">KEEP WORK MOVING</p><h1>Agent inbox</h1><p>{% if project != "" %}Viewing mailbox: <a href="{{ project_href }}"><strong>{{ workspace }} / {{ project }}</strong></a>{% else %}Create a project to start exchanging messages with agents.{% endif %}</p></div><a href="{{ inbox_href }}#compose" id="compose-shortcut" class="primary-button">＋ New message</a></div>
+{% if warning != "" %}<p class="section-note" role="alert"><strong>Mailbox unavailable.</strong> {{ warning }}</p>{% endif %}
 <section class="surface mail-overview" aria-labelledby="mail-overview-title">
   <h2 id="mail-overview-title">Waiting for agents</h2>
   {% if pending_total > 0 %}<p class="section-note"><strong>{{ pending_total }} queued</strong> · {% if pending_projects == 1 %}1 project{% else %}{{ pending_projects }} projects{% endif %}. Opening a mailbox does not collect its messages.</p>
