@@ -220,6 +220,9 @@ pub(super) fn render(terminal: &crate::terminal::Terminal, view: View<'_>) {
     // or a plain single-provider setup reports an empty list.
     if !report.providers.llm_candidates.is_empty() {
         terminal.line(format_args!("    fallback chain:"));
+        if let Some(headline) = fallback_chain_headline(&report.providers.llm_candidates) {
+            terminal.line(format_args!("      {headline}"));
+        }
         for candidate in &report.providers.llm_candidates {
             terminal.line(format_args!("      {}", fallback_candidate_line(candidate)));
         }

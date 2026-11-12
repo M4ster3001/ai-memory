@@ -36,6 +36,7 @@ Defaults that come from a named constant or from another crate say so in the Def
 | `llm_timeout_secs` | `300` (`ai_memory_llm::DEFAULT_REQUEST_TIMEOUT_SECS`) | `AI_MEMORY_LLM_TIMEOUT_SECS` | Per-request timeout for chat completions and the Copilot token exchange. The openai-oauth token refresh keeps its own ceiling. |
 | `llm_reasoning_effort` | unset (the model default applies) | `AI_MEMORY_LLM_REASONING_EFFORT` | Reasoning effort: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra` or `persistent`. |
 | `llm_headers` | `[]` | `AI_MEMORY_LLM_HEADERS` | Extra HTTP headers on every LLM chat request, as `Name: Value` or `Name=Value` entries. |
+| `llm_quota_cooldown_secs` | `900` (`ai_memory_llm::DEFAULT_QUOTA_COOLDOWN`) | `AI_MEMORY_LLM_QUOTA_COOLDOWN_SECS` | How long a `[[llm_fallbacks]]` chain skips a candidate that reported exhausted credit, quota or billing before the next call probes it again. Accepted range 30–86400. |
 | `embedding_provider` | unset (in-process local embeddings) | `AI_MEMORY_EMBEDDING_PROVIDER` | Embedding provider: `none`, `openai`, `voyage`, `google` or `gemini`, or `openai-compat`. |
 | `embedding_model` | unset | `AI_MEMORY_EMBEDDING_MODEL` | Provider-specific embedding model override. |
 | `embedding_dim` | unset | `AI_MEMORY_EMBEDDING_DIM` | Embedding dimension override. It must match the model. |
@@ -47,7 +48,7 @@ Defaults that come from a named constant or from another crate say so in the Def
 
 ## `[[llm_fallbacks]]`
 
-An array of tables. Each entry is tried in order after the primary provider, only when a call fails transiently. The default is an empty list. Config load rejects an entry with no provider or model. The list has no environment form.
+An array of tables. Each entry is tried in order after the primary provider, only when a call fails transiently or the provider reports exhausted credit, quota or billing (see [`llm-provider-fallback.md`](llm-provider-fallback.md#credit-and-quota-exhaustion)). The default is an empty list. Config load rejects an entry with no provider or model. The list has no environment form.
 
 | Key | Default | Env equivalent | Purpose |
 | --- | --- | --- | --- |
