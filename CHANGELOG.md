@@ -327,6 +327,9 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Changed
 
+- The `/web/search` page now lists the ten most recently updated pages when
+  no search term is entered, from the selected project or from every readable
+  project, instead of only showing an empty prompt.
 - `memory_lint` now reports embedding-band pairs as
   `similarity_candidate` instead of `contradiction`, and no longer infers that
   a newer page supersedes an older one from timestamps alone. Explicit
