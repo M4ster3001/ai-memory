@@ -11,6 +11,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Changed
+
+- The `/web/search` page now lists the ten most recently updated pages when
+  no search term is entered, from the selected project or from every readable
+  project, instead of only showing an empty prompt.
+
 ### Fixed
 
 - `ai-memory run claude --resume <name>` now links the session Claude resumed
