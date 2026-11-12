@@ -19,6 +19,10 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Fixed the web inbox refusing to load when a project name was also another
+  project's legacy key. The default mailbox now opens through the project id,
+  and an explicit request by the clashing name keeps the page with a warning
+  that points to `merge-project` instead of returning a bare 400.
 - `ai-memory run claude --resume <name>` now links the session Claude resumed
   and imports its transcript. The session name was recorded as the native
   session id, so the transcript was never found: the run exited 0 with the
