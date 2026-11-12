@@ -171,23 +171,23 @@ If every eligible candidate fails, the wrapper returns a bounded aggregate
 error containing provider/model labels and error classes, never response bodies
 or secrets. A candidate skipped because its circuit is open appears as
 `provider/model: skipped (circuit open: quota-exhausted)` (or `transient`), so
-the error still says why when nothing was attempted.
+the error says why a candidate was not attempted.
 
 ## Credit and quota exhaustion
 
-When an account runs out of credit, providers answer with an error that the
-status alone cannot tell apart from a malformed request or a short rate limit:
-Anthropic sends `400 invalid_request_error`, OpenAI `429 insufficient_quota`,
-OpenRouter `402`. Before this rule only the `429` advanced the chain, so an
-Anthropic primary with an empty balance failed every consolidation and the
-configured fallback never ran.
+When an account runs out of credit, the HTTP status alone looks like a
+malformed request or a short rate limit: Anthropic sends
+`400 invalid_request_error`, OpenAI `429 insufficient_quota` and OpenRouter
+`402`. Only the `429` used to advance the chain, so an Anthropic primary with
+an empty balance failed every consolidation and the configured fallback never
+ran.
 
-`LlmError::failover_class()` is the one classification. It returns
-`Transient`, `QuotaExhausted` or `Permanent`; `is_transient()`,
-`is_quota_exhausted()` and `should_fail_over()` are views of it. The quota
-check lives in `crates/ai-memory-llm/src/quota.rs` and reads only the bounded
-error body that `LlmError::Provider` already carries (at most 1 KiB, secrets
-scrubbed); the result is a boolean and no part of the body is logged.
+`LlmError::failover_class()` returns `Transient`, `QuotaExhausted` or
+`Permanent`, and `is_transient()`, `is_quota_exhausted()` and
+`should_fail_over()` all derive from it. The quota check lives in
+`crates/ai-memory-llm/src/quota.rs`. It reads only the bounded error body that
+`LlmError::Provider` already carries (at most 1 KiB, with secrets scrubbed),
+returns a boolean, and logs no part of the body.
 
 | Provider | Signal treated as `QuotaExhausted` |
 | --- | --- |
@@ -199,32 +199,33 @@ scrubbed); the result is a boolean and no part of the body is logged.
 | `copilot` | `quota_exceeded`, `monthly quota` |
 | `opencode` | any `402`; `insufficient balance`, `out of credits` |
 
-The markers are matched case-insensitively against any provider's body, since
-gateways relay each other's errors. A per-minute rate limit keeps the
-transient class: Gemini reuses OpenAI's "exceeded your current quota" wording
-for its per-minute limit, so that phrase is deliberately not a marker.
+The markers are matched case-insensitively against every provider's body,
+because gateways relay each other's errors. A per-minute rate limit stays
+transient. Gemini reuses OpenAI's "exceeded your current quota" wording for its
+per-minute limit, so that phrase is not a marker.
 
-**401 and 403.** A plain `401` (an invalid, revoked or mistyped key) never
-fails over: the key is the operator's to fix, and silently moving every call to
-the fallback would hide it. A `401`/`403` fails over only when its body carries
-an explicit billing, quota, credit or disabled-account marker from the table,
-such as OpenAI's `account_deactivated` or Anthropic's disabled organization.
+A plain `401` (an invalid, revoked or mistyped key) never fails over. The
+operator has to fix the key, and moving every call to the fallback would hide
+the problem. A `401` or `403` fails over only when its body carries an explicit
+billing, quota, credit or disabled-account marker from the table, such as
+OpenAI's `account_deactivated` or Anthropic's disabled organization.
 
-**Retries.** Exhausted quota is not transient: the consolidation and bootstrap
-retry loops do not re-send it two seconds later, even when it arrives as a
-`429`. The SessionEnd consolidation queue keeps such a job on its bounded
-backoff instead of marking it terminal, because a top-up or quota reset can
-clear it within that window, as the `429` always could.
+The consolidation and bootstrap retry loops do not re-send an exhausted-quota
+error two seconds later, even when it arrives as a `429`, because it is not
+transient. The SessionEnd consolidation queue keeps such a job on its bounded
+backoff instead of marking it terminal: a top-up or quota reset can clear it
+within that window, as it always could for a `429`.
 
-**Cooldown and probe.** A quota failure opens the candidate's circuit for
-`llm_quota_cooldown_secs` (default 900, accepted 30–86400; env
-`AI_MEMORY_LLM_QUOTA_COOLDOWN_SECS`). A longer provider retry hint (a quota
-reset time) stretches it, up to one hour or the configured value, whichever is
-longer. While the circuit is open the candidate gets no traffic. The first real
-call after the window probes it again: if it answers, it takes back over and
-its circuit closes; if it is still exhausted, it costs one rejected request and
-the window starts again. There is no background probe traffic, and a restart
-clears the state.
+A quota failure opens the candidate's circuit for `llm_quota_cooldown_secs`
+(default 900, accepted range 30 to 86400, env
+`AI_MEMORY_LLM_QUOTA_COOLDOWN_SECS`). A longer provider retry hint, such as a
+quota reset time, stretches the window up to one hour or the configured value,
+whichever is longer. A transient failure that arrives while the window is open
+neither shortens it nor changes its reason. The candidate gets no traffic while
+its circuit is open. The first real call after the window tries it again: if it
+answers, it takes over again and its circuit closes; if it is still exhausted,
+that call costs one rejected request and the window starts again. Nothing
+probes in the background, and a restart clears the state.
 
 Example, Anthropic as primary with OpenAI taking over when the Anthropic
 balance runs out:

@@ -443,16 +443,15 @@ docker run -d --name ai-memory \
     akitaonrails/ai-memory:latest
 ```
 
-> **Replace `<server-ip>` — do not paste it literally.** It must be the exact
-> address CLIENTS will put in their URL (`AI_MEMORY_SERVER_URL`), because the
-> server checks it against the HTTP `Host` header of every request, not the
-> caller's source IP. Leaving the placeholder text in place (or setting it to
-> some other address than what clients actually connect to) makes **every**
-> non-loopback request fail with `403 Forbidden: forbidden host` — the auth
-> token can be perfectly valid and it still gets rejected before reaching
-> that check. If the server has both a LAN IP and a hostname clients might
-> use, list both: `-e AI_MEMORY_ALLOWED_HOSTS="192.168.1.50,homelab.local,localhost,127.0.0.1"`.
-> The port is optional in each entry — `192.168.1.50` and `192.168.1.50:49374`
+> Replace `<server-ip>` with the address clients put in `AI_MEMORY_SERVER_URL`;
+> do not paste the placeholder. The server compares it with the HTTP `Host`
+> header of each request, not with the caller's source IP. If the placeholder
+> stays, or the value differs from the address clients use, every non-loopback
+> request fails with `403 Forbidden: forbidden host`, even with a valid auth
+> token, because the host check runs first. When clients may use either a LAN
+> IP or a hostname, list both:
+> `-e AI_MEMORY_ALLOWED_HOSTS="192.168.1.50,homelab.local,localhost,127.0.0.1"`.
+> The port is optional in each entry: `192.168.1.50` and `192.168.1.50:49374`
 > both match.
 
 See [Security](../README.md#security) in the README for why
@@ -468,19 +467,18 @@ browsers then correctly withhold the session cookie.
 
 ### Client side (the laptop)
 
-> **Before you paste this: `ai-memory` here means a native binary/wrapper
-> installed on THIS machine — not the Docker image.** The commands below
-> mutate files that live on your laptop (`~/.claude.json`, your agent's hook
-> config); a container that exits after `docker run --rm` can't write to
-> them. If you only have Docker so far, install the client first — Windows:
-> [docs/windows.md](windows.md) (pick Scenario B, C, or D based on whether
-> you use Docker Desktop, a prebuilt binary, or a source build); everything
-> else: [Running ai-memory without docker](#running-ai-memory-without-docker)
-> (`mise use -g github:akitaonrails/ai-memory` is the one-liner for most
-> setups). Confirm it worked with `ai-memory --version` before continuing —
-> if that itself prints "command not found", the install step above didn't
-> put it on `PATH` for this shell yet (Windows: open a new terminal so the
-> PATH change from the installer takes effect).
+> The `ai-memory` commands below need a native binary or wrapper installed on
+> this machine; the Docker image is not enough. They change files on the laptop
+> (`~/.claude.json` and the agent's hook config), which a container started with
+> `docker run --rm` cannot write. If you only have Docker so far, install the
+> client first. On Windows, follow [docs/windows.md](windows.md) and pick
+> Scenario B, C or D depending on whether you use Docker Desktop, a prebuilt
+> binary or a source build. Elsewhere, see
+> [Running ai-memory without docker](#running-ai-memory-without-docker);
+> `mise use -g github:akitaonrails/ai-memory` covers most setups. Check with
+> `ai-memory --version` before continuing. If it prints "command not found",
+> the install has not put the binary on this shell's `PATH` yet (on Windows,
+> open a new terminal so the installer's PATH change applies).
 
 ```bash
 export AI_MEMORY_SERVER_URL="http://<server-ip>:49374"
@@ -526,13 +524,13 @@ up hook-command changes. `setup-agent` and `backup-agents` only know the
 user-level file. Claude Code only; other agents keep their user-level hook
 files.
 
-**Troubleshooting this step:**
+Common client-side errors:
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `ai-memory: command not found` (or PowerShell `The term 'ai-memory' is not recognized`) | No native client installed on this machine — only the Docker image exists, and it can't write your local config files | Install the native client (see the callout above), open a new terminal, retry |
-| `Error: GET /admin/status: server returned 403 Forbidden: forbidden host` | Server's `AI_MEMORY_ALLOWED_HOSTS` doesn't include the address you're connecting through — often because `<server-ip>` was left as literal placeholder text in the server-side `docker run` | On the **server**, fix `AI_MEMORY_ALLOWED_HOSTS` to the real address (see callout in [Server side](#server-side-the-homelab-host) above) and restart that container; re-run `ai-memory status` from the client to confirm |
-| `401 Unauthorized` | `AI_MEMORY_AUTH_TOKEN` on the client doesn't match what the server was started with | Re-check both sides use the *same* token value — `generate-auth-token` produces a new random token every time it runs, it does not fetch an existing one |
+| `ai-memory: command not found` (or PowerShell `The term 'ai-memory' is not recognized`) | No native client is installed on this machine. Only the Docker image exists, and it cannot write your local config files. | Install the native client (see the note above), open a new terminal and retry. |
+| `Error: GET /admin/status: server returned 403 Forbidden: forbidden host` | The server's `AI_MEMORY_ALLOWED_HOSTS` does not include the address you connect through, often because `<server-ip>` was left as placeholder text in the server's `docker run`. | On the server, set `AI_MEMORY_ALLOWED_HOSTS` to the real address (see [Server side](#server-side-the-homelab-host)), restart that container, then run `ai-memory status` from the client again. |
+| `401 Unauthorized` | `AI_MEMORY_AUTH_TOKEN` on the client differs from the token the server started with. | Use the same token value on both sides. `generate-auth-token` makes a new random token each time it runs; it does not fetch the existing one. |
 
 `--session-aware` is an optional Claude Code MCP mode:
 

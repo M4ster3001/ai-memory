@@ -13,39 +13,39 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
-- `llm_quota_cooldown_secs` (default 900, env
-  `AI_MEMORY_LLM_QUOTA_COOLDOWN_SECS`) sets how long a fallback chain, the
-  default one or a workload's, skips a provider that is out of credit or
-  quota. The next call after the window probes it again, so a topped-up
-  primary takes back over without a restart. `ai-memory status` names an
-  exhausted primary and the fallback answering in its place, and the health
-  payload's candidates carry a `circuit_reason`.
+- Added `llm_quota_cooldown_secs` (default 900, env
+  `AI_MEMORY_LLM_QUOTA_COOLDOWN_SECS`), how long a fallback chain (the default
+  one or a workload's) skips a provider that reported it is out of credit or
+  quota. The first call after that window tries the provider again, so a
+  topped-up primary takes over again without a restart. `ai-memory status`
+  names an exhausted primary and the fallback answering for it, and each
+  candidate in the health payload carries a `circuit_reason`.
 
 ### Changed
 
-- The `/web/search` page now lists the ten most recently updated pages when
-  no search term is entered, from the selected project or from every readable
-  project, instead of only showing an empty prompt.
+- `/web/search` with no search term lists the ten most recently updated
+  pages, from the selected project or from every project the viewer can read.
+  It used to show only an empty prompt.
 
 ### Fixed
 
-- An `[[llm_fallbacks]]` chain now moves to the next provider when the current
-  one reports that the account is out of credit, quota or billing, not only on
-  a `429`, `5xx` or network failure. Anthropic's `400` "credit balance is too
-  low" used to count as a malformed request, so with an exhausted Anthropic
+- Fixed `[[llm_fallbacks]]` chains stopping when a provider reported that the
+  account was out of credit, quota or billing. Only a `429`, a `5xx` or a
+  network failure moved the chain on, and Anthropic's `400` "credit balance is
+  too low" counted as a malformed request, so with an exhausted Anthropic
   primary every consolidation failed and the configured OpenAI fallback never
-  ran. The classification covers Anthropic, OpenAI (`insufficient_quota`,
-  billing limits, deactivated accounts), OpenAI-compatible gateways such as
-  OpenRouter (`402`), Gemini daily quotas, Codex `usage_limit_reached`,
-  Copilot and OpenCode, and reads only the bounded, scrubbed error body. A
-  plain invalid-key `401` still does not fall back. Exhausted quota is no
-  longer retried in place by the consolidation and bootstrap loops; the
-  SessionEnd queue keeps such a job on its backoff. See
+  ran. The chain now also advances on these errors from Anthropic, OpenAI
+  (`insufficient_quota`, billing limits, deactivated accounts),
+  OpenAI-compatible gateways such as OpenRouter (`402`), Gemini daily quotas,
+  Codex `usage_limit_reached`, Copilot and OpenCode. The check reads only the
+  bounded, scrubbed error body, and a plain invalid-key `401` still does not
+  fall back. The consolidation and bootstrap loops no longer retry exhausted
+  quota in place; the SessionEnd queue keeps such a job on its backoff. See
   [`docs/llm-provider-fallback.md`](docs/llm-provider-fallback.md#credit-and-quota-exhaustion).
 - Fixed the web inbox refusing to load when a project name was also another
-  project's legacy key. The default mailbox now opens through the project id,
-  and an explicit request by the clashing name keeps the page with a warning
-  that points to `merge-project` instead of returning a bare 400.
+  project's legacy key. The default mailbox now opens through the project id.
+  A request that names the clashing project keeps the page and shows a warning
+  pointing to `merge-project`, where it used to return a bare 400.
 - `ai-memory run claude --resume <name>` now links the session Claude resumed
   and imports its transcript. The session name was recorded as the native
   session id, so the transcript was never found: the run exited 0 with the

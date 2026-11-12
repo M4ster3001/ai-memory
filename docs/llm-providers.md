@@ -292,8 +292,8 @@ billing: Anthropic's `400` "credit balance is too low", OpenAI's
 `429 insufficient_quota`, an OpenRouter `402`, a Gemini daily
 `RESOURCE_EXHAUSTED`, a Codex `usage_limit_reached` or a Copilot
 `quota_exceeded`. A plain invalid-key `401` does not fall back. The exhausted
-provider is skipped for `llm_quota_cooldown_secs` (default 900) and probed
-again by the next call after that, so it takes back over once topped up.
+provider is skipped for `llm_quota_cooldown_secs` (default 900). The next
+call after that tries it again, so it takes over again once topped up.
 
 ```toml
 llm_provider = "anthropic"
