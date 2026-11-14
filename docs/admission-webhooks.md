@@ -380,6 +380,13 @@ A webhook is either **blocking** or **non-blocking**:
   `git-mirror`) so a slow or down sink never adds latency to writes. Still
   honours `events` and the skip list.
 
+A non-blocking `message_send` observer can also wake a local process. The
+inbox watcher script (`scripts/agent-inbox-watch.py --webhook-listen`) receives
+that POST, ignores the body and lists the inbox at once. The entry filters by
+event and not by project, so keep a polling interval as the fallback and see
+[the messaging guide](agent-messaging.md#waiting-for-mail-without-a-model) for a
+working entry.
+
 Since the blocking chain is sequential, total worst-case write latency is
 `Σ timeout_ms` over the **blocking** webhooks only; non-blocking ones add none.
 

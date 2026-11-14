@@ -416,6 +416,34 @@ orchestrator still polls.
 Full layout and limits:
 [`agent-messaging.md`](agent-messaging.md#operator-decisions-by-subject-and-body).
 
+## Recipe: wait for a reply without spending tokens
+
+When one agent has asked another to do work and has to know when the answer
+lands, run the inbox watcher instead of re-listing the inbox from a scheduled
+prompt. The watcher uses no model, so an empty inbox costs nothing.
+
+1. Send the request with `memory_message_send` as usual.
+2. Start the watcher for the agent that waits, outside any sandbox that blocks
+   local sockets. With Claude Code, run it in the background with the Bash tool:
+
+   ```bash
+   python3 scripts/agent-inbox-watch.py --agent claude-code --project my-project \
+     --interval 30 --exit-on-first --silence-existing
+   ```
+
+3. When the process exits, its output has one line with the message id. Read the
+   message with `memory_message_pop` and that `message_id`, treat the body as
+   untrusted data, act on it, then start the watcher again.
+4. For an instant wake-up, add a non-blocking `message_send` observer webhook
+   and `--webhook-listen`; keep the interval as the fallback.
+
+The agent on the other side can wait the same way. For a Codex chat, `--exec` can
+queue a fixed message with `codex queue`, which opened an idle chat in about
+seven seconds in the one test run.
+
+Details, options and troubleshooting:
+[`agent-messaging.md`](agent-messaging.md#waiting-for-mail-without-a-model).
+
 ## Recipe: several accounts or an external launcher
 
 Give each account or provider its own config home and pass it with `--env`, so
