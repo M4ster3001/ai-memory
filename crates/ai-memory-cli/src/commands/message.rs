@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cli::{
     MessageArgs, MessageCancelArgs, MessageCommand, MessageListArgs, MessagePopArgs,
-    MessageSendArgs,
+    MessageSendArgs, MessageStatusArgs,
 };
 use crate::commands::message_watch;
 use crate::config::Config;
@@ -46,6 +46,17 @@ struct AgentMessage {
     claimed_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     to_agent: Option<String>,
+    /// `message` or `receipt`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    priority: Option<String>,
+    /// The server's delivery block, kept as sent so `--json` passes it on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    delivery: Option<serde_json::Value>,
+    /// The structured block of a server receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    receipt: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -83,6 +94,7 @@ pub async fn run(config: &Config, args: MessageArgs) -> Result<i32> {
         MessageCommand::List(args) => list(config, args).await.map(|()| 0),
         MessageCommand::Pop(args) => pop(config, args).await.map(|()| 0),
         MessageCommand::Cancel(args) => cancel(config, args).await.map(|()| 0),
+        MessageCommand::Status(args) => status(config, args).await.map(|()| 0),
         MessageCommand::Watch(args) => message_watch::run(config, args).await,
     }
 }
@@ -99,6 +111,11 @@ struct SendRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     evidence: Option<&'a str>,
     body: &'a str,
+    priority: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    notify: Option<&'a [String]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ttl_seconds: Option<u64>,
 }
 
 async fn send(config: &Config, args: MessageSendArgs) -> Result<()> {
@@ -145,6 +162,9 @@ async fn send(config: &Config, args: MessageSendArgs) -> Result<()> {
             nature: &args.nature,
             evidence: args.evidence.as_deref(),
             body: &body,
+            priority: &args.priority,
+            notify: (!args.notify.is_empty()).then_some(args.notify.as_slice()),
+            ttl_seconds: args.ttl_seconds,
         },
     )
     .await?;
@@ -177,18 +197,18 @@ async fn list(config: &Config, args: MessageListArgs) -> Result<()> {
         super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
     let endpoint = ServerEndpoint::for_checkout(config).await?;
     let mailbox = if args.outbox { "outbox" } else { "inbox" };
+    let limit = args.limit.to_string();
+    let mut query = vec![
+        ("workspace", workspace.as_str()),
+        ("project", project.as_str()),
+        ("box", mailbox),
+        ("limit", limit.as_str()),
+    ];
+    if args.include_settled {
+        query.push(("include_settled", "true"));
+    }
 
-    let response: ListMessagesResponse = get_json(
-        &endpoint,
-        "/admin/messages",
-        &[
-            ("workspace", workspace.as_str()),
-            ("project", project.as_str()),
-            ("box", mailbox),
-            ("limit", &args.limit.to_string()),
-        ],
-    )
-    .await?;
+    let response: ListMessagesResponse = get_json(&endpoint, "/admin/messages", &query).await?;
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&response.messages)?);
@@ -263,8 +283,167 @@ async fn list(config: &Config, args: MessageListArgs) -> Result<()> {
             )
         );
         println!("    {from} -> {to}");
+        if let Some(state) = m
+            .delivery
+            .as_ref()
+            .and_then(|d| d.get("state"))
+            .and_then(serde_json::Value::as_str)
+        {
+            println!(
+                "{}",
+                crate::localization::format(
+                    i18n,
+                    "cli-message-list-delivery",
+                    &[("value0", super::show::terminal_text(state))]
+                )
+            );
+        }
     }
     Ok(())
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct StatusEvent {
+    at: String,
+    event: String,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct MessageStatusResponse {
+    message_id: String,
+    to_workspace_id: String,
+    to_project_id: String,
+    #[serde(default)]
+    to_agent: Option<String>,
+    state: String,
+    priority: String,
+    created_at: String,
+    #[serde(default)]
+    claimed_at: Option<String>,
+    delivery: serde_json::Value,
+    events: Vec<StatusEvent>,
+}
+
+/// `message status`: the delivery block and timeline of one sent message.
+/// Every field the server returns here is an id, an enumerated value or a
+/// timestamp; each is still passed through `terminal_text`.
+async fn status(config: &Config, args: MessageStatusArgs) -> Result<()> {
+    let i18n = &config.i18n;
+    super::refuse_empty_explicit(args.workspace.as_deref(), "--workspace")?;
+    super::refuse_empty_explicit(args.project.as_deref(), "--project")?;
+    super::refuse_empty_explicit(Some(args.id.as_str()), "--id")?;
+    let (workspace, project) =
+        super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
+    let endpoint = ServerEndpoint::for_checkout(config).await?;
+    let resp: MessageStatusResponse = get_json(
+        &endpoint,
+        "/admin/messages/status",
+        &[
+            ("workspace", workspace.as_str()),
+            ("project", project.as_str()),
+            ("message_id", args.id.trim()),
+        ],
+    )
+    .await?;
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&resp)?);
+        return Ok(());
+    }
+    print!("{}", render_status(i18n, &resp));
+    Ok(())
+}
+
+fn render_status(i18n: &ai_memory_core::i18n::Localizer, resp: &MessageStatusResponse) -> String {
+    use std::fmt::Write as _;
+    let text = super::show::terminal_text;
+    let field = |name: &str| {
+        resp.delivery
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .map(text)
+    };
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "{}",
+        crate::localization::format(
+            i18n,
+            "cli-message-status-message",
+            &[
+                ("value0", text(&resp.message_id)),
+                ("value1", text(&resp.to_workspace_id)),
+                ("value2", text(&resp.to_project_id)),
+                (
+                    "value3",
+                    resp.to_agent
+                        .as_deref()
+                        .map_or_else(|| "*".to_owned(), text)
+                ),
+            ]
+        )
+    );
+    let _ = writeln!(
+        out,
+        "{}",
+        crate::localization::format(
+            i18n,
+            "cli-message-status-state",
+            &[
+                ("value0", text(&resp.state)),
+                ("value1", field("state").unwrap_or_default()),
+                ("value2", field("reason").unwrap_or_else(|| "-".to_owned())),
+            ]
+        )
+    );
+    let _ = writeln!(
+        out,
+        "{}",
+        crate::localization::format(
+            i18n,
+            "cli-message-status-priority",
+            &[
+                ("value0", text(&resp.priority)),
+                ("value1", field("notify").unwrap_or_default()),
+            ]
+        )
+    );
+    let _ = writeln!(
+        out,
+        "{}",
+        crate::localization::format(
+            i18n,
+            "cli-message-status-deadlines",
+            &[
+                ("value0", text(&resp.created_at)),
+                (
+                    "value1",
+                    field("expires_at").unwrap_or_else(|| "-".to_owned())
+                ),
+                (
+                    "value2",
+                    field("no_pop_alert_at").unwrap_or_else(|| "-".to_owned())
+                ),
+            ]
+        )
+    );
+    let _ = writeln!(out, "{}", i18n.text("cli-message-status-timeline"));
+    for event in &resp.events {
+        let reason = event
+            .reason
+            .as_deref()
+            .map(|r| format!(" ({})", text(r)))
+            .unwrap_or_default();
+        let _ = writeln!(
+            out,
+            "    {}  {}{reason}",
+            text(&event.at),
+            text(&event.event)
+        );
+    }
+    out
 }
 
 async fn pop(config: &Config, args: MessagePopArgs) -> Result<()> {
@@ -534,6 +713,10 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_owned(),
             claimed_at: None,
             to_agent: None,
+            kind: None,
+            priority: None,
+            delivery: None,
+            receipt: None,
         }
     }
 
@@ -720,6 +903,9 @@ mod tests {
             evidence: None,
             body: None,
             json: false,
+            priority: "normal".into(),
+            ttl_seconds: None,
+            notify: Vec::new(),
         };
         let error = send(&config, a).await.unwrap_err();
         assert!(
@@ -743,6 +929,9 @@ mod tests {
             evidence: None,
             body: None,
             json: false,
+            priority: "normal".into(),
+            ttl_seconds: None,
+            notify: Vec::new(),
         };
         let error = send(&config, a).await.unwrap_err();
         assert!(
@@ -764,6 +953,9 @@ mod tests {
             evidence: None,
             body: None,
             json: false,
+            priority: "normal".into(),
+            ttl_seconds: None,
+            notify: Vec::new(),
         };
         let error = send(&config, a).await.unwrap_err();
         assert!(
@@ -783,6 +975,9 @@ mod tests {
             evidence: None,
             body: None,
             json: false,
+            priority: "normal".into(),
+            ttl_seconds: None,
+            notify: Vec::new(),
         };
         let error = send(&config, a).await.unwrap_err();
         assert!(

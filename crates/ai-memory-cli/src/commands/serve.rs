@@ -1488,6 +1488,11 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
     // it can tell an idle box from a busy one and cancel a run on the operator's
     // return.
     let activity_clock = server.activity_clock();
+    store
+        .writer
+        .set_message_delivery_policy(config.messaging.delivery_policy())
+        .await?;
+    let _message_deadline_sweeper = spawn_message_deadline_sweeper(store.writer.clone());
     let _maintenance_tasks = start_maintenance_scheduler(
         config.maintenance.clone(),
         config.auto_improve.clone(),
@@ -2189,6 +2194,42 @@ async fn close_store_within(store: &Store, grace: Duration) -> bool {
         return false;
     }
     true
+}
+
+/// How often the message deadline sweep runs.
+const MESSAGE_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+/// Most messages one sweep pass expires or alerts on.
+const MESSAGE_SWEEP_BATCH: usize = 100;
+
+/// Expire agent messages whose time to live passed and record due "not popped
+/// yet" alerts, queueing the receipts their senders asked for. One bounded
+/// writer transaction per minute; it runs no command and makes no network
+/// call. It is part of message delivery, so it runs even when scheduled
+/// maintenance is off.
+fn spawn_message_deadline_sweeper(writer: WriterHandle) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(MESSAGE_SWEEP_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            let now_us = jiff::Timestamp::now().as_microsecond();
+            match writer
+                .sweep_message_deadlines(now_us, MESSAGE_SWEEP_BATCH)
+                .await
+            {
+                Ok(outcome) if outcome.expired + outcome.alerts == 0 => {}
+                Ok(outcome) => info!(
+                    expired = outcome.expired,
+                    alerts = outcome.alerts,
+                    receipts = outcome.receipts,
+                    receipts_dropped = outcome.receipts_dropped,
+                    "message deadline sweep"
+                ),
+                Err(ai_memory_store::StoreError::WriterClosed) => break,
+                Err(e) => tracing::warn!(error = %e, "message deadline sweep failed"),
+            }
+        }
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

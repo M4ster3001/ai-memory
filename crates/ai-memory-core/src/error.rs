@@ -40,6 +40,11 @@ pub enum MemoryError {
     #[error("invalid password: {0}")]
     InvalidPassword(String),
 
+    /// A caller-supplied value is outside its allowed set or range. The
+    /// string names the field and the rule, never the value.
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
+
     /// Wraps any underlying I/O failure.
     #[error(transparent)]
     Io(#[from] std::io::Error),

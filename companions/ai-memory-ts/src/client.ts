@@ -746,6 +746,9 @@ export class MessagesNamespace {
         subject: a.subject,
         nature: a.nature,
         evidence: a.evidence,
+        priority: a.priority,
+        ttl_seconds: a.ttlSeconds,
+        notify: a.notify,
       }),
       true,
       options,
@@ -764,7 +767,13 @@ export class MessagesNamespace {
     }
     const decoded = await this.#core.invoke(
       "memory_message_list",
-      wire({ ...scopeWire(scope), box: a.box, limit: a.limit }),
+      wire({
+        ...scopeWire(scope),
+        box: a.box,
+        limit: a.limit,
+        include_settled: a.includeSettled,
+        message_id: a.messageId,
+      }),
       false,
       options,
     );

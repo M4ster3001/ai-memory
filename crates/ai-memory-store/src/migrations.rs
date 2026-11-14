@@ -165,6 +165,32 @@ mod tests {
     };
     use rusqlite::{Connection, params};
 
+    /// Insert a session row the way the store does, without the agent
+    /// registration of V102, so a test can seed a store migrated only up to an
+    /// older version.
+    fn seed_session(conn: &mut Connection, session: &NewSession) -> crate::StoreResult<()> {
+        conn.execute(
+            "INSERT INTO sessions \
+             (id, workspace_id, project_id, agent_kind, cwd, started_at, actor_user) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT(id) DO NOTHING",
+            params![
+                session.id.as_bytes(),
+                session.workspace_id.as_bytes(),
+                session.project_id.as_bytes(),
+                session.agent_kind.as_str(),
+                session
+                    .cwd
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned()),
+                session
+                    .occurred_at
+                    .unwrap_or_else(|| jiff::Timestamp::now().as_microsecond()),
+                session.actor_user.as_deref(),
+            ],
+        )?;
+        Ok(())
+    }
+
     #[test]
     fn v94_preserves_old_response_rows_and_cascades_context() {
         let mut conn = Connection::open_in_memory().unwrap();
@@ -307,6 +333,130 @@ mod tests {
         );
         conn.execute_batch("INSERT INTO sessions(id,workspace_id,project_id,agent_kind,started_at) VALUES(zeroblob(16),zeroblob(16),zeroblob(16),'codex',1);
             UPDATE agent_messages SET from_session_id=zeroblob(16) WHERE body='queued';").unwrap();
+        let dangling: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_foreign_key_check('agent_messages')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(dangling, 0);
+    }
+
+    /// V102 backfills the agent registry from recorded sessions, and V103
+    /// rebuilds `agent_messages` with delivery state. Existing mail keeps its
+    /// text and state, gets a delivery state derived from it, no deadline and
+    /// `notify = 'never'`, so nothing old starts to expire or bounce.
+    #[test]
+    fn v102_v103_backfill_registry_and_derive_delivery_for_existing_mail() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        run_to(&mut conn, 101).unwrap();
+        conn.execute_batch(
+            "INSERT INTO workspaces(id,name,created_at) VALUES(zeroblob(16),'mail',1);
+             INSERT INTO projects(id,workspace_id,name,created_at) VALUES(zeroblob(16),zeroblob(16),'mail',1);
+             INSERT INTO sessions(id,workspace_id,project_id,agent_kind,started_at) VALUES(zeroblob(16),zeroblob(16),zeroblob(16),'codex',7);
+             INSERT INTO sessions(id,workspace_id,project_id,agent_kind,started_at) VALUES(x'00000000000000000000000000000001',zeroblob(16),zeroblob(16),'codex',3);
+             INSERT INTO agent_messages(id,from_workspace_id,from_project_id,from_agent,to_workspace_id,to_project_id,body,state,created_at,to_agent)
+                 VALUES(x'01000000000000000000000000000000',zeroblob(16),zeroblob(16),'other',zeroblob(16),zeroblob(16),'queued','pending',5,'grok');
+             INSERT INTO agent_messages(id,from_workspace_id,from_project_id,from_agent,to_workspace_id,to_project_id,body,state,created_at,claimed_at)
+                 VALUES(x'02000000000000000000000000000000',zeroblob(16),zeroblob(16),'other',zeroblob(16),zeroblob(16),'done','claimed',6,7);
+             INSERT INTO agent_messages(id,from_workspace_id,from_project_id,from_agent,to_workspace_id,to_project_id,body,state,created_at)
+                 VALUES(x'03000000000000000000000000000000',zeroblob(16),zeroblob(16),'other',zeroblob(16),zeroblob(16),'gone','cancelled',8);
+             INSERT INTO agent_messages(id,from_workspace_id,from_project_id,from_agent,to_workspace_id,to_project_id,body,state,created_at)
+                 VALUES(x'04000000000000000000000000000000',zeroblob(16),zeroblob(16),'other',zeroblob(16),zeroblob(16),'held','editing',9);",
+        )
+        .unwrap();
+        run(&mut conn).unwrap();
+        run(&mut conn).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+
+        let registry: Vec<(String, i64)> = conn
+            .prepare("SELECT agent_kind, created_at FROM agent_registrations")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(registry, vec![("codex".to_owned(), 3)]);
+
+        type Row = (
+            String,
+            String,
+            String,
+            Option<String>,
+            String,
+            Option<i64>,
+            String,
+        );
+        let rows: Vec<Row> = conn
+            .prepare(
+                "SELECT body, state, delivery_state, delivery_reason, notify, expires_at, kind \
+                 FROM agent_messages ORDER BY created_at",
+            )
+            .unwrap()
+            .query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let expect = |body: &str, state: &str, delivery: &str, reason: Option<&str>| {
+            (
+                body.to_owned(),
+                state.to_owned(),
+                delivery.to_owned(),
+                reason.map(str::to_owned),
+                "never".to_owned(),
+                None,
+                "message".to_owned(),
+            )
+        };
+        assert_eq!(
+            rows,
+            vec![
+                expect("queued", "pending", "queued", None),
+                expect("done", "claimed", "delivered", None),
+                expect("gone", "cancelled", "cancelled", Some("sender_cancelled")),
+                expect("held", "editing", "queued", None),
+            ]
+        );
+        // The constraints bite: unknown values and a receipt that asks for
+        // receipts are refused.
+        for bad in [
+            "UPDATE agent_messages SET delivery_state='lost' WHERE body='queued'",
+            "UPDATE agent_messages SET delivery_reason='because' WHERE body='queued'",
+            "UPDATE agent_messages SET notify='delay,failure' WHERE body='queued'",
+            "UPDATE agent_messages SET kind='receipt' WHERE body='queued'",
+            "UPDATE agent_messages SET kind='receipt', receipt_outcome='expired', notify='failure' WHERE body='queued'",
+            "UPDATE agent_messages SET receipt_outcome='expired' WHERE body='queued'",
+        ] {
+            assert!(conn.execute(bad, []).is_err(), "{bad}");
+        }
+        conn.execute(
+            "UPDATE agent_messages SET state='expired', delivery_state='expired', delivery_reason='ttl' \
+             WHERE body='queued'",
+            [],
+        )
+        .unwrap();
+        let indexes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND tbl_name='agent_messages' \
+                 AND name IN ('idx_agent_messages_inbox','idx_agent_messages_outbox','idx_messages_agent_inbox', \
+                 'idx_agent_messages_expiry','idx_agent_messages_no_pop_alert','idx_agent_messages_receipt_once')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexes, 6);
         let dangling: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM pragma_foreign_key_check('agent_messages')",
@@ -947,7 +1097,7 @@ mod tests {
             .unwrap();
         assert_eq!(foreign_key_errors, 0);
 
-        crate::ops::begin_session(
+        seed_session(
             &mut conn,
             &NewSession {
                 occurred_at: None,
@@ -1006,7 +1156,7 @@ mod tests {
             )
         );
 
-        crate::ops::begin_session(
+        seed_session(
             &mut conn,
             &NewSession {
                 occurred_at: None,
@@ -1079,7 +1229,7 @@ mod tests {
             )
         );
 
-        crate::ops::begin_session(
+        seed_session(
             &mut conn,
             &NewSession {
                 occurred_at: None,
@@ -1152,7 +1302,7 @@ mod tests {
             )
         );
 
-        crate::ops::begin_session(
+        seed_session(
             &mut conn,
             &NewSession {
                 occurred_at: None,
@@ -1220,7 +1370,7 @@ mod tests {
             ("pool".into(), "/repo".into(), 7, Some("user:alice".into()))
         );
 
-        crate::ops::begin_session(
+        seed_session(
             &mut conn,
             &NewSession {
                 occurred_at: None,
@@ -1321,7 +1471,7 @@ mod tests {
             ("zcode".into(), "/repo".into(), 7, Some("user:alice".into()))
         );
 
-        crate::ops::begin_session(
+        seed_session(
             &mut conn,
             &NewSession {
                 occurred_at: None,
@@ -1394,7 +1544,7 @@ mod tests {
             )
         );
 
-        crate::ops::begin_session(
+        seed_session(
             &mut conn,
             &NewSession {
                 occurred_at: None,
@@ -1483,7 +1633,7 @@ mod tests {
             .unwrap();
         assert_eq!(dangling, 0, "ingest_keys must still reference sessions");
 
-        crate::ops::begin_session(
+        seed_session(
             &mut conn,
             &NewSession {
                 occurred_at: None,
@@ -1605,7 +1755,7 @@ mod tests {
             assert_eq!(dangling, 0, "{table} must still reference sessions");
         }
 
-        crate::ops::begin_session(
+        seed_session(
             &mut conn,
             &NewSession {
                 occurred_at: None,
@@ -1727,7 +1877,7 @@ mod tests {
             assert_eq!(dangling, 0, "{table} must still reference sessions");
         }
 
-        crate::ops::begin_session(
+        seed_session(
             &mut conn,
             &NewSession {
                 occurred_at: None,
@@ -1834,7 +1984,7 @@ mod tests {
             .unwrap();
         assert_eq!(observations, 1, "the session's observations survive");
 
-        crate::ops::begin_session(
+        seed_session(
             &mut conn,
             &NewSession {
                 occurred_at: None,
@@ -1943,7 +2093,7 @@ mod tests {
             .unwrap();
         assert_eq!(observations, 1, "the session's observations survive");
 
-        crate::ops::begin_session(
+        seed_session(
             &mut conn,
             &NewSession {
                 occurred_at: None,
@@ -2034,7 +2184,7 @@ mod tests {
                 Some("user:alice".into())
             )
         );
-        crate::ops::begin_session(
+        seed_session(
             &mut conn,
             &NewSession {
                 occurred_at: None,
@@ -2079,7 +2229,7 @@ mod tests {
         let project =
             crate::ops::get_or_create_project(&mut conn, &workspace, "app", None).unwrap();
         let session = SessionId::new();
-        crate::ops::begin_session(
+        seed_session(
             &mut conn,
             &NewSession {
                 occurred_at: None,
@@ -2502,7 +2652,7 @@ mod tests {
         let project_id =
             crate::ops::get_or_create_project(&mut conn, &workspace_id, "proj", None).unwrap();
         let session_id = SessionId::new();
-        crate::ops::begin_session(
+        seed_session(
             &mut conn,
             &NewSession {
                 occurred_at: None,
@@ -2592,7 +2742,7 @@ mod tests {
         let project_id =
             crate::ops::get_or_create_project(conn, &workspace_id, "proj", None).unwrap();
         let session_id = SessionId::new();
-        crate::ops::begin_session(
+        seed_session(
             conn,
             &NewSession {
                 occurred_at: None,
@@ -2753,7 +2903,7 @@ mod tests {
         let project_id =
             crate::ops::get_or_create_project(&mut conn, &workspace_id, "proj", None).unwrap();
         let session_id = SessionId::new();
-        crate::ops::begin_session(
+        seed_session(
             &mut conn,
             &NewSession {
                 occurred_at: None,

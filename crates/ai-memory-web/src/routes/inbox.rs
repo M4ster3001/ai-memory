@@ -245,11 +245,14 @@ pub(crate) async fn handler(
                         MessageState::Claimed => "Collected",
                         MessageState::Cancelled => "Cancelled",
                         MessageState::Editing => "Editing",
+                        MessageState::Expired => "Expired",
                     }
                     .to_owned()
                 } else {
                     i18n.status(m.state.as_str())
                 },
+                delivery: m.delivery.state.as_str().into(),
+                delivery_label: i18n.text(delivery_label_id(m.delivery.state)),
                 when: i18n.relative(&m.created_at.to_string()),
             }
         })
@@ -310,6 +313,23 @@ pub(crate) async fn handler(
     match view.render() {
         Ok(html) => Html(html).into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// Fluent id of a delivery state's badge label.
+fn delivery_label_id(state: ai_memory_core::DeliveryState) -> &'static str {
+    use ai_memory_core::DeliveryState as D;
+    match state {
+        D::Queued => "web-delivery-queued",
+        D::AwaitingAgent => "web-delivery-awaiting-agent",
+        D::WakeAttempted => "web-delivery-wake-attempted",
+        D::Delivered => "web-delivery-delivered",
+        D::WakeFailed => "web-delivery-wake-failed",
+        D::AgentUnavailable => "web-delivery-agent-unavailable",
+        D::QuotaExhausted => "web-delivery-quota-exhausted",
+        D::Expired => "web-delivery-expired",
+        D::Dead => "web-delivery-dead",
+        D::Cancelled => "web-delivery-cancelled",
     }
 }
 
@@ -434,24 +454,6 @@ pub(crate) async fn send(
     if agent.as_str() != input.to_agent {
         return error(StatusCode::BAD_REQUEST, "Select a registered agent.");
     }
-    let known = match state
-        .reader
-        .agent_usage(
-            target.workspace_id,
-            target.project_id,
-            ai_memory_core::OwnerFilter::Any,
-        )
-        .await
-    {
-        Ok(rows) => rows.iter().any(|r| r.agent == input.to_agent),
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    };
-    if !known {
-        return error(
-            StatusCode::BAD_REQUEST,
-            "That agent has no registered session in the recipient project.",
-        );
-    }
     if input.body.trim().is_empty()
         || input.body.chars().count() > 8_000
         || input.subject.chars().count() > 200
@@ -475,6 +477,11 @@ pub(crate) async fn send(
         body: input.body.trim().to_owned(),
         nature: ai_memory_core::MessageNature::Unknown,
         evidence: None,
+        priority: ai_memory_core::MessagePriority::Normal,
+        // A browser sender has no agent inbox to read receipts in; the Sent
+        // view shows the delivery state instead.
+        notify: ai_memory_core::NotifyOn::NEVER,
+        ttl_secs: None,
     };
     match state.wiki.send_agent_message(message, actor).await {
         Ok(id) => (

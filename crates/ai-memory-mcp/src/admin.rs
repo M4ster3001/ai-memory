@@ -557,6 +557,21 @@ struct ListMessagesQuery {
     mailbox: String,
     #[serde(default = "default_list_messages_limit")]
     limit: usize,
+    /// Outbox only: every state, newest first.
+    #[serde(default)]
+    include_settled: bool,
+    /// Outbox only: just this message.
+    #[serde(default)]
+    message_id: Option<String>,
+}
+
+/// Query for `GET /admin/messages/status`: one message the project sent.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MessageStatusQuery {
+    workspace: String,
+    project: String,
+    message_id: String,
 }
 
 fn default_message_box() -> String {
@@ -769,6 +784,7 @@ pub fn admin_router_with_sweep_tuning(
         .route("/admin/handoffs/expire", post(handle_expire_handoffs))
         .route("/admin/messages", get(handle_list_messages))
         .route("/admin/messages/send", post(handle_send_message))
+        .route("/admin/messages/status", get(handle_message_status))
         .route("/admin/messages/pop", post(handle_pop_message))
         .route("/admin/messages/cancel", post(handle_cancel_messages))
         .route("/admin/pending-writes", get(handle_pending_writes_list))
@@ -3568,10 +3584,92 @@ async fn handle_list_messages(
         }
     };
     let limit = query.limit.clamp(1, 200);
-    match state.reader.list_messages(ws, proj, mailbox, limit).await {
+    let message_id = match parse_optional_message_id(query.message_id.as_deref()) {
+        Ok(id) => id,
+        Err(e) => return e,
+    };
+    if mailbox == ai_memory_core::MessageBox::Inbox
+        && (query.include_settled || message_id.is_some())
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "include_settled and message_id apply to box \"outbox\" only"
+            })),
+        );
+    }
+    let filter = ai_memory_store::MessageListFilter {
+        include_settled: query.include_settled,
+        message_id,
+    };
+    match state
+        .reader
+        .list_messages_filtered(ws, proj, mailbox, filter, limit)
+        .await
+    {
         Ok(messages) => (
             StatusCode::OK,
             Json(serde_json::json!({ "messages": messages })),
+        ),
+        Err(e) => internal_err(e.to_string()),
+    }
+}
+
+/// `GET /admin/messages/status` — the delivery block and timeline of one
+/// message this project sent. Scoped to the sender coordinate, so an id from
+/// another project's outbox answers 404.
+async fn handle_message_status(
+    State(state): State<Arc<AdminState>>,
+    Query(query): Query<MessageStatusQuery>,
+) -> impl IntoResponse {
+    let (ws, proj) = match lookup_ws_proj_no_create(&state, &query.workspace, &query.project).await
+    {
+        Ok(ids) => ids,
+        Err(e) => return e,
+    };
+    let id = match parse_optional_message_id(Some(query.message_id.as_str())) {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "message_id must be a full UUID" })),
+            );
+        }
+        Err(e) => return e,
+    };
+    let filter = ai_memory_store::MessageListFilter {
+        include_settled: true,
+        message_id: Some(id),
+    };
+    let message = match state
+        .reader
+        .list_messages_filtered(ws, proj, ai_memory_core::MessageBox::Outbox, filter, 1)
+        .await
+    {
+        Ok(rows) => rows.into_iter().next(),
+        Err(e) => return internal_err(e.to_string()),
+    };
+    let Some(message) = message else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "no such message in this project's outbox" })),
+        );
+    };
+    match state.reader.message_delivery_events(ws, proj, id).await {
+        Ok(events) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "message_id": message.id.to_string(),
+                "to_workspace_id": message.to_workspace_id.to_string(),
+                "to_project_id": message.to_project_id.to_string(),
+                "to_agent": message.to_agent,
+                "state": message.state,
+                "priority": message.priority,
+                "created_at": message.created_at,
+                "claimed_at": message.claimed_at,
+                "delivery": message.delivery,
+                "events": events,
+            })),
         ),
         Err(e) => internal_err(e.to_string()),
     }
@@ -3591,6 +3689,12 @@ struct SendMessageRequest {
     #[serde(default)]
     evidence: Option<String>,
     body: String,
+    #[serde(default)]
+    priority: ai_memory_core::MessagePriority,
+    #[serde(default)]
+    notify: Option<Vec<ai_memory_core::NotifyClass>>,
+    #[serde(default)]
+    ttl_seconds: Option<u64>,
 }
 
 /// Map a message-store failure to a response. `InvalidState` is the
@@ -3657,6 +3761,36 @@ async fn handle_send_message(
             })),
         );
     }
+    let notify = match req
+        .notify
+        .as_deref()
+        .map(ai_memory_core::NotifyOn::from_classes)
+        .transpose()
+    {
+        Ok(notify) => notify.unwrap_or(ai_memory_core::NotifyOn::DEFAULT),
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            );
+        }
+    };
+    {
+        use ai_memory_core::message_delivery::{MAX_MESSAGE_TTL_SECS, MIN_MESSAGE_TTL_SECS};
+        if req
+            .ttl_seconds
+            .is_some_and(|ttl| !(MIN_MESSAGE_TTL_SECS..=MAX_MESSAGE_TTL_SECS).contains(&ttl))
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "ttl_seconds must be between {MIN_MESSAGE_TTL_SECS} and {MAX_MESSAGE_TTL_SECS}"
+                    )
+                })),
+            );
+        }
+    }
 
     let distinguishes = match state
         .reader
@@ -3690,6 +3824,9 @@ async fn handle_send_message(
         body,
         nature: req.nature,
         evidence,
+        priority: req.priority,
+        notify,
+        ttl_secs: req.ttl_seconds,
     };
 
     // Match MCP's crossing-point admission and post-commit observer ordering.
@@ -10399,6 +10536,9 @@ mod tests {
                     body: "fixture".into(),
                     nature: ai_memory_core::MessageNature::Unknown,
                     evidence: None,
+                    priority: ai_memory_core::MessagePriority::Normal,
+                    notify: ai_memory_core::NotifyOn::DEFAULT,
+                    ttl_secs: None,
                 })
                 .await
                 .unwrap();

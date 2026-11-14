@@ -171,8 +171,14 @@ impl ReaderPool {
                 MessageBox::Inbox => "to_project_id",
                 MessageBox::Outbox => "from_project_id",
             };
+            // A receipt's sender coordinate is the recipient project; it is
+            // not mail that project sent.
+            let kind = match mailbox {
+                MessageBox::Inbox => "",
+                MessageBox::Outbox => " AND kind='message'",
+            };
             let mut stmt = conn.prepare(&format!(
-                "SELECT {} FROM agent_messages WHERE {scope}=?1 AND {proj}=?2 \
+                "SELECT {} FROM agent_messages WHERE {scope}=?1 AND {proj}=?2{kind} \
                  AND (?5 IS NULL OR state=?5) \
                  ORDER BY created_at DESC,id DESC LIMIT ?3 OFFSET ?4",
                 crate::ops::MESSAGE_COLUMNS

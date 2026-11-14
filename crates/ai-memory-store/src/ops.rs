@@ -2634,7 +2634,10 @@ fn refresh_incoming_links_for_path(
 /// Begin (or re-affirm) a session row keyed on the caller-supplied id.
 /// Idempotent: a second call with the same id leaves the row untouched.
 pub fn begin_session(conn: &mut Connection, session: &NewSession) -> StoreResult<()> {
-    begin_session_row(conn, session)
+    let tx = conn.transaction()?;
+    begin_session_row(&tx, session)?;
+    tx.commit()?;
+    Ok(())
 }
 
 pub(crate) fn begin_session_in_transaction(
@@ -2683,7 +2686,7 @@ fn session_is_purged(conn: &Connection, session: &NewSession) -> StoreResult<boo
     )? == 1)
 }
 
-fn begin_session_row(conn: &Connection, session: &NewSession) -> StoreResult<()> {
+fn begin_session_row(conn: &Transaction<'_>, session: &NewSession) -> StoreResult<()> {
     validate_identity_storage_key(session.actor_user.as_deref(), "session owner")?;
     // A purge must be terminal. The events that produced a session can still
     // be sitting undelivered in a client hook spool; without this check the
@@ -2702,7 +2705,7 @@ fn begin_session_row(conn: &Connection, session: &NewSession) -> StoreResult<()>
         .cwd
         .as_ref()
         .map(|p| p.to_string_lossy().into_owned());
-    conn.execute(
+    let inserted = conn.execute(
         "INSERT INTO sessions \
          (id, workspace_id, project_id, agent_kind, cwd, started_at, actor_user) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
@@ -2717,6 +2720,15 @@ fn begin_session_row(conn: &Connection, session: &NewSession) -> StoreResult<()>
             session.actor_user.as_deref(),
         ],
     )?;
+    if inserted > 0 {
+        crate::message_delivery::register_agent_in_tx(
+            conn,
+            &session.workspace_id,
+            &session.project_id,
+            session.agent_kind,
+            now,
+        )?;
+    }
     Ok(())
 }
 
@@ -3581,6 +3593,13 @@ pub fn admit_hook_session_event(
             tx.execute(
                 "INSERT INTO sessions (id, workspace_id, project_id, agent_kind, cwd, started_at, actor_user) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![session.id.as_bytes(), session.workspace_id.as_bytes(), session.project_id.as_bytes(), session.agent_kind.as_str(), session.cwd.as_ref().map(|p| p.to_string_lossy().into_owned()), started_at, session.actor_user.as_deref()],
+            )?;
+            crate::message_delivery::register_agent_in_tx(
+                &tx,
+                &session.workspace_id,
+                &session.project_id,
+                session.agent_kind,
+                started_at,
             )?;
             (
                 session.actor_user.clone(),
@@ -6120,12 +6139,15 @@ fn bound_message_evidence(value: &str) -> String {
     ai_memory_core::truncate_utf8_bytes(value, MESSAGE_EVIDENCE_MAX_BYTES)
 }
 
-/// Read one message row into the materialized view. Column order must match the
-/// SELECTs in this module and in [`crate::reader`].
+/// Read one message row into the materialized view. Column order must match
+/// [`MESSAGE_COLUMNS`].
 pub(crate) fn row_to_agent_message(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<StoreResult<ai_memory_core::AgentMessage>> {
-    use ai_memory_core::{AgentMessage, MessageNature, MessageOrigin, MessageState};
+    use ai_memory_core::{
+        AgentMessage, DeliveryReason, DeliveryReceipt, DeliveryState, MessageDelivery, MessageKind,
+        MessageNature, MessageOrigin, MessagePriority, MessageState, NotifyOn, ReceiptOutcome,
+    };
     let id_bytes: Vec<u8> = row.get(0)?;
     let from_ws: Vec<u8> = row.get(1)?;
     let from_pj: Vec<u8> = row.get(2)?;
@@ -6140,14 +6162,52 @@ pub(crate) fn row_to_agent_message(
     let claimed_at_us: Option<i64> = row.get(11)?;
     let nature: Option<String> = row.get(12)?;
     let evidence: Option<String> = row.get(13)?;
+    let to_agent: Option<String> = row.get(14)?;
+    let kind: String = row.get(15)?;
+    let priority: String = row.get(16)?;
+    let notify: String = row.get(17)?;
+    let expires_us: Option<i64> = row.get(18)?;
+    let alert_us: Option<i64> = row.get(19)?;
+    let delivery_state: String = row.get(20)?;
+    let delivery_reason: Option<String> = row.get(21)?;
+    let retry_after_us: Option<i64> = row.get(22)?;
+    let receipt_for: Option<Vec<u8>> = row.get(23)?;
+    let receipt_outcome: Option<String> = row.get(24)?;
+    let receipt_reason: Option<String> = row.get(25)?;
     Ok((|| {
+        let ts = |us: i64, what: &str| {
+            jiff::Timestamp::from_microsecond(us).map_err(|e| {
+                StoreError::Memory(ai_memory_core::MemoryError::MalformedRecord(format!(
+                    "bad {what}: {e}"
+                )))
+            })
+        };
+        let created_at = ts(created_us, "created_at")?;
+        let kind = kind.parse::<MessageKind>().map_err(StoreError::from)?;
+        let receipt = match (kind, receipt_outcome) {
+            (MessageKind::Receipt, Some(outcome)) => Some(DeliveryReceipt {
+                schema: ai_memory_core::message_delivery::RECEIPT_SCHEMA,
+                receipt_for: receipt_for
+                    .as_deref()
+                    .map(MessageId::from_slice)
+                    .transpose()?,
+                outcome: outcome
+                    .parse::<ReceiptOutcome>()
+                    .map_err(StoreError::from)?,
+                reason: receipt_reason
+                    .as_deref()
+                    .map(str::parse::<DeliveryReason>)
+                    .transpose()
+                    .map_err(StoreError::from)?,
+                at: created_at,
+            }),
+            _ => None,
+        };
         Ok(AgentMessage {
             id: MessageId::from_slice(&id_bytes)?,
             to_workspace_id: WorkspaceId::from_slice(&to_ws)?,
             to_project_id: ProjectId::from_slice(&to_pj)?,
-            to_agent: row
-                .get::<_, Option<String>>(14)?
-                .map(|s| AgentKind::from_wire(&s)),
+            to_agent: to_agent.map(|s| AgentKind::from_wire(&s)),
             origin: MessageOrigin {
                 from_workspace_id: WorkspaceId::from_slice(&from_ws)?,
                 from_project_id: ProjectId::from_slice(&from_pj)?,
@@ -6163,19 +6223,27 @@ pub(crate) fn row_to_agent_message(
                 .map_err(StoreError::from)?,
             evidence,
             state: state.parse::<MessageState>().map_err(StoreError::from)?,
-            created_at: jiff::Timestamp::from_microsecond(created_us).map_err(|e| {
-                StoreError::Memory(ai_memory_core::MemoryError::MalformedRecord(format!(
-                    "bad created_at: {e}"
-                )))
-            })?,
-            claimed_at: claimed_at_us
-                .map(jiff::Timestamp::from_microsecond)
-                .transpose()
-                .map_err(|e| {
-                    StoreError::Memory(ai_memory_core::MemoryError::MalformedRecord(format!(
-                        "bad claimed_at: {e}"
-                    )))
-                })?,
+            created_at,
+            claimed_at: claimed_at_us.map(|us| ts(us, "claimed_at")).transpose()?,
+            kind,
+            priority: priority
+                .parse::<MessagePriority>()
+                .map_err(StoreError::from)?,
+            delivery: MessageDelivery {
+                state: delivery_state
+                    .parse::<DeliveryState>()
+                    .map_err(StoreError::from)?,
+                reason: delivery_reason
+                    .as_deref()
+                    .map(str::parse::<DeliveryReason>)
+                    .transpose()
+                    .map_err(StoreError::from)?,
+                retry_after: retry_after_us.map(|us| ts(us, "retry_after")).transpose()?,
+                expires_at: expires_us.map(|us| ts(us, "expires_at")).transpose()?,
+                no_pop_alert_at: alert_us.map(|us| ts(us, "no_pop_alert_at")).transpose()?,
+                notify: notify.parse::<NotifyOn>().map_err(StoreError::from)?,
+            },
+            receipt,
         })
     })())
 }
@@ -6183,15 +6251,36 @@ pub(crate) fn row_to_agent_message(
 /// The stable column list backing [`row_to_agent_message`].
 pub(crate) const MESSAGE_COLUMNS: &str = "id, from_workspace_id, from_project_id, from_agent, \
      from_owner_user, to_workspace_id, to_project_id, subject, body, state, created_at, claimed_at, \
-     nature, evidence, to_agent";
+     nature, evidence, to_agent, kind, priority, notify, expires_at, no_pop_alert_at, \
+     delivery_state, delivery_reason, retry_after, receipt_for, receipt_outcome, receipt_reason";
 
 /// Send a message into a recipient project's inbox.
 ///
 /// Fails closed with [`StoreError::InvalidState`] when the recipient inbox is
 /// already at [`MAX_PENDING_INBOX_MESSAGES`] pending — the caller surfaces this
 /// as a full-inbox rejection rather than flooding the recipient.
-pub fn insert_message(conn: &mut Connection, m: &NewAgentMessage) -> StoreResult<MessageId> {
+///
+/// The message is stamped with the deadlines `policy` gives its priority
+/// (a requested time to live only shortens them). Mail addressed to a harness
+/// that has never run in the recipient project is accepted with delivery
+/// state `awaiting_agent`.
+pub fn insert_message(
+    conn: &mut Connection,
+    m: &NewAgentMessage,
+    policy: &ai_memory_core::DeliveryPolicy,
+) -> StoreResult<MessageId> {
     validate_identity_storage_key(m.from_owner_user.as_deref(), "message sender")?;
+    if let Some(ttl) = m.ttl_secs
+        && !(ai_memory_core::message_delivery::MIN_MESSAGE_TTL_SECS
+            ..=ai_memory_core::message_delivery::MAX_MESSAGE_TTL_SECS)
+            .contains(&ttl)
+    {
+        return Err(StoreError::Memory(
+            ai_memory_core::MemoryError::InvalidInput(
+                "ttl_seconds is outside the allowed range".into(),
+            ),
+        ));
+    }
     if m.nature == ai_memory_core::MessageNature::Measured
         && m.evidence
             .as_deref()
@@ -6224,12 +6313,32 @@ pub fn insert_message(conn: &mut Connection, m: &NewAgentMessage) -> StoreResult
     let body = bound_message_field(&m.body);
     let evidence = m.evidence.as_deref().map(bound_message_evidence);
     let from_session: Option<&[u8]> = m.from_session_id.as_ref().map(|s| &s.as_bytes()[..]);
+    let deadlines = policy.deadlines(m.priority, m.ttl_secs, now);
+    let awaiting = match m.to_agent {
+        Some(agent) => !crate::message_delivery::agent_is_registered(
+            &tx,
+            &m.to_workspace_id,
+            &m.to_project_id,
+            agent,
+        )?,
+        None => false,
+    };
+    let (delivery_state, delivery_reason) = if awaiting {
+        (
+            ai_memory_core::DeliveryState::AwaitingAgent,
+            Some(ai_memory_core::DeliveryReason::AgentNotRegistered),
+        )
+    } else {
+        (ai_memory_core::DeliveryState::Queued, None)
+    };
     tx.execute(
         "INSERT INTO agent_messages ( \
              id, from_workspace_id, from_project_id, from_agent, from_session_id, \
              from_owner_user, to_workspace_id, to_project_id, subject, body, state, created_at, \
-             nature, evidence, to_agent \
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', ?11, ?12, ?13, ?14)",
+             nature, evidence, to_agent, kind, priority, notify, expires_at, no_pop_alert_at, \
+             delivery_state, delivery_reason \
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', ?11, ?12, ?13, ?14, \
+             'message', ?15, ?16, ?17, ?18, ?19, ?20)",
         params![
             id.as_bytes(),
             m.from_workspace_id.as_bytes(),
@@ -6245,6 +6354,12 @@ pub fn insert_message(conn: &mut Connection, m: &NewAgentMessage) -> StoreResult
             m.nature.as_str(),
             evidence,
             m.to_agent.map(|a| a.as_str()),
+            m.priority.as_str(),
+            m.notify.as_canonical(),
+            deadlines.expires_at_us,
+            deadlines.no_pop_alert_at_us,
+            delivery_state.as_str(),
+            delivery_reason.map(|r| r.as_str()),
         ],
     )?;
     // Audit records the lifecycle event under the recipient scope (the crossing
@@ -6267,11 +6382,18 @@ pub fn insert_message(conn: &mut Connection, m: &NewAgentMessage) -> StoreResult
 /// With `specific_id`, pops that message; otherwise the oldest pending one.
 /// Returns `None` when nothing matched or another session claimed it first.
 /// Mirrors [`accept_handoff_in_transaction`]'s two `state='pending'` guards.
-pub fn pop_message(
+///
+/// The claim also marks the message `delivered` and, when its sender asked
+/// for `success`, queues a receipt; the second value names the inbox that
+/// gained that receipt.
+pub(crate) fn pop_message(
     conn: &mut Connection,
     claim: &MessageClaim,
     specific_id: Option<MessageId>,
-) -> StoreResult<Option<ai_memory_core::AgentMessage>> {
+) -> StoreResult<(
+    Option<ai_memory_core::AgentMessage>,
+    Option<crate::message_delivery::NewInboxRow>,
+)> {
     let tx = conn.transaction()?;
     let popped = pop_message_in_transaction(&tx, claim, specific_id)?;
     tx.commit()?;
@@ -6282,7 +6404,10 @@ pub(crate) fn pop_message_in_transaction(
     tx: &Transaction<'_>,
     claim: &MessageClaim,
     specific_id: Option<MessageId>,
-) -> StoreResult<Option<ai_memory_core::AgentMessage>> {
+) -> StoreResult<(
+    Option<ai_memory_core::AgentMessage>,
+    Option<crate::message_delivery::NewInboxRow>,
+)> {
     validate_identity_storage_key(claim.claiming_user.as_deref(), "message recipient")?;
     // Choose the target: an explicit id, or the oldest pending in this inbox.
     let target: Option<MessageId> = match specific_id {
@@ -6305,7 +6430,7 @@ pub(crate) fn pop_message_in_transaction(
             .transpose()?,
     };
     let Some(target) = target else {
-        return Ok(None);
+        return Ok((None, None));
     };
     // Guard 1: metadata lookup, scoped to the recipient coordinate. A message
     // addressed to another project (or already popped/cancelled) is invisible.
@@ -6325,7 +6450,7 @@ pub(crate) fn pop_message_in_transaction(
         .optional()?
         .is_some();
     if !exists {
-        return Ok(None);
+        return Ok((None, None));
     }
     // Guard 2: atomic compare-and-set. Only one racing session flips
     // 'pending' -> 'claimed'; a loser changes 0 rows and gets nothing.
@@ -6347,8 +6472,9 @@ pub(crate) fn pop_message_in_transaction(
         ],
     )?;
     if changed == 0 {
-        return Ok(None);
+        return Ok((None, None));
     }
+    let receipt = crate::message_delivery::mark_delivered(tx, &target, now)?;
     audit(
         tx,
         "pop_message",
@@ -6374,7 +6500,7 @@ pub(crate) fn pop_message_in_transaction(
         )
         .optional()?
         .transpose()?;
-    Ok(message)
+    Ok((message, receipt))
 }
 
 /// Cancel (retract) pending outbox messages a project has sent. With
@@ -6389,23 +6515,47 @@ pub fn cancel_messages(
 ) -> StoreResult<u64> {
     let now = Timestamp::now().as_microsecond();
     let tx = conn.transaction()?;
-    let changed = match specific_id {
-        Some(id) => tx.execute(
-            "UPDATE agent_messages SET state = 'cancelled' \
-             WHERE id = ?1 AND from_workspace_id = ?2 AND from_project_id = ?3 \
-               AND state = 'pending'",
-            params![
-                id.as_bytes(),
-                from_workspace_id.as_bytes(),
-                from_project_id.as_bytes()
-            ],
-        )?,
-        None => tx.execute(
-            "UPDATE agent_messages SET state = 'cancelled' \
-             WHERE from_workspace_id = ?1 AND from_project_id = ?2 AND state = 'pending'",
-            params![from_workspace_id.as_bytes(), from_project_id.as_bytes()],
-        )?,
+    // Receipts carry the recipient project as their sender coordinate, so the
+    // `kind` guard keeps a recipient from retracting the receipts about it.
+    const SET: &str = "UPDATE agent_messages SET state = 'cancelled', \
+         delivery_state = 'cancelled', delivery_reason = 'sender_cancelled', \
+         no_pop_alert_at = NULL";
+    let cancelled: Vec<Vec<u8>> = match specific_id {
+        Some(id) => tx
+            .prepare(&format!(
+                "{SET} WHERE id = ?1 AND from_workspace_id = ?2 AND from_project_id = ?3 \
+                   AND state = 'pending' AND kind = 'message' RETURNING id"
+            ))?
+            .query_map(
+                params![
+                    id.as_bytes(),
+                    from_workspace_id.as_bytes(),
+                    from_project_id.as_bytes()
+                ],
+                |row| row.get(0),
+            )?
+            .collect::<rusqlite::Result<_>>()?,
+        None => tx
+            .prepare(&format!(
+                "{SET} WHERE from_workspace_id = ?1 AND from_project_id = ?2 \
+                   AND state = 'pending' AND kind = 'message' RETURNING id"
+            ))?
+            .query_map(
+                params![from_workspace_id.as_bytes(), from_project_id.as_bytes()],
+                |row| row.get(0),
+            )?
+            .collect::<rusqlite::Result<_>>()?,
     };
+    for id in &cancelled {
+        crate::message_delivery::record_event(
+            &tx,
+            id,
+            now,
+            ai_memory_core::DeliveryEventKind::Cancelled,
+            Some(ai_memory_core::DeliveryReason::SenderCancelled),
+        )?;
+    }
+    let changed = cancelled.len();
     if changed > 0 {
         audit(
             &tx,
@@ -6439,7 +6589,7 @@ pub fn begin_message_edit(
     let changed = tx.execute(
         "UPDATE agent_messages SET state = 'editing' \
          WHERE id = ?1 AND to_workspace_id = ?2 AND to_project_id = ?3 \
-           AND state = 'pending'",
+           AND state = 'pending' AND kind = 'message'",
         params![
             id.as_bytes(),
             to_workspace_id.as_bytes(),
@@ -18429,7 +18579,11 @@ pub(crate) mod tests {
                         nature: ai_memory_core::MessageNature::Unknown,
                         evidence: None,
                         to_agent: None,
+                        priority: ai_memory_core::MessagePriority::Normal,
+                        notify: ai_memory_core::NotifyOn::DEFAULT,
+                        ttl_secs: None,
                     },
+                    &ai_memory_core::DeliveryPolicy::default(),
                 )
                 .unwrap();
                 match state {
@@ -18446,7 +18600,7 @@ pub(crate) mod tests {
                             Some(id),
                         )
                         .unwrap();
-                        assert!(claimed.is_some());
+                        assert!(claimed.0.is_some());
                     }
                     "cancelled" => {
                         assert_eq!(

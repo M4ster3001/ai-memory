@@ -13,6 +13,30 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- Added delivery states and receipts for agent messages. Every message now
+  carries a `delivery` block (`queued`, `awaiting_agent`, `delivered`,
+  `expired` or `cancelled`, a reason from a fixed list, `expires_at` and
+  `notify`), shown by `memory_message_list` and returned by
+  `memory_message_send`. The outbox takes `include_settled` and `message_id`.
+  Messages expire by priority (`low` 7 days, `normal` 3 days, `high` 24
+  hours), and `normal` and `high` mail gets a "not popped yet" alert after 2
+  hours or 15 minutes; a sender can shorten the time to live with
+  `ttl_seconds`. When asked through `notify` (default `failure,delay`), the
+  server puts a receipt in the sender's inbox: a row with `kind: "receipt"`
+  built only from ids, fixed values and timestamps, at most one per message
+  and outcome, never receipted itself, and dropped when the sender's inbox is
+  full. A one-minute server sweep handles at most 100 messages per pass. New
+  `ai-memory message status --id`, `message list --include-settled`, the
+  `--priority`, `--ttl-seconds` and `--notify` flags of `message send`,
+  `GET /admin/messages/status`, a delivery badge in the web Sent view and the
+  `[messaging]` settings `ttl_low_days`, `ttl_normal_days`, `ttl_high_hours`,
+  `no_pop_alert_normal_minutes` and `no_pop_alert_high_minutes`. Mail sent
+  before the upgrade never expires and sends no receipts. See
+  [`docs/agent-messaging.md`](docs/agent-messaging.md#delivery-states-and-receipts).
+- Added `ai_memory_core::quota::quota_signal`, the credit and quota classifier
+  that the LLM fallback used privately, so a harness's captured output can be
+  classified with the same markers. It also reads a stated
+  `resets_in_seconds`. LLM fallback behavior is unchanged.
 - Added `ai-memory message watch`, which waits for new inbox mail without a
   model. It long-polls the new `GET /inbox/watch` route, and the server answers
   as soon as a send to that inbox and harness commits, so a reply is announced
@@ -42,6 +66,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Changed
 
+- `memory_message_send` and the web composer no longer refuse `to_agent`
+  for a harness that has never started a session in the recipient project.
+  The message is queued with delivery state `awaiting_agent`, becomes
+  `queued` when that harness first starts a session there, and expires like
+  any other message. Harnesses are recorded in a new agent registry, filled
+  from existing sessions on upgrade.
 - `/web/search` with no search term lists the ten most recently updated
   pages, from the selected project or from every project the viewer can read.
   It used to show only an empty prompt.

@@ -144,6 +144,9 @@ async fn send(h: &Harness, to_agent: Option<AgentKind>, subject: &str, body: &st
             body: body.into(),
             nature: MessageNature::Unknown,
             evidence: None,
+            priority: ai_memory_core::MessagePriority::Normal,
+            notify: ai_memory_core::NotifyOn::DEFAULT,
+            ttl_secs: None,
         })
         .await
         .unwrap()

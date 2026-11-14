@@ -75,6 +75,15 @@ pub(crate) enum WriteCmd {
         mode: crate::AccessMode,
         reply: oneshot::Sender<StoreResult<()>>,
     },
+    SetMessageDeliveryPolicy {
+        policy: ai_memory_core::DeliveryPolicy,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
+    SweepMessageDeadlines {
+        now_us: i64,
+        batch: usize,
+        reply: oneshot::Sender<StoreResult<crate::message_delivery::DeadlineSweepOutcome>>,
+    },
     SetAccessMode {
         project_id: ProjectId,
         mode: crate::AccessMode,
@@ -1079,6 +1088,42 @@ impl WriterHandle {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::SetNewProjectMode { mode, reply: tx })
             .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Set the deadlines new messages are stamped with (`[messaging]`). Sent
+    /// once at startup; until then the design defaults apply.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] if the actor has shut down.
+    pub async fn set_message_delivery_policy(
+        &self,
+        policy: ai_memory_core::DeliveryPolicy,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::SetMessageDeliveryPolicy { policy, reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Expire due messages and record due "not popped yet" alerts, at most
+    /// `batch` rows (capped at [`crate::MAX_SWEEP_BATCH`]) in one
+    /// transaction, queueing the receipts their senders asked for.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn sweep_message_deadlines(
+        &self,
+        now_us: i64,
+        batch: usize,
+    ) -> StoreResult<crate::DeadlineSweepOutcome> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::SweepMessageDeadlines {
+            now_us,
+            batch,
+            reply: tx,
+        })
+        .await?;
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
@@ -4049,11 +4094,37 @@ fn worker_loop(
     // this actor performs every project insert, so no creation path can
     // forget to apply it.
     let mut new_project_mode = crate::AccessMode::Open;
+    // Deadlines for new messages (`[messaging]`), set once at startup like
+    // the project mode above.
+    let mut delivery_policy = ai_memory_core::DeliveryPolicy::default();
+    let signal = |row: crate::message_delivery::NewInboxRow| {
+        inbox_signals.notify(row.workspace_id, row.project_id, row.to_agent);
+    };
     while let Some(cmd) = rx.blocking_recv() {
         match cmd {
             WriteCmd::SetNewProjectMode { mode, reply } => {
                 new_project_mode = mode;
                 send_or_warn(reply, Ok(()), "set_new_project_mode");
+            }
+            WriteCmd::SetMessageDeliveryPolicy { policy, reply } => {
+                delivery_policy = policy;
+                send_or_warn(reply, Ok(()), "set_message_delivery_policy");
+            }
+            WriteCmd::SweepMessageDeadlines {
+                now_us,
+                batch,
+                reply,
+            } => {
+                let result = conn.transaction().map_err(StoreError::from).and_then(|tx| {
+                    let outcome =
+                        crate::message_delivery::sweep_message_deadlines(&tx, now_us, batch)?;
+                    tx.commit()?;
+                    Ok(outcome)
+                });
+                if let Ok(outcome) = &result {
+                    outcome.new_rows.iter().copied().for_each(signal);
+                }
+                send_or_warn(reply, result, "sweep_message_deadlines");
             }
             WriteCmd::SetAccessMode {
                 project_id,
@@ -4647,7 +4718,7 @@ fn worker_loop(
                 send_or_warn(reply, result, "cancel_handoff");
             }
             WriteCmd::InsertMessage { message, reply } => {
-                let result = ops::insert_message(&mut conn, &message);
+                let result = ops::insert_message(&mut conn, &message, &delivery_policy);
                 // After the commit and before the reply, so a sender that
                 // reads its id back has already woken the recipient's waiters.
                 if result.is_ok() {
@@ -4664,7 +4735,11 @@ fn worker_loop(
                 specific_id,
                 reply,
             } => {
-                let result = ops::pop_message(&mut conn, &claim, specific_id);
+                let result =
+                    ops::pop_message(&mut conn, &claim, specific_id).map(|(message, receipt)| {
+                        receipt.into_iter().for_each(signal);
+                        message
+                    });
                 send_or_warn(reply, result, "pop_message");
             }
             WriteCmd::BeginMessageEdit {

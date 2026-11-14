@@ -9558,28 +9558,121 @@ impl ReaderPool {
         mailbox: MessageBox,
         limit: usize,
     ) -> StoreResult<Vec<AgentMessage>> {
+        self.list_messages_filtered(
+            workspace_id,
+            project_id,
+            mailbox,
+            crate::MessageListFilter::default(),
+            limit,
+        )
+        .await
+    }
+
+    /// [`Self::list_messages`] with the sender's view options. With
+    /// `include_settled`, rows in every state are listed, newest first;
+    /// `message_id` narrows the listing to one message of this mailbox side.
+    /// The outbox never lists receipts: their sender coordinate is the
+    /// recipient project, and they are not that project's mail to manage.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn list_messages_filtered(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        mailbox: MessageBox,
+        filter: crate::MessageListFilter,
+        limit: usize,
+    ) -> StoreResult<Vec<AgentMessage>> {
         let limit = limit.clamp(1, 200);
         self.with_conn(move |conn| {
             // Scope by the coordinate that owns this side of the mailbox: a
             // project only ever sees mail TO it (inbox) or FROM it (outbox).
             let predicate = match mailbox {
                 MessageBox::Inbox => "to_workspace_id = ?1 AND to_project_id = ?2",
-                MessageBox::Outbox => "from_workspace_id = ?1 AND from_project_id = ?2",
+                MessageBox::Outbox => {
+                    "from_workspace_id = ?1 AND from_project_id = ?2 AND kind = 'message'"
+                }
+            };
+            let (state, order) = if filter.include_settled {
+                ("", "created_at DESC, id DESC")
+            } else {
+                (" AND state = 'pending'", "created_at ASC")
             };
             let sql = format!(
                 "SELECT {cols} FROM agent_messages \
-                 WHERE {predicate} AND state = 'pending' \
-                 ORDER BY created_at ASC LIMIT {limit}",
+                 WHERE {predicate}{state} AND (?3 IS NULL OR id = ?3) \
+                 ORDER BY {order} LIMIT {limit}",
                 cols = crate::ops::MESSAGE_COLUMNS,
             );
             let mut stmt = conn.prepare(&sql)?;
             let rows = stmt.query_map(
-                params![workspace_id.as_bytes(), project_id.as_bytes()],
+                params![
+                    workspace_id.as_bytes(),
+                    project_id.as_bytes(),
+                    filter.message_id.as_ref().map(|id| &id.as_bytes()[..]),
+                ],
                 crate::ops::row_to_agent_message,
             )?;
             let mut out = Vec::new();
             for row in rows {
                 out.push(row??);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// The delivery timeline of one message this project sent, oldest first.
+    /// Scoped to the sender coordinate: a message id from another project's
+    /// outbox reads as an empty timeline.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn message_delivery_events(
+        &self,
+        from_workspace_id: WorkspaceId,
+        from_project_id: ProjectId,
+        message_id: MessageId,
+    ) -> StoreResult<Vec<crate::DeliveryEvent>> {
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT e.at, e.event, e.reason FROM message_delivery_events e \
+                 JOIN agent_messages m ON m.id = e.message_id \
+                 WHERE e.message_id = ?1 AND m.from_workspace_id = ?2 \
+                   AND m.from_project_id = ?3 AND m.kind = 'message' \
+                 ORDER BY e.at ASC, e.id ASC LIMIT 200",
+            )?;
+            let rows = stmt.query_map(
+                params![
+                    message_id.as_bytes(),
+                    from_workspace_id.as_bytes(),
+                    from_project_id.as_bytes()
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (at, event, reason) = row?;
+                out.push(crate::DeliveryEvent {
+                    at: jiff::Timestamp::from_microsecond(at).map_err(|e| {
+                        StoreError::Memory(ai_memory_core::MemoryError::MalformedRecord(format!(
+                            "bad event time: {e}"
+                        )))
+                    })?,
+                    event: event.parse().map_err(StoreError::from)?,
+                    reason: reason
+                        .as_deref()
+                        .map(str::parse)
+                        .transpose()
+                        .map_err(StoreError::from)?,
+                });
             }
             Ok(out)
         })

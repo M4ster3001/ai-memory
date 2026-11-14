@@ -944,9 +944,10 @@ export interface SendMessageArgs {
   /** Sending project. Defaults to the client's `scope`. */
   from?: Scope;
   /**
-   * Restrict claiming to this registered harness in the recipient project
-   * (for example `codex` or `claude-code`); the server refuses a harness with
-   * no session there. Omit for shared project mail.
+   * Restrict claiming to this harness in the recipient project (for example
+   * `codex` or `claude-code`). A harness that has never run there is
+   * accepted with delivery state `awaiting_agent`. Omit for shared project
+   * mail.
    */
   toAgent?: string;
   /**
@@ -962,6 +963,12 @@ export interface SendMessageArgs {
   nature?: "unknown" | "measured" | "reported" | "inferred";
   /** Supporting evidence. Required by the server when `nature` is `measured`. */
   evidence?: string;
+  /** Picks the default time to live and the "not popped yet" alert. Defaults to `normal`. */
+  priority?: "low" | "normal" | "high";
+  /** A shorter time to live, 60 to 2592000 seconds. Never extends the priority's default. */
+  ttlSeconds?: number;
+  /** Receipts to receive in the sender's inbox. Defaults to `["failure", "delay"]`. */
+  notify?: ReadonlyArray<"never" | "failure" | "delay" | "success">;
 }
 
 /** Result of {@link MessagesNamespace.send}. */
@@ -984,7 +991,7 @@ export interface Message {
   readonly nature: "unknown" | "measured" | "reported" | "inferred";
   /** Supporting evidence, or `null`. */
   readonly evidence: UntrustedText | null;
-  /** `pending`, `editing`, `claimed` or `cancelled`. */
+  /** `pending`, `editing`, `claimed`, `cancelled` or `expired`. Delivery state and receipts are in `raw` (`delivery`, `kind`, `receipt`). */
   readonly state: string;
   /** Send time. */
   readonly createdAt: string | undefined;
@@ -1006,6 +1013,10 @@ export interface ListMessagesArgs extends ScopedArgs {
   box?: "inbox" | "outbox";
   /** Maximum messages (default 50, clamped to 200). */
   limit?: number;
+  /** Outbox only: list sent mail in every state, newest first. */
+  includeSettled?: boolean;
+  /** Outbox only: list just this sent message. */
+  messageId?: string;
 }
 
 /** Result of {@link MessagesNamespace.list}. */

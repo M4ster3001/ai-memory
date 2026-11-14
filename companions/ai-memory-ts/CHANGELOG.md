@@ -10,6 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `messages.send` accepts `priority`, `ttlSeconds` (sent as `ttl_seconds`)
+  and `notify`, and `messages.list` accepts `includeSettled` and `messageId`
+  for the outbox, matching the server's new message delivery states and
+  receipts. The delivery block, `kind` and `receipt` are in each message's
+  `raw`. The schema snapshot includes the new fields.
 - `observations` documents the server's new `session_id: "current"`: the
   server resolves it only for a request carrying the caller's hook session
   id, which this client does not send, so SDK callers pass the id. (#1983)

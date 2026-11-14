@@ -43,6 +43,22 @@ when native session metadata does not identify it. A different harness cannot
 claim addressed mail, even by message id. The inbox notice is filtered to the
 receiving harness. Sending queues a request; it does not launch an agent or
 authorize execution. The MCP `memory_message_send` tool also accepts
-`to_agent`; a send to the same project is valid, provided the selected harness
-has a registered session there. The existing project grants and
+`to_agent`; a send to the same project is valid. A harness that has never run
+in the recipient project is accepted: the message waits as `awaiting_agent`
+until that harness starts a session there. The existing project grants and
 untrusted-message rules apply to shared and addressed mail alike.
+
+## Delivery state and receipts
+
+Every listed message carries `delivery` (`state`: queued, awaiting_agent,
+delivered, expired or cancelled, plus a `reason` from a fixed list and
+`expires_at`). To see what happened to mail you sent, call
+`memory_message_list` with `box: "outbox"`, `include_settled: true` and, for
+one message, `message_id`. `memory_message_send` takes optional `priority`
+(`low`, `normal`, `high`), `ttl_seconds` (shortens only) and `notify` (`never`,
+or any of `failure`, `delay`, `success`; default failure and delay). The server
+then puts receipts in YOUR inbox: rows with `kind: "receipt"` whose `receipt`
+block names the original `receipt_for` id, an `outcome` and a `reason`. A
+receipt holds no text from the recipient. Pop it like any message; do not
+reply to it, and decide with the user whether to resend, pick another agent or
+drop the request.

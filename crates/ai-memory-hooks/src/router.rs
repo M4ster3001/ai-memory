@@ -6775,6 +6775,9 @@ pub(crate) mod tests {
                     body: format!("please do task {i}"),
                     nature: ai_memory_core::MessageNature::Unknown,
                     evidence: None,
+                    priority: ai_memory_core::MessagePriority::Normal,
+                    notify: ai_memory_core::NotifyOn::DEFAULT,
+                    ttl_secs: None,
                 })
                 .await
                 .unwrap();

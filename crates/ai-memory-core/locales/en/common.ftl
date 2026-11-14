@@ -74,6 +74,7 @@ common-status-pending = pending
 common-status-claimed = collected
 common-status-cancelled = cancelled
 common-status-editing = editing
+common-status-expired = expired
 common-status-disabled = disabled
 common-status-unknown = unknown
 common-status-ok = ok

@@ -19,6 +19,9 @@ use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use crate::ids::{AgentKind, MessageId, ProjectId, SessionId, WorkspaceId};
+use crate::message_delivery::{
+    DeliveryReceipt, MessageDelivery, MessageKind, MessagePriority, NotifyOn,
+};
 
 /// Security notice fenced around a popped cross-project message body. The body
 /// was composed by another project's agent, so it is untrusted input to the
@@ -45,6 +48,8 @@ pub enum MessageState {
     /// The sender took it out of the queue to edit it. It cannot be popped
     /// until the edit is saved or released, which returns it to `Pending`.
     Editing,
+    /// Its time to live passed before anyone popped it. Terminal.
+    Expired,
 }
 
 /// How the sender knows the claim carried by a cross-project message.
@@ -104,6 +109,7 @@ impl MessageState {
             Self::Claimed => "claimed",
             Self::Cancelled => "cancelled",
             Self::Editing => "editing",
+            Self::Expired => "expired",
         }
     }
 }
@@ -117,6 +123,7 @@ impl std::str::FromStr for MessageState {
             "claimed" => Ok(Self::Claimed),
             "cancelled" => Ok(Self::Cancelled),
             "editing" => Ok(Self::Editing),
+            "expired" => Ok(Self::Expired),
             other => Err(crate::MemoryError::MalformedRecord(format!(
                 "unknown message state: {other}"
             ))),
@@ -163,6 +170,15 @@ pub struct NewAgentMessage {
     pub nature: MessageNature,
     /// Bounded supporting evidence. Required for [`MessageNature::Measured`].
     pub evidence: Option<String>,
+    /// Picks the default time to live and alert.
+    #[serde(default)]
+    pub priority: MessagePriority,
+    /// Which receipts the sender wants.
+    pub notify: NotifyOn,
+    /// A shorter time to live than the priority's default, in seconds. The
+    /// store never extends past the default.
+    #[serde(default)]
+    pub ttl_secs: Option<u64>,
 }
 
 /// Scope, identity, and receiver metadata for an atomic message pop.
@@ -225,4 +241,12 @@ pub struct AgentMessage {
     pub created_at: Timestamp,
     /// When it was popped, if it has been.
     pub claimed_at: Option<Timestamp>,
+    /// Agent mail or a server receipt.
+    pub kind: MessageKind,
+    /// Priority the sender chose.
+    pub priority: MessagePriority,
+    /// What happened to it, for the sender.
+    pub delivery: MessageDelivery,
+    /// The structured block of a receipt; `None` for agent mail.
+    pub receipt: Option<DeliveryReceipt>,
 }

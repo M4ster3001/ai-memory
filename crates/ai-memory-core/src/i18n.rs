@@ -350,6 +350,7 @@ impl Localizer {
             "claimed" => "common-status-claimed",
             "cancelled" => "common-status-cancelled",
             "editing" => "common-status-editing",
+            "expired" => "common-status-expired",
             "disabled" => "common-status-disabled",
             "unknown" => "common-status-unknown",
             "ok" => "common-status-ok",
