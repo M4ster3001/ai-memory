@@ -23,8 +23,9 @@ outbox).
   pop a shared message; only the named harness can claim an addressed message.
   Knowledge is shared, while messages and handoffs are claimed once.
 - **Claim-once queue.** A message is `pending` until a session in the recipient
-  project pops it (→ `claimed`, exactly once) or the sender cancels it
-  (→ `cancelled`). A second pop of the same message returns nothing.
+  project pops it (→ `claimed`, exactly once), the sender cancels it
+  (→ `cancelled`) or its time to live passes (→ `expired`). A second pop of the
+  same message returns nothing.
   Claimed and cancelled messages remain for audit. Scheduled empty-project
   cleanup preserves both the sender and recipient while any message remains;
   an explicit project or workspace purge still removes its messages.
@@ -33,6 +34,10 @@ outbox).
   turned into a dead inbox nobody reads.
 - **Bounded.** Each recipient inbox holds at most 256 pending messages; a full
   inbox rejects new sends.
+- **The sender is told what happened.** Every message has a delivery state and
+  an expiry, and the server can put a receipt in the sender's inbox when the
+  message expires, waits too long or is popped. See
+  [Delivery states and receipts](#delivery-states-and-receipts).
 - **Epistemic provenance.** A sender may classify a claim as `measured`,
   `reported`, `inferred`, or `unknown` (the compatibility default). A measured
   claim is refused unless it includes non-empty supporting `evidence`; both
@@ -52,8 +57,8 @@ Four MCP tools (documented in the installed `ai-memory-messaging` skill):
 
 | Tool | Role |
 |---|---|
-| `memory_message_send` | Send to `to_workspace` + `to_project`'s inbox; optional `to_agent` restricts claiming to a registered harness. The same project is a valid recipient. |
-| `memory_message_list` | List pending mail. `box="inbox"` (default) or `box="outbox"`. Read-only. |
+| `memory_message_send` | Send to `to_workspace` + `to_project`'s inbox; optional `to_agent` restricts claiming to one harness. Optional `priority`, `ttl_seconds` and `notify`. The same project is a valid recipient. |
+| `memory_message_list` | List pending mail. `box="inbox"` (default) or `box="outbox"`; the outbox also takes `include_settled` and `message_id`. Every row carries `delivery`. Read-only. |
 | `memory_message_pop` | Claim the next inbox message (oldest, or a specific `message_id`). |
 | `memory_message_cancel` | Retract a sent message (`message_id`), or clear the whole outbox. |
 
@@ -70,9 +75,12 @@ states a direct measurement, also send `nature: "measured"` and evidence such
 as the command, query, `file:line`, or source message id. Relayed claims should
 remain `reported` unless the sender measures them again.
 
-Set `to_agent` to a registered harness such as `codex` when only that harness
-may claim the message; the recipient project must have a session recorded for
-it. Omit `to_agent` for shared project mail. The MCP tool accepts the sender's
+Set `to_agent` to a harness such as `codex` when only that harness may claim
+the message. If that harness has never started a session in the recipient
+project, the send is still accepted: the message waits with delivery state
+`awaiting_agent` and becomes `queued` when the harness first starts a session
+there. It expires like any other message, and the sender gets a receipt if it
+does. Omit `to_agent` for shared project mail. The MCP tool accepts the sender's
 own project as the recipient too. Static MCP clients can set `from_agent` when
 the caller's session does not record its harness; a recorded session takes
 precedence, but only one that belongs to the sending project (and, on a
@@ -141,6 +149,8 @@ echo "…request…" | ai-memory message send --to-workspace default --to-projec
 
 ai-memory message list                 # this project's inbox (pending)
 ai-memory message list --outbox        # what this project has sent
+ai-memory message list --outbox --include-settled   # also delivered, expired, cancelled
+ai-memory message status --id <message-id>          # delivery state and timeline
 ai-memory message pop                  # claim the oldest inbox message
 ai-memory message pop --id <message-id>
 ai-memory message cancel --id <message-id>
@@ -148,7 +158,8 @@ ai-memory message cancel --all         # clear this project's outbox
 ```
 
 The CLI resolves the current project as the sender/reader scope, the same way
-`ai-memory handoffs` does.
+`ai-memory handoffs` does. `message send` also takes `--priority low|normal|high`,
+`--ttl-seconds N` and `--notify failure,delay,success` (or `never`).
 
 Both CLI and MCP sends run `message_send` admission against the **recipient**
 scope: deciding webhooks run before insertion, and observers run asynchronously
@@ -320,6 +331,114 @@ on `message_send` can wake a companion: the notification carries the recipient
 scope and the actor, and the companion then lists that inbox. It is the
 best-effort signal described above, not a queue and not a wakeup for the
 orchestrator. Each inbox still holds at most 256 pending messages.
+
+## Delivery states and receipts
+
+A message has two states. The queue state (`pending`, `claimed`, `cancelled`,
+`editing`, `expired`) is what the claim guards read. The delivery state tells
+the sender what happened, and its reason is always one value from a fixed list,
+never free text:
+
+| `delivery.state` | Set when | Final |
+|---|---|---|
+| `queued` | stored and claimable | no |
+| `awaiting_agent` | addressed to a harness that has never started a session in the recipient project (reason `agent_not_registered`) | no |
+| `delivered` | popped | yes |
+| `expired` | the time to live passed while it waited (reason `ttl`) | yes |
+| `cancelled` | the sender cancelled it (reason `sender_cancelled`) | yes |
+
+`wake_attempted`, `wake_failed`, `agent_unavailable`, `quota_exhausted` and
+`dead` are reserved for the wake supervisor and delivery leases described in
+[the design note](design-agent-wakeup-and-secure-messaging.md). Nothing sets
+them yet, and `retry_after` stays empty until a wake adapter reports a quota
+reset. When the "not popped yet" alert fires, a queued message keeps its state
+and gets the reason `no_pop_timeout`.
+
+### Priority and time to live
+
+| Priority | Time to live | "Not popped yet" alert |
+|---|---|---|
+| `low` | 7 days | none |
+| `normal` (default) | 3 days | after 2 hours |
+| `high` | 24 hours | after 15 minutes |
+
+The operator changes these under `[messaging]` in `config.toml`
+([configuration](config-properties.md#messaging)). A sender can shorten a
+message's life with `ttl_seconds` (60 seconds to 30 days) but never extend it
+past its priority's default. Mail sent before this release has no deadline and
+never expires.
+
+Once a minute the server runs one bounded sweep: at most 100 messages per pass,
+oldest deadline first, in one writer transaction. It expires due messages,
+records due alerts and queues the receipts that follow. It runs no command and
+calls no network service, and it runs even when scheduled maintenance is off.
+
+### Receipts
+
+A receipt is a message the server puts in the sender's inbox, modelled on SMTP
+delivery status notifications (RFC 3461 and RFC 5321). The sender picks which
+ones it wants with `notify`:
+
+| `notify` keyword | Receipt outcome | When |
+|---|---|---|
+| `failure` | `expired` | the message expired |
+| `delay` | `delayed` | the alert fired and nobody had popped it |
+| `success` | `delivered` | it was popped |
+| `never` | none | |
+
+The default is `failure,delay`. Browser sends use `never`, because the person
+watches the Sent view instead.
+
+A receipt row has `kind: "receipt"` and a `receipt` block:
+
+```json
+{"schema":"ai-memory.receipt/v1","receipt_for":"<message id>",
+ "outcome":"expired","reason":"ttl","at":"2026-11-14T18:02:11Z"}
+```
+
+Its sender coordinate is the recipient project. Its subject is
+`receipt: <outcome> <message id>` and its body comes from a fixed template.
+Every part is an id, a value from a fixed list or a timestamp; nothing the
+recipient wrote reaches it. When the original sender's session was recorded
+by the server, the receipt is addressed to that harness; otherwise it is shared
+project mail.
+
+Receipts are bounded:
+
+- A receipt never asks for a receipt and never gets an alert. The schema
+  refuses a receipt row whose `notify` is anything but `never`.
+- At most one receipt per message and outcome.
+- A receipt counts toward the sender's 256-message inbox cap. When that inbox
+  is full, the receipt is dropped and the drop is recorded in the message's
+  timeline; it is not retried.
+- A receipt expires after 7 days, silently.
+- The recipient project cannot cancel, edit or list receipts about it, even
+  though it is their sender coordinate: the outbox and `memory_message_cancel`
+  only cover `kind: "message"`.
+
+### What the sender sees
+
+- MCP: `memory_message_list` with `box: "outbox"` takes `include_settled: true`
+  (every state, newest first) and `message_id`. Every row has
+  `delivery: {state, reason, retry_after, expires_at, no_pop_alert_at, notify}`.
+  `memory_message_send` returns the same `delivery` block. Receipts arrive in
+  the inbox as ordinary rows.
+- CLI: `ai-memory message status --id <id>` prints the delivery block and the
+  timeline (`agent_registered`, `no_pop_alert`, `expired`, `delivered`,
+  `cancelled`, `receipt_sent`, `receipt_dropped`). The data comes from
+  `GET /admin/messages/status`, scoped to the sending project.
+- Web: the Sent view shows a delivery badge next to each message, escaped like
+  every other mailbox field, and the state filter includes `expired`.
+
+### Agent registry
+
+A harness counts as registered in a project once it has started a session
+there. The store records it in `agent_registrations` in the same transaction as
+that first session, and backfilled every harness that already had sessions when
+this release first opened the database. The registry decides only whether
+addressed mail is `queued` or `awaiting_agent`. It grants nothing: who may pop
+addressed mail is unchanged, and a static client may still pop by declaring
+`agent`.
 
 ## In the web UI
 

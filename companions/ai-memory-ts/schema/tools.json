@@ -474,10 +474,22 @@
           "string"
         ]
       },
+      "include_settled": {
+        "type": [
+          "boolean",
+          "null"
+        ]
+      },
       "limit": {
         "type": [
           "integer",
           "null"
+        ]
+      },
+      "message_id": {
+        "type": [
+          "null",
+          "string"
         ]
       },
       "project": {
@@ -562,6 +574,32 @@
         ],
         "type": "string"
       },
+      "notify": {
+        "items": {
+          "enum": [
+            "delay",
+            "failure",
+            "never",
+            "success"
+          ],
+          "type": "string"
+        },
+        "type": [
+          "array",
+          "null"
+        ]
+      },
+      "priority": {
+        "enum": [
+          "high",
+          "low",
+          "normal"
+        ],
+        "type": [
+          "null",
+          "string"
+        ]
+      },
       "subject": {
         "type": [
           "null",
@@ -579,6 +617,12 @@
       },
       "to_workspace": {
         "type": "string"
+      },
+      "ttl_seconds": {
+        "type": [
+          "integer",
+          "null"
+        ]
       }
     },
     "required": [

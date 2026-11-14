@@ -287,6 +287,18 @@ Defined by `EntropyFilterConfig` in `ai-memory-consolidate`. A skipped page is l
 | `claim_on_session_start` | `true` | `AI_MEMORY_HANDOFF__CLAIM_ON_SESSION_START` | Claim a pending handoff automatically at SessionStart. `false` renders a notice and waits for `memory_handoff_accept`. |
 | `create_on_session_end` | `true` | `AI_MEMORY_HANDOFF__CREATE_ON_SESSION_END` | Create an automatic open handoff when an unmanaged session ends. A hook client running with `AI_MEMORY_AUTO_HANDOFF=off` skips it for that execution only (see `docs/usage.md`). |
 
+## `[messaging]`
+
+Default deadlines of cross-project agent messages. A sender can shorten a message's time to live with `ttl_seconds`, never extend it. See [agent messaging](agent-messaging.md#delivery-states-and-receipts).
+
+| Key | Default | Env equivalent | Purpose |
+| --- | --- | --- | --- |
+| `ttl_low_days` | `7` | `AI_MEMORY_MESSAGING__TTL_LOW_DAYS` | Time to live of a `low` priority message, 1 to 365 days. |
+| `ttl_normal_days` | `3` | `AI_MEMORY_MESSAGING__TTL_NORMAL_DAYS` | Time to live of a `normal` priority message, 1 to 365 days. |
+| `ttl_high_hours` | `24` | `AI_MEMORY_MESSAGING__TTL_HIGH_HOURS` | Time to live of a `high` priority message, 1 to 8760 hours. |
+| `no_pop_alert_normal_minutes` | `120` | `AI_MEMORY_MESSAGING__NO_POP_ALERT_NORMAL_MINUTES` | Minutes before an unpopped `normal` message gets its alert and `delay` receipt. `0` turns it off. |
+| `no_pop_alert_high_minutes` | `15` | `AI_MEMORY_MESSAGING__NO_POP_ALERT_HIGH_MINUTES` | The same alert for `high` priority. `0` turns it off. |
+
 ## `[profile]`
 
 Defined by `ProfileSettings` in `ai-memory-core`.
