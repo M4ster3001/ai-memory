@@ -19,6 +19,7 @@ use crate::cli::{
     MessageArgs, MessageCancelArgs, MessageCommand, MessageListArgs, MessagePopArgs,
     MessageSendArgs,
 };
+use crate::commands::message_watch;
 use crate::config::Config;
 use crate::http_client::{ServerEndpoint, get_json, post_json};
 
@@ -69,18 +70,20 @@ struct CancelMessagesResponse {
     cancelled: u64,
 }
 
-/// Dispatch `ai-memory message`.
+/// Dispatch `ai-memory message`. Returns the process exit code, which only
+/// `watch` sets to anything but 0.
 ///
 /// # Errors
 /// Returns [`anyhow::Error`] when an explicit mutating scope or target is
 /// empty, the scope cannot be resolved, stdin cannot be read, the server is
 /// unreachable, or it answers non-2xx.
-pub async fn run(config: &Config, args: MessageArgs) -> Result<()> {
+pub async fn run(config: &Config, args: MessageArgs) -> Result<i32> {
     match args.command {
-        MessageCommand::Send(args) => send(config, args).await,
-        MessageCommand::List(args) => list(config, args).await,
-        MessageCommand::Pop(args) => pop(config, args).await,
-        MessageCommand::Cancel(args) => cancel(config, args).await,
+        MessageCommand::Send(args) => send(config, args).await.map(|()| 0),
+        MessageCommand::List(args) => list(config, args).await.map(|()| 0),
+        MessageCommand::Pop(args) => pop(config, args).await.map(|()| 0),
+        MessageCommand::Cancel(args) => cancel(config, args).await.map(|()| 0),
+        MessageCommand::Watch(args) => message_watch::run(config, args).await,
     }
 }
 

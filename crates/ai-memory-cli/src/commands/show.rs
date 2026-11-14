@@ -713,32 +713,34 @@ pub(crate) fn terminal_text(text: &str) -> String {
 pub(crate) fn terminal_body(text: &str) -> String {
     text.chars()
         .map(|character| {
-            // Control, direction-override and invisible-format characters all
-            // let a value the CLI only quotes reach the terminal as a
-            // sequence the operator did not read: C0/C1 controls and DEL
-            // (`is_control`), bidi embeddings/overrides/isolates plus the
-            // direction marks, and the zero-width space/word-joiner/BOM
-            // family (#2000). The zero-width joiner and non-joiner (U+200C,
-            // U+200D) stay: emoji sequences and Persian or Indic text need
-            // them, and page bodies and titles print through here.
-            if (character.is_control() && !matches!(character, '\n' | '\t'))
-                || matches!(
-                    character,
-                    '\u{061c}'
-                        | '\u{200b}'
-                        | '\u{200e}'..='\u{200f}'
-                        | '\u{2028}'..='\u{202e}'
-                        | '\u{2060}'..='\u{2064}'
-                        | '\u{2066}'..='\u{2069}'
-                        | '\u{feff}'
-                )
-            {
+            if terminal_unsafe(character) && !matches!(character, '\n' | '\t') {
                 '?'
             } else {
                 character
             }
         })
         .collect()
+}
+
+/// Control, direction-override and invisible-format characters all let a
+/// value the CLI only quotes reach the terminal as a sequence the operator did
+/// not read: C0/C1 controls and DEL (`is_control`), bidi
+/// embeddings/overrides/isolates plus the direction marks, and the zero-width
+/// space/word-joiner/BOM family (#2000). The zero-width joiner and non-joiner
+/// (U+200C, U+200D) stay: emoji sequences and Persian or Indic text need them,
+/// and page bodies and titles print through here.
+pub(crate) fn terminal_unsafe(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '\u{061c}'
+                | '\u{200b}'
+                | '\u{200e}'..='\u{200f}'
+                | '\u{2028}'..='\u{202e}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{feff}'
+        )
 }
 
 struct TerminalGuard;
