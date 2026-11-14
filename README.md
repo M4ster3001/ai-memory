@@ -771,7 +771,7 @@ diagram, crate breakdown, schema notes, and invariants.
 | [`docs/usage.md`](docs/usage.md) | Handoffs, proactive memory queries, slim routing snippet + managed Agent Skills, web UI, raw-wiki inspection, and the rules, memory and profile precedence. |
 | [`docs/cross-project-profile.md`](docs/cross-project-profile.md) | **The cross-project profile.** Your usual choices delivered to every project as defaults: defaults per deployment, every setting, per-project opt-outs, multi-user opt-in and privacy, CLI. |
 | [`docs/managed-workstreams.md`](docs/managed-workstreams.md) | Optional `ai-memory run` continuity across harnesses: auto harness selection, native resume, argument forwarding, ledger search, privacy, and recovery. |
-| [`docs/agent-messaging.md`](docs/agent-messaging.md) | Cross-project agent-to-agent messaging: a directed, claim-once inbox/queue plus the on-start "you have mail" notice. |
+| [`docs/agent-messaging.md`](docs/agent-messaging.md) | Cross-project agent-to-agent messaging: a directed, claim-once inbox/queue plus the on-start "you have mail" notice, and a model-free inbox watcher that wakes an agent when mail arrives. |
 | [`docs/marker-file.md`](docs/marker-file.md) | Default repository-path project naming plus `.ai-memory.toml` workspace/project routing for multi-client trees, mono-repos, worktrees, and work/personal separation, plus per-repository server profiles. |
 | [`docs/auto-scope.md`](docs/auto-scope.md) | `[auto_scope]` modes for shared servers: the default `per_actor` isolation, session-aware `per_session` isolation, and the pre-v1.39 `single` slot. |
 | [`docs/macos.md`](docs/macos.md) | macOS install paths: menu bar app, native release tarball, source build, Docker wrapper, launchd, and current limitations. |
