@@ -779,3 +779,124 @@ async fn collected_or_cancelled_mail_cannot_be_taken_for_editing() {
         );
     }
 }
+
+/// The inbox commit signal (`GET /inbox/watch`): a committed send wakes a
+/// watcher of that inbox and recipient, a refused send does not, and the
+/// snapshot a watcher reads carries ids for its own recipient only.
+#[tokio::test]
+async fn a_committed_send_wakes_the_inbox_watcher_and_a_refused_one_does_not() {
+    use std::time::Duration;
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let a = project(&store, "default", "project-a").await;
+    let b = project(&store, "default", "project-b").await;
+    let mut watch = store
+        .writer
+        .inbox_signals()
+        .try_watch(b.0, b.1, AgentKind::Codex, false)
+        .expect("a watcher slot");
+    let before = watch.generation();
+
+    // Refused at the store boundary (measured without evidence): no commit,
+    // so no wake.
+    let mut refused = message(a, b, "unproven");
+    refused.to_agent = Some(AgentKind::Codex);
+    refused.nature = MessageNature::Measured;
+    store.writer.insert_message(refused).await.unwrap_err();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), watch.changed())
+            .await
+            .is_err(),
+        "a send that did not commit must not wake the watcher"
+    );
+
+    // Mail for another harness and for another inbox: no wake either.
+    let mut for_claude = message(a, b, "for claude");
+    for_claude.to_agent = Some(AgentKind::ClaudeCode);
+    store.writer.insert_message(for_claude).await.unwrap();
+    let mut elsewhere = message(b, a, "for codex in project a");
+    elsewhere.to_agent = Some(AgentKind::Codex);
+    store.writer.insert_message(elsewhere).await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), watch.changed())
+            .await
+            .is_err(),
+        "mail for another harness or inbox must not wake the watcher"
+    );
+    assert_eq!(watch.generation(), before);
+
+    let mut for_codex = message(a, b, "for codex");
+    for_codex.to_agent = Some(AgentKind::Codex);
+    let id = store.writer.insert_message(for_codex).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), watch.changed())
+        .await
+        .expect("a committed send to the watched recipient wakes it");
+    assert!(watch.generation() > before);
+
+    let snapshot = store
+        .reader
+        .inbox_watch_snapshot(b.0, b.1, AgentKind::Codex, false, 10)
+        .await
+        .unwrap();
+    assert_eq!(snapshot.total, 1);
+    assert_eq!(snapshot.messages.len(), 1);
+    assert_eq!(snapshot.messages[0].0, id);
+    assert!(!snapshot.messages[0].1, "addressed mail is not shared");
+
+    // Shared mail joins the snapshot only when asked for.
+    store
+        .writer
+        .insert_message(message(a, b, "for anyone"))
+        .await
+        .unwrap();
+    let with_shared = store
+        .reader
+        .inbox_watch_snapshot(b.0, b.1, AgentKind::Codex, true, 1)
+        .await
+        .unwrap();
+    assert_eq!(with_shared.total, 2);
+    assert_eq!(with_shared.messages.len(), 1, "the row cap applies");
+}
+
+/// An edited message returning to the queue is new claimable mail again, so
+/// the requeue wakes the inbox's watchers; taking it out for editing does not.
+#[tokio::test]
+async fn a_requeued_edit_wakes_the_inbox_watcher() {
+    use std::time::Duration;
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let a = project(&store, "default", "project-a").await;
+    let b = project(&store, "default", "project-b").await;
+    let mut to_codex = message(a, b, "draft");
+    to_codex.to_agent = Some(AgentKind::Codex);
+    let id = store.writer.insert_message(to_codex).await.unwrap();
+    let mut watch = store
+        .writer
+        .inbox_signals()
+        .try_watch(b.0, b.1, AgentKind::Codex, false)
+        .unwrap();
+    watch.generation();
+
+    store
+        .writer
+        .begin_message_edit(b.0, b.1, id)
+        .await
+        .unwrap()
+        .expect("held for editing");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), watch.changed())
+            .await
+            .is_err(),
+        "leaving the queue is not new mail"
+    );
+    assert!(
+        store
+            .writer
+            .finish_message_edit(b.0, b.1, id, None)
+            .await
+            .unwrap()
+    );
+    tokio::time::timeout(Duration::from_secs(1), watch.changed())
+        .await
+        .expect("the requeue wakes the watcher");
+}
