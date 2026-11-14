@@ -18,7 +18,9 @@ version in [`docs/changelog/`](docs/changelog/):
   `GET /admin/messages`, prints one line per new pending message for a given
   `to_agent`, and exits or runs a fixed command when mail arrives, so a
   coordinating agent no longer needs a scheduled prompt that re-lists the inbox
-  every minute. It never pops a message or prints a body. See
+  every minute. It never pops a message or prints a body. With
+  `--webhook-listen` it also receives the `message_send` observer webhook and
+  polls at once instead of waiting for the interval. See
   [`docs/agent-messaging.md`](docs/agent-messaging.md#waiting-for-mail-without-a-model).
 - Added `llm_quota_cooldown_secs` (default 900, env
   `AI_MEMORY_LLM_QUOTA_COOLDOWN_SECS`), how long a fallback chain (the default

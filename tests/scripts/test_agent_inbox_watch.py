@@ -2,11 +2,15 @@
 import importlib.util
 import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
+import urllib.error
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -148,6 +152,66 @@ class WatcherTest(unittest.TestCase):
             sys.executable, marker)
         self.run_watch("--once", "--exec", template)
         self.assertEqual(marker.read_text(), ID_A)
+
+    def free_port(self):
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            return probe.getsockname()[1]
+
+    def start_with_webhook(self, port, secret):
+        env = dict(os.environ, AI_MEMORY_AUTH_TOKEN=TOKEN)
+        command = [sys.executable, "-B", str(SCRIPT), "--agent", "claude-code", "--project", "demo",
+                   "--server", self.stub.url, "--state-dir", self.state.name, "--interval", "60",
+                   "--exit-on-first", "--webhook-listen", "127.0.0.1:%d" % port, "--webhook-secret", secret]
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+        self.addCleanup(self.reap, process)
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                    return process
+            except OSError:
+                time.sleep(0.1)
+        self.fail("webhook receiver did not start")
+
+    @staticmethod
+    def reap(process):
+        if process.poll() is None:
+            process.kill()
+        process.communicate()
+
+    def post(self, port, path):
+        request = urllib.request.Request("http://127.0.0.1:%d%s" % (port, path), data=b"{}", method="POST")
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status
+        except urllib.error.HTTPError as error:
+            error.close()
+            return error.code
+
+    def test_webhook_post_triggers_an_immediate_poll_despite_a_long_interval(self):
+        port = self.free_port()
+        process = self.start_with_webhook(port, "s3cret")
+        time.sleep(0.5)
+        self.stub.messages = [message(ID_A, "claude-code")]
+        self.assertEqual(self.post(port, "/s3cret"), 204)
+        out, _ = process.communicate(timeout=10)
+        self.assertEqual(process.returncode, 0)
+        self.assertIn(ID_A, out)
+
+    def test_webhook_with_the_wrong_path_does_not_wake_the_loop(self):
+        port = self.free_port()
+        process = self.start_with_webhook(port, "s3cret")
+        time.sleep(0.5)
+        self.stub.messages = [message(ID_A, "claude-code")]
+        self.assertEqual(self.post(port, "/wrong"), 404)
+        time.sleep(1.5)
+        self.assertIsNone(process.poll())
+
+    def test_webhook_listen_needs_host_and_port(self):
+        result = self.run_watch("--once", "--webhook-listen", "nonsense")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("HOST:PORT", result.stderr)
 
     def test_clean_text_removes_controls_quotes_and_truncates(self):
         dirty = 'a\x00b\n"c"‮' + "x" * 300

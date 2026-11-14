@@ -18,6 +18,8 @@ Typical use:
   optionally with `--exec` to run a fixed command per new message.
 - Hooks and scripts: `--summary` prints the pending count and exits without
   touching state.
+- Instant wake-up: `--webhook-listen HOST:PORT` receives the `message_send`
+  observer webhook and polls at once; keep `--interval` as the fallback.
 
 Standard library only (Python 3.8+). Protocol and security notes in
 docs/agent-messaging.md ("Waiting for mail without a model").
@@ -37,6 +39,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
@@ -47,6 +50,7 @@ MAX_SEEN = 2000
 SEEN_RETENTION_S = 14 * 24 * 3600
 
 stop = threading.Event()
+wake = threading.Event()
 
 
 def now_iso():
@@ -149,6 +153,40 @@ class State:
         os.replace(tmp, self.file)
 
 
+class Receiver(BaseHTTPRequestHandler):
+    """Accepts the `message_send` observer webhook and only wakes the poll loop.
+
+    The POST body is ignored: it is a signal, not data. The loop lists the inbox
+    again, so a forged or replayed POST costs one extra read and nothing else.
+    """
+
+    secret = ""
+
+    def do_POST(self):
+        length = min(int(self.headers.get("Content-Length") or 0), 65536)
+        if length:
+            self.rfile.read(length)
+        if self.secret and self.path.rstrip("/") != "/" + self.secret:
+            self.send_response(404)
+            self.end_headers()
+            return
+        wake.set()
+        self.send_response(204)
+        self.end_headers()
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+def start_receiver(address, secret):
+    host, _, port = address.rpartition(":")
+    Receiver.secret = secret
+    server = ThreadingHTTPServer((host or "127.0.0.1", int(port)), Receiver)
+    threading.Thread(target=server.serve_forever, name="webhook-receiver", daemon=True).start()
+    log("webhook receiver on http://%s:%s/%s" % (host or "127.0.0.1", port, "<secret>" if secret else ""))
+    return server
+
+
 def run_action(template, message_id):
     """Run the fixed command for one message. Only a validated id is substituted."""
     if not ID_RE.match(message_id):
@@ -206,6 +244,10 @@ def build_parser():
     p.add_argument("--exec", dest="action", default="",
                    help="command (no shell) run per new message; {id} is the only placeholder")
     p.add_argument("--http-timeout", type=float, default=5.0)
+    p.add_argument("--webhook-listen", default="",
+                   help="HOST:PORT that receives the message_send observer webhook and triggers an immediate poll")
+    p.add_argument("--webhook-secret", default=os.environ.get("AI_MEMORY_WATCH_WEBHOOK_SECRET", ""),
+                   help="path segment required on the webhook POST (env AI_MEMORY_WATCH_WEBHOOK_SECRET)")
     return p
 
 
@@ -216,6 +258,8 @@ def main():
         parser.error("invalid --agent")
     if not a.project:
         parser.error("--project (or AI_MEMORY_PROJECT) is required")
+    if a.webhook_listen and not re.match(r"^([A-Za-z0-9_.-]*):[0-9]{1,5}$", a.webhook_listen):
+        parser.error("--webhook-listen must look like HOST:PORT")
     interval = max(a.interval, 0.5)
     try:
         inbox = Inbox(a.server, read_token(a.token_file), a.workspace, a.project, a.http_timeout)
@@ -242,9 +286,11 @@ def main():
         return 3
 
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-        signal.signal(sig, lambda *_: stop.set())
+        signal.signal(sig, lambda *_: (stop.set(), wake.set()))
 
-    log("watching %s/%s for to_agent=%s every %.1fs" % (a.workspace, a.project, a.agent, interval))
+    receiver = start_receiver(a.webhook_listen, a.webhook_secret) if a.webhook_listen else None
+    log("watching %s/%s for to_agent=%s every %.1fs%s" % (
+        a.workspace, a.project, a.agent, interval, " + webhook" if receiver else ""))
 
     failing = False
     last_new = time.monotonic()
@@ -307,7 +353,10 @@ def main():
         if a.idle_timeout and time.monotonic() - last_new >= a.idle_timeout:
             log("exiting: %.0fs without new mail" % a.idle_timeout)
             break
-        stop.wait(interval)
+        wake.wait(interval)
+        wake.clear()
+    if receiver:
+        receiver.shutdown()
     log("watcher stopped")
     return code
 

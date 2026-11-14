@@ -515,6 +515,32 @@ python3 scripts/agent-inbox-watch.py --agent claude-code --project my-project \
 - Hooks and scripts: `--summary` prints the pending count and exits without
   touching state.
 
+For an instant wake-up instead of waiting for the next poll, subscribe a
+non-blocking observer webhook to `message_send` and let the watcher receive it
+(see [admission webhooks](admission-webhooks.md#8-configuration)):
+
+```toml
+[[admission_webhooks]]
+name = "inbox-watch"
+url = "http://172.17.0.1:49380/<secret>"   # host address as seen from the container
+timeout_ms = 500
+failure_policy = "ignore"
+events = ["message_send"]
+blocking = false
+```
+
+```bash
+AI_MEMORY_WATCH_WEBHOOK_SECRET=<secret> python3 scripts/agent-inbox-watch.py \
+  --agent claude-code --project my-project --interval 30 --exit-on-first \
+  --webhook-listen 172.17.0.1:49380
+```
+
+A POST to `/<secret>` only makes the watcher list the inbox again right away; the
+body is ignored and a wrong path gets a 404. Keep a long `--interval` as the
+fallback, because the webhook is fire-and-forget and a missed POST would
+otherwise be a missed wake-up. The webhook fires for every send in the project,
+so the watcher still filters by `--agent`. Config changes need a server restart.
+
 Two things to know before relying on it:
 
 - It reaches the server over TCP. Use `127.0.0.1` and the server port. The
