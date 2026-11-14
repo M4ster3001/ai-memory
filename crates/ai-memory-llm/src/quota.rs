@@ -1,97 +1,16 @@
 //! Credit, quota and billing exhaustion detection for provider failures.
 //!
-//! A provider that has run out of credit or quota for the account answers
-//! with an error that says nothing about the request: the same call succeeds
-//! on another provider, and fails identically on this one until someone tops
-//! up the balance or the quota window resets. Providers disagree on the
-//! status they use for it (Anthropic sends `400`, OpenAI `429`, OpenRouter
-//! `402`), so the status alone cannot tell it apart from a malformed request
-//! or a short rate limit. This module is the single place that reads the
-//! bounded, already-scrubbed error body for the documented markers. See
-//! `docs/llm-provider-fallback.md` for the per-provider table.
-//!
-//! Only the bounded body that [`crate::LlmError::Provider`] already carries
-//! (at most 1 KiB, secrets scrubbed) is inspected, and the result is a
-//! boolean: no part of the body leaves this module.
-
-/// Case-insensitive markers that identify credit, quota, billing or disabled
-/// account failures in a provider error body. Every entry is a provider's
-/// documented error code or a fixed phrase from its error message; none is a
-/// generic rate-limit phrase, so a per-minute `429` keeps its short
-/// transient cooldown.
-const QUOTA_MARKERS: &[&str] = &[
-    // Anthropic: `400 invalid_request_error` "Your credit balance is too low
-    // to access the Anthropic API", `402 billing_error`, the monthly spend
-    // limit ("You have reached your specified API usage limits") and a
-    // `403 permission_error` for a disabled organization.
-    "credit balance is too low",
-    "billing_error",
-    "reached your specified api usage limits",
-    "organization has been disabled",
-    // OpenAI: `429 insufficient_quota` ("You exceeded your current quota"),
-    // the hard billing limit, an inactive billing account, a deactivated
-    // account. The bare "exceeded your current quota" phrase is deliberately
-    // absent: Gemini reuses it for its per-minute rate limits.
-    "insufficient_quota",
-    "billing_hard_limit_reached",
-    "billing_not_active",
-    "account_deactivated",
-    "account has been deactivated",
-    "account has been disabled",
-    // OpenRouter and other OpenAI-compatible gateways (DeepSeek, OpenCode
-    // Zen and similar) on a prepaid balance.
-    "insufficient credits",
-    "insufficient_credits",
-    "insufficient balance",
-    "insufficient_balance",
-    "out of credits",
-    "requires more credits",
-    "key limit exceeded",
-    // ChatGPT-plan Codex / openai-oauth: `usage_limit_reached`.
-    "usage_limit_reached",
-    "usage limit has been reached",
-    // GitHub Copilot premium-request and plan quotas.
-    "quota_exceeded",
-    "monthly quota",
-    // Gemini paid tier: a project spend cap or depleted prepaid credits.
-    "spending cap",
-    "credits are depleted",
-];
+//! The marker table lives in [`ai_memory_core::quota`] so the messaging
+//! supervisor can classify a harness's output with the same rules. This
+//! module keeps the provider-facing entry point: only the bounded, scrubbed
+//! body that [`crate::LlmError::Provider`] carries (at most 1 KiB) is read,
+//! and the result is a boolean.
 
 /// Whether a failed provider response reports exhausted credit, quota or
 /// billing for the account, rather than a malformed request, a bad key or a
-/// short rate limit.
-///
-/// `402 Payment Required` always counts. Any other `4xx`/`5xx` counts only
-/// when the body carries one of [`QUOTA_MARKERS`], or is a Gemini
-/// `RESOURCE_EXHAUSTED` whose violated quota is a daily one or has a limit of
-/// zero (no access on this tier). A `401` with a plain invalid-key message
-/// carries no marker and stays a credential error.
+/// short rate limit. See [`ai_memory_core::quota::quota_signal`].
 pub(crate) fn is_quota_exhaustion(status: u16, body: &str) -> bool {
-    if status == 402 {
-        return true;
-    }
-    if !(400..=599).contains(&status) || body.is_empty() {
-        return false;
-    }
-    let lower = body.to_ascii_lowercase();
-    if QUOTA_MARKERS.iter().any(|marker| lower.contains(marker)) {
-        return true;
-    }
-    gemini_daily_or_zero_quota(&lower)
-}
-
-/// Gemini answers both a per-minute rate limit and an exhausted daily (or
-/// zero) quota with `429 RESOURCE_EXHAUSTED` and the same "exceeded your
-/// current quota" message; only the violated quota tells them apart.
-fn gemini_daily_or_zero_quota(lower: &str) -> bool {
-    lower.contains("resource_exhausted")
-        && (lower.contains("perday")
-            || lower.contains("per_day")
-            || lower.contains("per day")
-            || lower.contains("limit: 0,")
-            || lower.contains("limit: 0\n")
-            || lower.ends_with("limit: 0"))
+    ai_memory_core::quota::quota_signal(Some(status), body).is_some()
 }
 
 #[cfg(test)]
