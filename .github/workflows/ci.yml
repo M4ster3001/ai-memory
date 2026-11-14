@@ -132,6 +132,13 @@ jobs:
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
           AI_MEMORY_IMPORTER_E2E_BIN: ${{ github.workspace }}/target/debug/ai-memory
         run: cargo test --locked --manifest-path companions/ai-memory-importer/Cargo.toml e2e
+      # The inbox watcher script is stdlib Python; its tests run it against a
+      # local stub server, so no ai-memory binary is needed.
+      - name: Agent inbox watcher script tests
+        if: matrix.os == 'ubuntu-latest'
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: uv run --no-project python -m unittest discover -s tests/scripts -p 'test_*.py' -v
       # The Jev reranker adapter under docs/examples is stdlib Python with its
       # own unittest suite; nothing else runs it. `unittest discover` exits 5
       # when it finds no tests, so the step skips cleanly until a test file

@@ -484,3 +484,52 @@ Both notice clients need a server with this release. An older server ignores
 `inbox_only` and still returns only the notice (the clients also send
 `handoff=0&recovery=0&profile_digest=0`), but it republishes the active
 project on each fetch.
+
+## Waiting for mail without a model
+
+The session-start notice and the per-prompt notice only help an agent that is
+already running a turn. An agent that coordinates others still needs to know
+when a reply lands, and polling `memory_message_list` from a scheduled prompt
+spends model tokens on every empty check.
+
+`scripts/agent-inbox-watch.py` does that wait without a model. It lists the
+inbox over HTTP (`GET /admin/messages`, read-only), prints one line for each new
+pending message addressed to a harness, and never pops, cancels or prints the
+body. The subject and sender in that line are untrusted too, so they are
+stripped of control characters and truncated. The agent reads the message with
+`memory_message_pop` and the printed `message_id`.
+
+```bash
+python3 scripts/agent-inbox-watch.py --agent claude-code --project my-project \
+  --interval 3 --exit-on-first --silence-existing
+```
+
+- Claude Code: run the command with the Bash tool in the background. The
+  process exits when mail arrives, which wakes the agent once. Pop the message,
+  handle it, then start the watcher again. The Monitor tool also works: omit
+  `--exit-on-first` and every printed line becomes one notification.
+- Other harnesses: run it in a terminal outside the agent, and use
+  `--exec` to run a fixed command per message. The command runs without a
+  shell, and `{id}` is the only placeholder; it is replaced only by a
+  well-formed message id.
+- Hooks and scripts: `--summary` prints the pending count and exits without
+  touching state.
+
+Two things to know before relying on it:
+
+- It reaches the server over TCP. Use `127.0.0.1` and the server port. The
+  `ai-memory` wrapper can run the CLI in a helper container where `localhost`
+  is the container itself; the watcher does not use it. A harness sandbox that
+  blocks local sockets, such as the default Codex sandbox, cannot run the
+  watcher inside the sandbox; run it from a terminal outside the agent.
+- Latency is the poll interval. The default is 5 seconds
+  (`--interval`, minimum 0.5). Announced ids are kept under
+  `$XDG_STATE_HOME/ai-memory/inbox-watch`, so a restart does not repeat a line.
+  A second watcher for the same project and agent refuses to start (exit 3).
+  Exit 2 means the token is missing or was refused.
+
+The token comes from `AI_MEMORY_AUTH_TOKEN`, or from the file named by
+`--token-file` (default `~/.local/share/ai-memory/auth-header`). It is sent
+only to `--server`. A message is claimed once, so an agent that pops a message
+and fails before replying loses it; the sender should resend if no answer comes
+back in the expected time.
