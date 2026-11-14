@@ -962,7 +962,11 @@ pub struct MessageWatchArgs {
     pub silence_existing: bool,
     /// Longest wait, in seconds, for the server's wake-up before checking
     /// again; also the retry delay while the server does not answer.
-    #[arg(long, default_value_t = 25, value_parser = clap::value_parser!(u64).range(1..=25))]
+    #[arg(
+        long,
+        default_value_t = ai_memory_hooks::MAX_INBOX_WATCH_WAIT_MS / 1_000,
+        value_parser = clap::value_parser!(u64).range(1..=ai_memory_hooks::MAX_INBOX_WATCH_WAIT_MS / 1_000)
+    )]
     pub interval: u64,
     /// Directory for the announced-id state and the single-instance lock
     /// (default: `inbox-watch` under the data directory).
