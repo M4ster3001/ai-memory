@@ -27,6 +27,7 @@ use crate::auto_improve::{
     StagedAutoImproveRunReport,
 };
 use crate::error::{StoreError, StoreResult};
+use crate::inbox_signals::InboxSignals;
 use crate::ops::{
     self, AdmittedSession, DeleteWorkspaceSummary, EmbeddingWrite, HookSessionAdmission,
     IdleEndCandidate, IdleEndResult, IngestObservationOutcome, LifecycleOnlyEndOutcome,
@@ -931,6 +932,7 @@ pub struct WriterHandle {
 struct WriterInner {
     tx: Option<mpsc::Sender<WriteCmd>>,
     join: Mutex<Option<JoinHandle<()>>>,
+    inbox_signals: InboxSignals,
     #[cfg(test)]
     before_join: Option<Box<dyn FnOnce() + Send + Sync>>,
 }
@@ -939,19 +941,29 @@ impl WriterHandle {
     /// Take ownership of `conn` and spawn the writer thread.
     pub(crate) fn spawn(conn: Connection) -> Self {
         let (tx, rx) = mpsc::channel(1024);
+        let inbox_signals = InboxSignals::new(crate::inbox_signals::MAX_INBOX_WATCHERS);
+        let worker_signals = inbox_signals.clone();
         let handle = thread::Builder::new()
             .name("ai-memory-writer".into())
-            .spawn(move || worker_loop(conn, rx))
+            .spawn(move || worker_loop(conn, rx, &worker_signals))
             .expect("spawn writer thread");
 
         Self {
             inner: Arc::new(WriterInner {
                 tx: Some(tx),
                 join: Mutex::new(Some(handle)),
+                inbox_signals,
                 #[cfg(test)]
                 before_join: None,
             }),
         }
+    }
+
+    /// Commit signals for agent inboxes: the writer bumps them after a
+    /// message becomes claimable, and long-poll waiters subscribe here.
+    #[must_use]
+    pub fn inbox_signals(&self) -> &InboxSignals {
+        &self.inner.inbox_signals
     }
 
     /// Resolve a workspace by name, creating it atomically if missing.
@@ -4027,7 +4039,11 @@ fn send_or_warn<T>(reply: oneshot::Sender<T>, result: T, op: &'static str) {
     }
 }
 
-fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
+fn worker_loop(
+    mut conn: Connection,
+    mut rx: mpsc::Receiver<WriteCmd>,
+    inbox_signals: &InboxSignals,
+) {
     // The mode a newly created project starts in — the server's
     // `[auth] new_projects_restricted`, set once at startup. Held here because
     // this actor performs every project insert, so no creation path can
@@ -4632,6 +4648,15 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             }
             WriteCmd::InsertMessage { message, reply } => {
                 let result = ops::insert_message(&mut conn, &message);
+                // After the commit and before the reply, so a sender that
+                // reads its id back has already woken the recipient's waiters.
+                if result.is_ok() {
+                    inbox_signals.notify(
+                        message.to_workspace_id,
+                        message.to_project_id,
+                        message.to_agent,
+                    );
+                }
                 send_or_warn(reply, result, "insert_message");
             }
             WriteCmd::PopMessage {
@@ -4672,6 +4697,9 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                         .as_ref()
                         .map(|(subject, body)| (subject.as_deref(), body.as_str())),
                 );
+                if matches!(result, Ok(true)) {
+                    inbox_signals.notify_inbox(to_workspace_id, to_project_id);
+                }
                 send_or_warn(reply, result, "finish_message_edit");
             }
             WriteCmd::CancelMessages {

@@ -75,6 +75,7 @@ mod managed_project;
 pub mod mcp_bridge;
 pub mod merge_project;
 pub mod message;
+pub(crate) mod message_watch;
 pub mod move_project;
 pub mod move_session;
 pub mod openclaw_plugin;

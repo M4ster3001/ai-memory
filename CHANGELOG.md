@@ -13,6 +13,16 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- Added `ai-memory message watch`, which waits for new inbox mail without a
+  model. It long-polls the new `GET /inbox/watch` route, and the server answers
+  as soon as a send to that inbox and harness commits, so a reply is announced
+  about a second after it is sent instead of at the next poll. It prints one
+  line per new message id and never a subject, body or sender. It can exit on
+  the first message or run a command without a shell, with the id as the only
+  substitution. Announced ids survive a restart, one watcher runs per inbox and
+  harness, and a DB-user API key that can read the project is enough. The route
+  holds at most 64 waiting requests and answers 429 past that. See
+  [`docs/agent-messaging.md`](docs/agent-messaging.md#waiting-for-mail-without-a-model).
 - Added `scripts/agent-inbox-watch.py`, a standard-library watcher that waits
   for new inbox mail without a model. It polls the read-only
   `GET /admin/messages`, prints one line per new pending message for a given

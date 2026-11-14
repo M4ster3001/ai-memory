@@ -181,7 +181,13 @@ async fn dispatch(
             Ok(())
         }
         Command::Handoffs(args) => commands::handoffs::run(&config, args).await,
-        Command::Message(args) => commands::message::run(&config, args).await,
+        Command::Message(args) => {
+            let exit_code = commands::message::run(&config, args).await?;
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
+            Ok(())
+        }
         Command::Workstreams(args) => commands::workstreams::run(&config, args).await,
         Command::RenameWorkstream(args) => commands::rename_workstream::run(&config, args).await,
         Command::WorkstreamSearch(args) => commands::workstream_search::run(&config, args).await,

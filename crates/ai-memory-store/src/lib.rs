@@ -22,6 +22,7 @@ pub mod decay;
 mod error;
 mod fts_query;
 mod grants;
+mod inbox_signals;
 mod maintenance;
 mod migrations;
 mod ops;
@@ -64,6 +65,7 @@ pub use error::{
     AmbiguousMatch, AmbiguousProjectHolder, AmbiguousProjectHolders, StoreError, StoreResult,
 };
 pub use grants::{GrantFilter, GrantListing, GrantOutcome, ProjectGrant};
+pub use inbox_signals::{InboxSignals, InboxWatch, MAX_INBOX_WATCHERS};
 pub use maintenance::MaintenanceJob;
 pub use ops::{
     AdmittedSession, AdoptedProjectIdentity, BootstrapChunkRecord, CompactSummary, Compaction,
@@ -99,16 +101,17 @@ pub use reader::{
     ContaminationSummary, ContradictionEdge, CrossProjectEdge, DecayCandidate, DecayTombstone,
     DerivedIndexStatus, EmbeddingTripleCount, FTS_HIGHLIGHT_END, FTS_HIGHLIGHT_START,
     FeedbackFinding, FileSessionRef, GraphVia, HealthDetail, HealthPage, HybridSearch,
-    HybridSearchOutcome, IdleOpenSession, InboxCount, InboxEntry, InterruptedSessionCandidate,
-    LinkGraph, LinkGraphEdge, LinkGraphNode, ObservationHit, ObservationOrder, ObservationPage,
-    ObservationPageResult, ObservationProjectionTotals, ObservationRecord, OpenSession, PAGE_KINDS,
-    PAGE_VERSIONS_MAX_LIMIT, PROJECT_LINK_GRAPH_MAX_NODES, PageAuthor, PageFilter, PageHit,
-    PageHitWithMeta, PageLinks, PageLinksPreview, PageMeta, PageSummary, PageVersion,
-    PageVersionBody, PageVersions, ProjectCoordinateCollisionReason, ProjectCoordinateDiagnostic,
-    ProjectCoordinateStatus, ProjectSummary, RELATED_WALK_MAX_DEPTH, RELATED_WALK_MAX_NODES,
-    ReaderPool, ReindexTargetStatus, RelatedNode, RelatedPage, RrfContributions,
-    SESSION_LINE_TITLE_CHARS, SUBSTANTIVE_OBSERVATION_KIND_SQL, ScopeRow, SearchExplain,
-    SessionActivity, SessionConsolidationQueue, SessionConsolidationSummary, SessionDependentRows,
+    HybridSearchOutcome, IdleOpenSession, InboxCount, InboxEntry, InboxWatchSnapshot,
+    InterruptedSessionCandidate, LinkGraph, LinkGraphEdge, LinkGraphNode, ObservationHit,
+    ObservationOrder, ObservationPage, ObservationPageResult, ObservationProjectionTotals,
+    ObservationRecord, OpenSession, PAGE_KINDS, PAGE_VERSIONS_MAX_LIMIT,
+    PROJECT_LINK_GRAPH_MAX_NODES, PageAuthor, PageFilter, PageHit, PageHitWithMeta, PageLinks,
+    PageLinksPreview, PageMeta, PageSummary, PageVersion, PageVersionBody, PageVersions,
+    ProjectCoordinateCollisionReason, ProjectCoordinateDiagnostic, ProjectCoordinateStatus,
+    ProjectSummary, RELATED_WALK_MAX_DEPTH, RELATED_WALK_MAX_NODES, ReaderPool,
+    ReindexTargetStatus, RelatedNode, RelatedPage, RrfContributions, SESSION_LINE_TITLE_CHARS,
+    SUBSTANTIVE_OBSERVATION_KIND_SQL, ScopeRow, SearchExplain, SessionActivity,
+    SessionConsolidationQueue, SessionConsolidationSummary, SessionDependentRows,
     SessionEndDisposition, SessionKindSummary, SessionLine, SessionObservationSnapshot,
     SessionPromptTitles, SessionSummary, SessionToolTitles, SessionUsageView, SettledPage,
     StatusCounts, StorageStatus, StoredEmbedding, StoredPageBody, StreamTimings, TokenCallOrder,

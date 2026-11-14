@@ -382,7 +382,8 @@ A webhook is either **blocking** or **non-blocking**:
 
 A non-blocking `message_send` observer can also wake a local process. The
 inbox watcher script (`scripts/agent-inbox-watch.py --webhook-listen`) receives
-that POST, ignores the body and lists the inbox at once. The entry filters by
+that POST, ignores the body and lists the inbox at once. `ai-memory message
+watch` needs no webhook, because the server wakes it directly. The entry filters by
 event and not by project, so keep a polling interval as the fallback and see
 [the messaging guide](agent-messaging.md#waiting-for-mail-without-a-model) for a
 working entry.

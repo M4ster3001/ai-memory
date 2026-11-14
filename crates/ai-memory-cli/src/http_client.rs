@@ -439,6 +439,46 @@ pub async fn get_json<T: DeserializeOwned>(
         .with_context(|| format!("parsing JSON body from GET {}", display_url(&url)))
 }
 
+/// GET `<endpoint>{path}` like [`get_json`], bounded in time and size: the
+/// whole exchange must finish within `timeout` and the body must not exceed
+/// `max_body_bytes`. For long-polls, which deliberately hold the request open
+/// and so cannot rely on a server answering promptly.
+///
+/// # Errors
+/// As [`get_json`], plus a timeout or an oversized body.
+pub(crate) async fn get_json_bounded<T: DeserializeOwned>(
+    endpoint: &ServerEndpoint,
+    path: &str,
+    query: &[(&str, &str)],
+    timeout: Duration,
+    max_body_bytes: usize,
+) -> Result<T> {
+    let client = http_client();
+    let url = endpoint.build_url(path);
+    let req = endpoint.authenticate(client.get(&url).query(query).timeout(timeout));
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| augment_connect_error(e, endpoint, &url))?;
+    let mut resp = require_success(&endpoint.i18n, reqwest::Method::GET, resp).await?;
+    let mut body = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| augment_connect_error(e, endpoint, &url))?
+    {
+        if body.len().saturating_add(chunk.len()) > max_body_bytes {
+            anyhow::bail!(
+                "the response from GET {} exceeded {max_body_bytes} bytes",
+                display_url(&url)
+            );
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body)
+        .with_context(|| format!("parsing JSON body from GET {}", display_url(&url)))
+}
+
 /// PATCH JSON body to `<endpoint>{path}`, deserialise JSON response.
 ///
 /// # Errors

@@ -434,6 +434,15 @@ that explicit handoff also expires the session's own open automatic batons
 (#2012). The startup block for a handoff with a source session names its
 `sessions/<id>.md` page, which opt-in SessionEnd consolidation rewrites after
 the baton was written.
+`GET /inbox/watch` is the long-poll behind `ai-memory message watch`. The
+writer actor owns per-inbox commit signals: after it commits a send it bumps a
+generation for the recipient inbox and harness (shared mail has its own key),
+and an edited message returning to the queue bumps every key of its inbox. The
+route authorizes the inbox with a no-create lookup at `Read`, waits on that
+signal or `wait_ms` (at most 25,000), then reads ids, a shared flag and
+timestamps; it never returns a subject, body or sender. It holds at most 64
+waiters and answers 429 past that. The signal is a hint after commit and the
+read decides, so a missed wake-up only delays an answer until its timeout.
 `GET /recap?session_id=` answers a prompt that starts with `reload context`
 (Claude Code and Codex in the `UserPromptSubmit` envelope, Grok on the next
 `PostToolUse`, OpenCode through its system/context hooks). It is read-only and

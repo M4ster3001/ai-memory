@@ -15,7 +15,7 @@ use std::sync::Arc;
 use ai_memory_core::{
     AgentKind, AgentMessage, AutoImproveProposalId, AutoImproveRunId, FAILED_TOOL_OUTCOME_LINE,
     Handoff, HandoffContent, HandoffId, HandoffLifecycle, HandoffOrigin, HandoffScope,
-    HandoffState, IdentityKey, ManagedRunId, MessageBox, Observation, ObservationId,
+    HandoffState, IdentityKey, ManagedRunId, MessageBox, MessageId, Observation, ObservationId,
     ObservationKind, OwnerFilter, PageId, PagePath, ProjectId, SessionId,
     TOOL_BODY_HEADER_MAX_CHARS, TOOL_BODY_SEPARATOR, User, UserId, WorkspaceId, WorkstreamEvent,
     WorkstreamId,
@@ -2504,6 +2504,19 @@ pub struct InboxEntry {
     pub sender: Option<(String, String)>,
 }
 
+/// What a long-poll inbox watcher may learn about pending mail: ids, whether
+/// each is shared, and when it was sent. Never subject, body, evidence or
+/// sender. Returned by [`ReaderPool::inbox_watch_snapshot`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboxWatchSnapshot {
+    /// `(id, shared, created_at)` of each pending message the watcher could
+    /// claim, oldest first, capped at the requested limit. `shared` is true for
+    /// mail with no `to_agent`.
+    pub messages: Vec<(MessageId, bool, Timestamp)>,
+    /// Every pending message the watcher could claim, beyond the cap too.
+    pub total: u64,
+}
+
 /// One workspace scope with the id + name needed to write its
 /// self-describing `_meta.md` manifest. Returned by
 /// [`ReaderPool::list_all_workspace_scopes`].
@@ -4341,7 +4354,7 @@ impl ReaderPool {
             let mut hits = Vec::new();
             for row in rows {
                 let (id_bytes, session_bytes, kind, title, snippet, rank, created_us) = row?;
-                let created_at = jiff::Timestamp::from_microsecond(created_us)
+                let created_at = Timestamp::from_microsecond(created_us)
                     .map(|ts| ts.to_string())
                     .unwrap_or_default();
                 hits.push(ObservationHit {
@@ -9664,6 +9677,74 @@ impl ReaderPool {
                 });
             }
             Ok(out)
+        })
+        .await
+    }
+
+    /// The pending mail `agent` could be woken for in one inbox: messages
+    /// addressed to it, plus shared ones (`to_agent IS NULL`) when
+    /// `include_shared` is set. Oldest first, at most `limit` rows, with the
+    /// uncapped total. Reads ids and timestamps only.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn inbox_watch_snapshot(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        agent: AgentKind,
+        include_shared: bool,
+        limit: usize,
+    ) -> StoreResult<InboxWatchSnapshot> {
+        let limit = i64::try_from(limit.clamp(1, 1_000)).unwrap_or(1_000);
+        self.with_conn(move |conn| {
+            const PREDICATE: &str = "to_workspace_id = ?1 AND to_project_id = ?2 \
+                 AND state = 'pending' AND (to_agent = ?3 OR (?4 AND to_agent IS NULL))";
+            let args = params![
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
+                agent.as_str(),
+                include_shared,
+            ];
+            let total: i64 = conn.query_row(
+                &format!("SELECT COUNT(*) FROM agent_messages WHERE {PREDICATE}"),
+                args,
+                |row| row.get(0),
+            )?;
+            let mut stmt = conn.prepare(&format!(
+                "SELECT id, to_agent IS NULL, created_at FROM agent_messages \
+                 WHERE {PREDICATE} ORDER BY created_at ASC, id ASC LIMIT ?5"
+            ))?;
+            let rows = stmt.query_map(
+                params![
+                    workspace_id.as_bytes(),
+                    project_id.as_bytes(),
+                    agent.as_str(),
+                    include_shared,
+                    limit,
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, bool>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )?;
+            let mut messages = Vec::new();
+            for row in rows {
+                let (id, shared, created_us) = row?;
+                let created_at = jiff::Timestamp::from_microsecond(created_us).map_err(|e| {
+                    StoreError::Memory(ai_memory_core::MemoryError::MalformedRecord(format!(
+                        "bad created_at: {e}"
+                    )))
+                })?;
+                messages.push((MessageId::from_slice(&id)?, shared, created_at));
+            }
+            Ok(InboxWatchSnapshot {
+                messages,
+                total: u64::try_from(total).unwrap_or(0),
+            })
         })
         .await
     }

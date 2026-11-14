@@ -195,8 +195,9 @@ pub enum Command {
     Resume(ResumeArgs),
     /// List open cross-agent handoffs so a stale one can be cancelled by id.
     Handoffs(HandoffsArgs),
-    /// Send, list, pop, or cancel cross-project agent messages (a directed,
-    /// claim-once mailbox between two projects — see `docs/agent-messaging.md`).
+    /// Send, list, pop, cancel, or watch cross-project agent messages (a
+    /// directed, claim-once mailbox between two projects — see
+    /// `docs/agent-messaging.md`).
     Message(MessageArgs),
     /// List recent managed workstreams selectable from the current checkout.
     Workstreams(WorkstreamsArgs),
@@ -836,6 +837,9 @@ pub enum MessageCommand {
     Pop(MessagePopArgs),
     /// Retract still-pending messages this project has sent.
     Cancel(MessageCancelArgs),
+    /// Wait for new mail addressed to a harness, without a model, and print
+    /// one line per new message id.
+    Watch(MessageWatchArgs),
 }
 
 /// Arguments for `message send`.
@@ -928,6 +932,56 @@ pub struct MessageCancelArgs {
     /// Emit JSON instead of a human confirmation.
     #[arg(long)]
     pub json: bool,
+}
+
+/// Arguments for `message watch`.
+#[derive(Debug, Args)]
+pub struct MessageWatchArgs {
+    /// Harness whose mail to watch, by its canonical name (for example codex
+    /// or claude-code).
+    #[arg(long)]
+    pub agent: String,
+    /// Workspace to watch (defaults to the resolved scope).
+    #[arg(long)]
+    pub workspace: Option<String>,
+    /// Project to watch (defaults to the resolved scope).
+    #[arg(long)]
+    pub project: Option<String>,
+    /// Also announce mail sent to the whole project, with no target harness.
+    #[arg(long)]
+    pub include_shared: bool,
+    /// Exit after announcing new mail.
+    #[arg(long, conflicts_with = "once")]
+    pub exit_on_first: bool,
+    /// Check once, announce what is new, and exit.
+    #[arg(long)]
+    pub once: bool,
+    /// On the first run, record the mail already pending as seen without
+    /// announcing it.
+    #[arg(long)]
+    pub silence_existing: bool,
+    /// Longest wait, in seconds, for the server's wake-up before checking
+    /// again; also the retry delay while the server does not answer.
+    #[arg(
+        long,
+        default_value_t = ai_memory_hooks::MAX_INBOX_WATCH_WAIT_MS / 1_000,
+        value_parser = clap::value_parser!(u64).range(1..=ai_memory_hooks::MAX_INBOX_WATCH_WAIT_MS / 1_000)
+    )]
+    pub interval: u64,
+    /// Directory for the announced-id state and the single-instance lock
+    /// (default: `inbox-watch` under the data directory).
+    #[arg(long)]
+    pub state_dir: Option<PathBuf>,
+    /// Command run without a shell for each announced message; `{id}` in its
+    /// arguments becomes the message id. Takes every remaining argument, so
+    /// put it last.
+    #[arg(
+        long = "exec",
+        value_name = "COMMAND",
+        num_args = 1..,
+        allow_hyphen_values = true
+    )]
+    pub exec: Vec<String>,
 }
 
 #[derive(Debug, Args)]

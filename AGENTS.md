@@ -893,7 +893,8 @@ Additional boundary rules:
   `ai-memory run` cross-harness continuity.
 - [`docs/agent-messaging.md`](docs/agent-messaging.md) — cross-project
   agent-to-agent inbox/queue, the on-start hot-context notice, and the
-  model-free inbox watcher (`scripts/agent-inbox-watch.py`).
+  model-free inbox watcher (`ai-memory message watch` over `GET /inbox/watch`,
+  with `scripts/agent-inbox-watch.py` as a polling alternative).
 - [`docs/companion-crates.md`](docs/companion-crates.md) — boundary for
   optional companion projects (e.g. the importer).
 - [`docs/desktop/`](docs/desktop/) — research notes and phased plan for
