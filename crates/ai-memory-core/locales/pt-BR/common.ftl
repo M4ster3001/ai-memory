@@ -74,6 +74,7 @@ common-status-pending = pendente
 common-status-claimed = coletada
 common-status-cancelled = cancelada
 common-status-editing = em edição
+common-status-expired = expirada
 common-status-disabled = desabilitado
 common-status-unknown = desconhecido
 common-status-ok = ok

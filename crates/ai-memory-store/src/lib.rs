@@ -24,6 +24,10 @@ mod fts_query;
 mod grants;
 mod inbox_signals;
 mod maintenance;
+mod message_delivery;
+pub use message_delivery::{
+    DeadlineSweepOutcome, DeliveryEvent, MAX_SWEEP_BATCH, MessageListFilter,
+};
 mod migrations;
 mod ops;
 pub mod password;

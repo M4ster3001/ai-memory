@@ -1037,3 +1037,5 @@ diag-message-watch-exec-timed-out = inbox watch: the --exec command for { $id } 
 diag-message-watch-creating-state-dir = creating the watch state directory { $value0 }
 diag-message-watch-opening-lock = opening the watch lock { $value0 }
 diag-response-exceeded-bytes = the response from GET { $value0 } exceeded { $max_body_bytes } bytes
+diag-messaging-ttl-must-be-between = { $value0 } must be between 1 and { $value1 }; got { $value2 }
+diag-messaging-alert-must-be-off-or-at-most = { $value0 } must be 0 (off) or at most 525600 minutes; got { $value1 }

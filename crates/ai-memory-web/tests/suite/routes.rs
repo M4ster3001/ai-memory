@@ -5787,6 +5787,9 @@ async fn send_mail(
             body: body.to_owned(),
             nature: ai_memory_core::MessageNature::Unknown,
             evidence: None,
+            priority: ai_memory_core::MessagePriority::Normal,
+            notify: ai_memory_core::NotifyOn::DEFAULT,
+            ttl_secs: None,
         })
         .await
         .unwrap();

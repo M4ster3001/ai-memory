@@ -675,6 +675,9 @@ pub struct Config {
     /// Session-start handoff delivery (design: #959). Default keeps today's
     /// automatic-claim behavior unchanged.
     pub handoff: HandoffSettings,
+    /// `[messaging]` — default deadlines of cross-project agent messages
+    /// (`docs/agent-messaging.md`, "Delivery states and receipts").
+    pub messaging: MessagingSettings,
     /// `[profile]` — the cross-project profile: how this user usually works,
     /// delivered to every project as defaults below the repository's rules
     /// file (`docs/design-cross-project-profile.md`,
@@ -1551,6 +1554,7 @@ impl Default for Config {
             query_answer: QueryAnswerSettings::default(),
             auto_improve: AutoImproveSettings::default(),
             handoff: HandoffSettings::default(),
+            messaging: MessagingSettings::default(),
             profile: ai_memory_core::profile::ProfileSettings::default(),
             sanitize: ai_memory_core::SanitizeConfig::default(),
             auth: AuthSettings::default(),
@@ -1758,6 +1762,78 @@ impl Default for HandoffSettings {
             claim_on_session_start: true,
             create_on_session_end: true,
         }
+    }
+}
+
+/// `[messaging]` default deadlines of cross-project agent messages. A sender
+/// may shorten a message's time to live, never extend it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MessagingSettings {
+    /// Time to live of a `low` priority message, in days (1 to 365).
+    pub ttl_low_days: u32,
+    /// Time to live of a `normal` priority message, in days (1 to 365).
+    pub ttl_normal_days: u32,
+    /// Time to live of a `high` priority message, in hours (1 to 8760).
+    pub ttl_high_hours: u32,
+    /// Minutes after which an unpopped `normal` message gets its "not popped
+    /// yet" alert and `delay` receipt. `0` turns the alert off.
+    pub no_pop_alert_normal_minutes: u32,
+    /// The same alert for `high` priority. `0` turns it off.
+    pub no_pop_alert_high_minutes: u32,
+}
+
+impl Default for MessagingSettings {
+    fn default() -> Self {
+        Self {
+            ttl_low_days: 7,
+            ttl_normal_days: 3,
+            ttl_high_hours: 24,
+            no_pop_alert_normal_minutes: 120,
+            no_pop_alert_high_minutes: 15,
+        }
+    }
+}
+
+impl MessagingSettings {
+    /// The deadline policy the store stamps on new messages.
+    #[must_use]
+    pub fn delivery_policy(&self) -> ai_memory_core::DeliveryPolicy {
+        let alert = |minutes: u32| (minutes > 0).then(|| u64::from(minutes) * 60);
+        ai_memory_core::DeliveryPolicy {
+            ttl_low_secs: u64::from(self.ttl_low_days) * 86_400,
+            ttl_normal_secs: u64::from(self.ttl_normal_days) * 86_400,
+            ttl_high_secs: u64::from(self.ttl_high_hours) * 3_600,
+            alert_normal_secs: alert(self.no_pop_alert_normal_minutes),
+            alert_high_secs: alert(self.no_pop_alert_high_minutes),
+        }
+    }
+
+    fn validate(&self) -> anyhow::Result<()> {
+        for (key, value, max) in [
+            ("messaging.ttl_low_days", self.ttl_low_days, 365),
+            ("messaging.ttl_normal_days", self.ttl_normal_days, 365),
+            ("messaging.ttl_high_hours", self.ttl_high_hours, 8_760),
+        ] {
+            if !(1..=max).contains(&value) {
+                anyhow::bail!("{key} must be between 1 and {max}; got {value}");
+            }
+        }
+        for (key, value) in [
+            (
+                "messaging.no_pop_alert_normal_minutes",
+                self.no_pop_alert_normal_minutes,
+            ),
+            (
+                "messaging.no_pop_alert_high_minutes",
+                self.no_pop_alert_high_minutes,
+            ),
+        ] {
+            if value > 525_600 {
+                anyhow::bail!("{key} must be 0 (off) or at most 525600 minutes; got {value}");
+            }
+        }
+        Ok(())
     }
 }
 
@@ -2637,6 +2713,8 @@ impl Config {
         // mistake (a typo of minutes for days), and a huge value would also
         // push the cutoff microsecond arithmetic toward `i64` overflow.
         // Bound it at load rather than at 3am inside the tick.
+        config.messaging.validate()?;
+
         if config.sessions.idle_end_after_hours > 8760 {
             anyhow::bail!(
                 "sessions.idle_end_after_hours must be 0 (off) or at most 8760 hours \
@@ -8173,6 +8251,44 @@ fn ambient_llm_base_url_still_configures_opencode() {
         provider.base_url.as_deref(),
         Some("https://opencode.ai/zen/v1")
     );
+}
+
+// --- `[messaging]` ---------------------------------------------------
+
+/// The defaults are the design's deadlines, a TOML override reaches the
+/// policy, `0` turns an alert off, and an out-of-range TTL fails the load by
+/// naming its key.
+#[test]
+fn messaging_defaults_overrides_and_bounds() {
+    use tempfile::TempDir;
+    assert_eq!(
+        Config::default().messaging.delivery_policy(),
+        ai_memory_core::DeliveryPolicy::default()
+    );
+    let tmp = TempDir::new().unwrap();
+    let config_path = tmp.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        "[messaging]\nttl_high_hours = 2\nno_pop_alert_normal_minutes = 0\n",
+    )
+    .unwrap();
+    let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+    let policy = config.messaging.delivery_policy();
+    assert_eq!(policy.ttl_high_secs, 7_200);
+    assert_eq!(policy.alert_normal_secs, None);
+    assert_eq!(policy.alert_high_secs, Some(900));
+    for bad in [
+        "ttl_low_days = 0",
+        "ttl_normal_days = 366",
+        "ttl_high_hours = 0",
+    ] {
+        std::fs::write(&config_path, format!("[messaging]\n{bad}\n")).unwrap();
+        let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+            .unwrap_err()
+            .to_string();
+        let key = bad.split(' ').next().unwrap();
+        assert!(error.contains(key), "{bad}: {error}");
+    }
 }
 
 // --- `[sessions] idle_end_after_hours` ------------------------------

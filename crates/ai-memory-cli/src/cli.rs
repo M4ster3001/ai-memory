@@ -837,6 +837,9 @@ pub enum MessageCommand {
     Pop(MessagePopArgs),
     /// Retract still-pending messages this project has sent.
     Cancel(MessageCancelArgs),
+    /// Show what happened to a message this project sent: its delivery state
+    /// and timeline.
+    Status(MessageStatusArgs),
     /// Wait for new mail addressed to a harness, without a model, and print
     /// one line per new message id.
     Watch(MessageWatchArgs),
@@ -868,7 +871,34 @@ pub struct MessageSendArgs {
     /// Sender project (defaults to the resolved scope).
     #[arg(long)]
     pub from_project: Option<String>,
+    /// Priority: picks the default time to live and the "not popped yet" alert.
+    #[arg(long, default_value = "normal", value_parser = ["low", "normal", "high"])]
+    pub priority: String,
+    /// Shorter time to live, in seconds. Never extends the priority's default.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(60..=2_592_000))]
+    pub ttl_seconds: Option<u64>,
+    /// Receipts to receive in this project's inbox, comma-separated: `never`,
+    /// or any of `failure`, `delay`, `success` (default `failure,delay`).
+    #[arg(long, value_delimiter = ',', value_parser = ["never", "failure", "delay", "success"])]
+    pub notify: Vec<String>,
     /// Emit JSON instead of a human confirmation.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for `message status`.
+#[derive(Debug, Args)]
+pub struct MessageStatusArgs {
+    /// Sending workspace (defaults to the resolved scope).
+    #[arg(long)]
+    pub workspace: Option<String>,
+    /// Sending project (defaults to the resolved scope).
+    #[arg(long)]
+    pub project: Option<String>,
+    /// Id of the message this project sent.
+    #[arg(long)]
+    pub id: String,
+    /// Emit JSON instead of the human report.
     #[arg(long)]
     pub json: bool,
 }
@@ -885,6 +915,10 @@ pub struct MessageListArgs {
     /// List sent, still-cancellable mail instead of the inbox.
     #[arg(long)]
     pub outbox: bool,
+    /// With `--outbox`, also list delivered, expired and cancelled mail,
+    /// newest first.
+    #[arg(long, requires = "outbox")]
+    pub include_settled: bool,
     /// Maximum messages to list.
     #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u16).range(1..=200))]
     pub limit: u16,

@@ -21,6 +21,7 @@ pub mod latency;
 pub use latency::{LATENCY_BUCKET_BOUNDS_US, LatencyHistogram, LatencySnapshot, LatencyTimer};
 pub mod log_ledger;
 pub mod message;
+pub mod message_delivery;
 pub mod observation;
 pub mod okf;
 pub mod page;
@@ -84,6 +85,10 @@ pub use ids::{
 pub use message::{
     AgentMessage, MessageBox, MessageClaim, MessageNature, MessageOrigin, MessageState,
     NewAgentMessage, UNTRUSTED_MESSAGE_NOTICE,
+};
+pub use message_delivery::{
+    DeliveryEventKind, DeliveryPolicy, DeliveryReason, DeliveryReceipt, DeliveryState,
+    MessageDelivery, MessageKind, MessagePriority, NotifyClass, NotifyOn, ReceiptOutcome,
 };
 pub use observation::{
     FAILED_TOOL_OUTCOME_LINE, FILE_PATH_MAX_CHARS, NewObservation, NewSession, NewSessionUsage,

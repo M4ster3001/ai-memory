@@ -772,12 +772,55 @@ async fn operations_browser_send_and_inbox_reads_preserve_pending_state() {
     assert_eq!(mail[0].to_agent, Some(AgentKind::Codex));
 }
 
+/// Owner decision Q2: a harness that never ran in the recipient project is
+/// accepted as `awaiting_agent`; the Sent view shows that as an escaped
+/// badge, and a browser send asks for no receipts.
+#[tokio::test]
+async fn operations_browser_send_to_an_unregistered_agent_waits_and_sent_shows_it() {
+    let (_tmp, store, wiki, ws, project, _) = fixture().await;
+    let app = router(store.reader.clone(), wiki);
+    let mut waiting = body();
+    waiting["to_agent"] = json!("claude-code");
+    let response = app
+        .clone()
+        .oneshot(send().body(Body::from(waiting.to_string())).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let sent = store
+        .reader
+        .list_messages(ws, project, MessageBox::Outbox, 50)
+        .await
+        .unwrap();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(
+        sent[0].delivery.state,
+        ai_memory_core::DeliveryState::AwaitingAgent
+    );
+    assert_eq!(sent[0].delivery.notify, ai_memory_core::NotifyOn::NEVER);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/inbox?workspace=team&project=app&box=outbox&state=")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = text(response).await;
+    assert!(html.contains(r#"data-delivery="awaiting_agent""#), "{html}");
+    assert!(html.contains("Waiting for the agent to register"));
+    assert!(!html.contains("Review <script>"));
+}
+
 #[tokio::test]
 async fn operations_browser_send_refuses_cross_origin_unknown_recipient_and_empty_body() {
     let (_tmp, store, wiki, ws, project, _) = fixture().await;
     let app = router(store.reader.clone(), wiki);
     let mut unknown = body();
-    unknown["to_agent"] = json!("claude-code");
+    unknown["to_agent"] = json!("not-a-harness");
     let mut empty = body();
     empty["body"] = json!("");
     for value in [unknown, empty] {
@@ -1781,6 +1824,9 @@ async fn operations_edit_needs_write_access_to_the_sender_project_too() {
             body: "do the thing".into(),
             nature: ai_memory_core::MessageNature::Unknown,
             evidence: None,
+            priority: ai_memory_core::MessagePriority::Normal,
+            notify: ai_memory_core::NotifyOn::DEFAULT,
+            ttl_secs: None,
         })
         .await
         .unwrap()

@@ -694,6 +694,18 @@ mid_session = "follow-cwd"
 # claim_on_session_start = true
 # create_on_session_end = true
 
+# Default deadlines of cross-project agent messages, per priority. A sender may
+# shorten a message's time to live with `ttl_seconds`, never extend it. When a
+# message expires, or is still unpopped after the alert delay, the server puts
+# a receipt in the sender's inbox if the sender asked for one. An alert of 0 is
+# off; `low` priority has no alert. See docs/agent-messaging.md.
+# [messaging]
+# ttl_low_days = 7
+# ttl_normal_days = 3
+# ttl_high_hours = 24
+# no_pop_alert_normal_minutes = 120
+# no_pop_alert_high_minutes = 15
+
 # Scheduled server jobs. `enabled` is the master switch. The interval keys are
 # in seconds and 0 disables that job. The forget sweep and lint persist their
 # cadence across restarts, and overdue work starts after a bounded startup

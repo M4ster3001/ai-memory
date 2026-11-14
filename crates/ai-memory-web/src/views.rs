@@ -43,6 +43,9 @@ pub(crate) struct MessageRow {
     pub agent: String,
     pub state: String,
     pub state_label: String,
+    /// Delivery state wire value, shown as a badge in the Sent view.
+    pub delivery: String,
+    pub delivery_label: String,
     pub when: String,
 }
 

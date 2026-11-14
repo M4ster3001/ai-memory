@@ -130,6 +130,9 @@ fn message(
         body: body.into(),
         nature: ai_memory_core::MessageNature::Unknown,
         evidence: None,
+        priority: ai_memory_core::MessagePriority::Normal,
+        notify: ai_memory_core::NotifyOn::DEFAULT,
+        ttl_secs: None,
     }
 }
 

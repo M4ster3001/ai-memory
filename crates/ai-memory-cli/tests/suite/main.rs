@@ -31,6 +31,7 @@ mod jail_toggles_e2e;
 mod live_token_usage_e2e;
 mod marker_scope;
 mod mcp_bridge_stdio;
+mod message_delivery_e2e;
 mod message_e2e;
 mod message_watch_e2e;
 mod opencode_dialect;
