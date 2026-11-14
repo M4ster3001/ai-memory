@@ -177,19 +177,20 @@ shared queues, cancellation, sender provenance and untrusted-message handling.
 ### Waiting for mail without spending tokens
 
 An agent that coordinates others does not need a scheduled prompt that re-lists
-its inbox every minute. `scripts/agent-inbox-watch.py` checks the inbox over
-HTTP with no model, prints one line per new message for a harness, and exits or
-runs a fixed command so the agent wakes only when mail arrives. It never pops a
-message and never prints a body. It needs a TCP connection to the server, so
-run it outside a sandbox that blocks local sockets.
+its inbox every minute. `ai-memory message watch` waits on the server with no
+model: the server answers as soon as a send to that inbox and harness commits.
+It prints one line per new message id, and exits or runs a fixed command so the
+agent wakes only when mail arrives. It never pops a message and never prints a
+subject, body or sender. It needs a TCP connection to the server, so run it
+outside a sandbox that blocks local sockets. `scripts/agent-inbox-watch.py` is
+a polling alternative in Python.
 
-Prerequisites: Python 3.8 or newer on a POSIX host, the server's HTTP port and a
-token that can read the project's inbox.
+Prerequisites: the server's HTTP port and a credential that can read the
+project's inbox (a DB-user API key is enough).
 
-Verify: start it with `--once` while a message is pending for the agent and
-check that one line with the message id appears, then run it again and check
-that nothing repeats. `--summary` prints the pending count without changing
-state. See [the guide](agent-messaging.md#waiting-for-mail-without-a-model) for
+Verify: run `ai-memory message watch --agent <harness> --once` while a message
+is pending for that harness and check that one line with the message id
+appears, then run it again and check that nothing repeats. See [the guide](agent-messaging.md#waiting-for-mail-without-a-model) for
 the options, the instant-wake webhook and the Codex recipe.
 
 ## Handoffs and compaction recovery
