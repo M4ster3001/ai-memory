@@ -7657,6 +7657,7 @@ mod tests {
             "/mcp",
             "/hook",
             "/handoff",
+            "/inbox/watch",
             "/workstream/runs",
         ] {
             protected_host = protected_host.route(
@@ -7686,6 +7687,7 @@ mod tests {
             (axum::http::Method::POST, "/mcp"),
             (axum::http::Method::POST, "/hook"),
             (axum::http::Method::GET, "/handoff"),
+            (axum::http::Method::GET, "/inbox/watch"),
             (axum::http::Method::POST, "/workstream/runs"),
         ] {
             let response = router

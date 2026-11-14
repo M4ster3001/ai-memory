@@ -816,8 +816,9 @@ fn admission_skips(
 
 /// Build a router with `POST /hook` (event ingress), `GET /handoff`
 /// (synchronous handoff-fetch for session-start hooks), `GET /brief` (the
-/// read-only project brief for a subagent start) and `GET /recap` (the
-/// read-only compaction recap for a "reload context" prompt).
+/// read-only project brief for a subagent start), `GET /recap` (the
+/// read-only compaction recap for a "reload context" prompt) and
+/// `GET /inbox/watch` (the long-poll for new agent mail).
 pub fn hook_router(state: HookState) -> Router {
     Router::new()
         .route(
@@ -831,6 +832,7 @@ pub fn hook_router(state: HookState) -> Router {
         .route("/handoff", get(handle_handoff))
         .route("/brief", get(handle_brief))
         .route("/recap", get(crate::recap::handle_recap))
+        .route("/inbox/watch", get(crate::inbox_watch::handle_inbox_watch))
         .with_state(Arc::new(state))
 }
 
