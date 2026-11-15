@@ -1049,6 +1049,8 @@ diag-supervise-approve-argv = { "  " }argv: { $argv }
 diag-supervise-approve-cwd = { "  " }working directory: { $path }
 diag-supervise-approve-env = { "  " }environment: { $keys }
 diag-supervise-approve-woken-by = { "  " }woken by: { $projects }
+diag-supervise-approve-unverified-off = { "  " }wake_unverified: false (a listed project wakes it only when the server recorded the sender's session)
+diag-supervise-approve-unverified-on = { "  " }wake_unverified: true; any local process with the server token can wake this agent; the wake text is fixed and the wake limits still apply
 diag-supervise-approve-prompt = Approve? [y/N]{ " " }
 diag-supervise-approve-declined = Not approved; nothing was recorded.
 diag-supervise-approved = Approved { $name }; the supervisor will run it.
@@ -1073,6 +1075,7 @@ diag-supervisor-bad-name = name must be 1 to 40 lowercase letters, digits or '-'
 diag-supervisor-bad-agent = agent must be a canonical harness name, such as codex or claude-code
 diag-supervisor-bad-scope = { $key } must be a non-empty name without control characters
 diag-supervisor-wake-from-cap = wake_from may name at most { $max } projects
+diag-supervisor-unverified-needs-wake-from = wake_unverified = true needs at least one wake_from project
 diag-supervisor-budget-range = wakes_per_hour must be between 1 and 60 and wakes_per_day between 1 and 1440
 diag-supervisor-timeout-range = timeout_secs must be between 5 and 300
 diag-supervisor-program-absolute = the adapter program must be an absolute path

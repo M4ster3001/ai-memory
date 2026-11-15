@@ -1851,6 +1851,13 @@ pub struct SupervisedAgent {
     /// session there. Receipts about the agent's own mail always may.
     #[serde(default)]
     pub wake_from: Vec<WakeFrom>,
+    /// Also wake for mail from a `wake_from` project when the server has no
+    /// session of the sender recorded there (the `unverified` label). Off by
+    /// default. With it on, any local process holding the server token can
+    /// wake the agent; the wake text and the wake limits stay the same.
+    /// Needs at least one `wake_from` project.
+    #[serde(default)]
+    pub wake_unverified: bool,
     /// The adapter that wakes the agent.
     pub adapter: WakeAdapterConfig,
     /// Adapter launches allowed in any rolling hour (default 4).
@@ -2010,6 +2017,9 @@ impl SupervisedAgent {
                 "wake_from may name at most {} projects",
                 ai_memory_hooks::MAX_WAKE_FROM
             );
+        }
+        if self.wake_unverified && self.wake_from.is_empty() {
+            anyhow::bail!("wake_unverified = true needs at least one wake_from project");
         }
         if !(1..=60).contains(&self.wakes_per_hour) || !(1..=1_440).contains(&self.wakes_per_day) {
             anyhow::bail!(

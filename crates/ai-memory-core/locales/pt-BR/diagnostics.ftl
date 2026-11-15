@@ -1058,6 +1058,8 @@ diag-supervise-approve-argv = { "  " }argv: { $argv }
 diag-supervise-approve-cwd = { "  " }diretório de trabalho: { $path }
 diag-supervise-approve-env = { "  " }ambiente: { $keys }
 diag-supervise-approve-woken-by = { "  " }acordado por: { $projects }
+diag-supervise-approve-unverified-off = { "  " }wake_unverified: false (um projeto listado só o acorda quando o servidor registrou a sessão do remetente)
+diag-supervise-approve-unverified-on = { "  " }wake_unverified: true; qualquer processo local com o token do servidor pode acordar este agente; o texto do acordar é fixo e os limites de acionamentos continuam valendo
 diag-supervise-approve-prompt = Aprovar? [s/N]{ " " }
 diag-supervise-approve-declined = Não aprovado; nada foi gravado.
 diag-supervise-approved = { $name } aprovado; o supervisor vai executá-lo.
@@ -1082,6 +1084,7 @@ diag-supervisor-bad-name = name precisa ter de 1 a 40 letras minúsculas, dígit
 diag-supervisor-bad-agent = agent precisa ser um nome canônico de cliente, como codex ou claude-code
 diag-supervisor-bad-scope = { $key } precisa ser um nome não vazio sem caracteres de controle
 diag-supervisor-wake-from-cap = wake_from pode nomear no máximo { $max } projetos
+diag-supervisor-unverified-needs-wake-from = wake_unverified = true exige pelo menos um projeto em wake_from
 diag-supervisor-budget-range = wakes_per_hour precisa estar entre 1 e 60 e wakes_per_day entre 1 e 1440
 diag-supervisor-timeout-range = timeout_secs precisa estar entre 5 e 300
 diag-supervisor-program-absolute = o programa do adaptador precisa ser um caminho absoluto
