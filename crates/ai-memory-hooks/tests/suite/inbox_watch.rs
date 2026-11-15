@@ -22,20 +22,20 @@ use crate::router::{
     ProjectCacheStore, SessionAgents, SubagentSessionSet, hook_router,
 };
 
-const WORKSPACE: &str = "team";
-const INBOX: &str = "inbox-project";
-const SENDER: &str = "sender-project";
+pub(super) const WORKSPACE: &str = "team";
+pub(super) const INBOX: &str = "inbox-project";
+pub(super) const SENDER: &str = "sender-project";
 
-struct Harness {
+pub(super) struct Harness {
     _tmp: TempDir,
     _store: Store,
-    app: axum::Router,
-    state: HookState,
-    inbox: (WorkspaceId, ProjectId),
-    sender: (WorkspaceId, ProjectId),
+    pub(super) app: axum::Router,
+    pub(super) state: HookState,
+    pub(super) inbox: (WorkspaceId, ProjectId),
+    pub(super) sender: (WorkspaceId, ProjectId),
 }
 
-async fn harness() -> Harness {
+pub(super) async fn harness() -> Harness {
     let tmp = TempDir::new().unwrap();
     let store = Store::open(tmp.path()).unwrap();
     let ws = store
@@ -111,7 +111,7 @@ fn watch_request(query: &str, viewer: Option<UserId>) -> Request<Body> {
     request
 }
 
-async fn call(app: &axum::Router, request: Request<Body>) -> (StatusCode, String) {
+pub(super) async fn call(app: &axum::Router, request: Request<Body>) -> (StatusCode, String) {
     let response = app.clone().oneshot(request).await.unwrap();
     let status = response.status();
     let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
