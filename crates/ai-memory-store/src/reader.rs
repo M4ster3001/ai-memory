@@ -2530,6 +2530,10 @@ pub struct WakeCandidate {
     pub from_workspace_id: WorkspaceId,
     /// The sending project.
     pub from_project_id: ProjectId,
+    /// The harness the message names as its sender: the recorded session's
+    /// agent, else the one the sender declared. Used only to tell an agent's
+    /// mail to itself from other mail of its own project.
+    pub from_agent: AgentKind,
     /// Whether the server recorded the sender's hook session in the sending
     /// project at send time (`from_session_id`).
     pub sender_session_recorded: bool,
@@ -9862,7 +9866,8 @@ impl ReaderPool {
 
     /// The pending mail `agent` could be woken for in one inbox, as
     /// [`Self::inbox_watch_snapshot`] selects it, with each message's kind,
-    /// sending project ids and whether its sender's session was recorded.
+    /// sending project ids and harness, and whether its sender's session was
+    /// recorded.
     /// Oldest first, at most `limit` rows.
     ///
     /// # Errors
@@ -9878,7 +9883,8 @@ impl ReaderPool {
         let limit = i64::try_from(limit.clamp(1, 1_000)).unwrap_or(1_000);
         self.with_conn(move |conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, kind, from_workspace_id, from_project_id, from_session_id IS NOT NULL \
+                "SELECT id, kind, from_workspace_id, from_project_id, from_session_id IS NOT NULL, \
+                 from_agent \
                  FROM agent_messages \
                  WHERE to_workspace_id = ?1 AND to_project_id = ?2 AND state = 'pending' \
                    AND (to_agent = ?3 OR (?4 AND to_agent IS NULL)) \
@@ -9899,17 +9905,19 @@ impl ReaderPool {
                         row.get::<_, Vec<u8>>(2)?,
                         row.get::<_, Vec<u8>>(3)?,
                         row.get::<_, bool>(4)?,
+                        row.get::<_, String>(5)?,
                     ))
                 },
             )?;
             let mut out = Vec::new();
             for row in rows {
-                let (id, kind, from_ws, from_pj, recorded) = row?;
+                let (id, kind, from_ws, from_pj, recorded, from_agent) = row?;
                 out.push(WakeCandidate {
                     id: MessageId::from_slice(&id)?,
                     kind: kind.parse().map_err(StoreError::from)?,
                     from_workspace_id: WorkspaceId::from_slice(&from_ws)?,
                     from_project_id: ProjectId::from_slice(&from_pj)?,
+                    from_agent: AgentKind::from_wire(&from_agent),
                     sender_session_recorded: recorded,
                 });
             }

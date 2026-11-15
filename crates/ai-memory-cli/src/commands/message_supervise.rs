@@ -598,10 +598,16 @@ struct Candidate {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum CandidateSender {
+    SameProject,
+    SameAgent,
     Listed,
     Unverified,
     Unlisted,
     System,
+    /// A label a newer server sends that this supervisor does not know.
+    /// It never wakes.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Serialize)]
@@ -624,19 +630,23 @@ struct ReportReply {
 }
 
 /// The messages of `candidates` that may wake `entry`, in server order:
-/// a listed sender whose session the server recorded, a listed sender with
-/// no recorded session when the entry sets `wake_unverified`, or a receipt
-/// when the adapter reaches a live session (owner decision Q6). An unlisted
-/// sender never wakes.
+/// another agent of the watched project (no authorization needed inside a
+/// project), a listed sender whose session the server recorded, a listed
+/// sender with no recorded session when the entry sets `wake_unverified`,
+/// or a receipt when the adapter reaches a live session (owner decision Q6).
+/// The agent's own mail to itself, an unlisted sender and an unknown label
+/// never wake.
 fn wakeable(entry: &Entry, candidates: &[Candidate], fresh: &[String]) -> Vec<String> {
     let fresh: HashSet<&str> = fresh.iter().map(String::as_str).collect();
     candidates
         .iter()
         .filter(|candidate| match candidate.sender {
-            CandidateSender::Listed => true,
+            CandidateSender::SameProject | CandidateSender::Listed => true,
             CandidateSender::Unverified => entry.wake_unverified,
             CandidateSender::System => entry.adapter.wakes_live_session(),
-            CandidateSender::Unlisted => false,
+            CandidateSender::SameAgent | CandidateSender::Unlisted | CandidateSender::Unknown => {
+                false
+            }
         })
         .filter_map(|candidate| canonical_message_id(&candidate.id))
         .filter(|id| fresh.contains(id.as_str()))
@@ -1126,7 +1136,7 @@ fn approve_interactive(
         .chain(std::iter::once("PATH"))
         .collect();
     let wake_from = if entry.wake_from.is_empty() {
-        "receipts only".to_owned()
+        "no other project".to_owned()
     } else {
         entry
             .wake_from
@@ -1136,11 +1146,17 @@ fn approve_interactive(
             .join(", ")
     };
     let unverified = if entry.wake_unverified {
-        "  wake_unverified: true; any local process with the server token can wake this agent; \
-         the wake text is fixed and the wake limits still apply"
+        "  wake_unverified: true (a listed project wakes it without a recorded sender session)"
     } else {
         "  wake_unverified: false (a listed project wakes it only when the server recorded the \
          sender's session)"
+    };
+    let risk = if entry.wake_unverified {
+        "  any local process with the server token can wake this agent through mail sent as \
+         its own project or a listed one; the wake text is fixed and the wake limits still apply"
+    } else {
+        "  any local process with the server token can wake this agent through mail sent as \
+         its own project; the wake text is fixed and the wake limits still apply"
     };
     let lines = [
         crate::localization::diagnostic(
@@ -1173,9 +1189,18 @@ fn approve_interactive(
         crate::localization::diagnostic(i18n, format!("  environment: {}", env_keys.join(", "))),
         crate::localization::diagnostic(
             i18n,
+            format!(
+                "  own project: other agents of {}/{} wake it with no wake_from entry or recorded session",
+                super::show::terminal_text(&entry.workspace),
+                super::show::terminal_text(&entry.project),
+            ),
+        ),
+        crate::localization::diagnostic(
+            i18n,
             format!("  woken by: {}", super::show::terminal_text(&wake_from)),
         ),
         crate::localization::diagnostic(i18n, unverified),
+        crate::localization::diagnostic(i18n, risk),
     ];
     for line in &lines {
         writeln!(output, "{line}")?;
@@ -1524,27 +1549,62 @@ mod tests {
         on.wake_unverified = true;
         let text = shown(&off, Language::English);
         assert!(text.contains("  wake_unverified: false ("), "{text}");
-        assert!(!text.contains("server token"), "{text}");
+        assert!(
+            text.contains(
+                "  own project: other agents of default/linha wake it with no wake_from entry or \
+                 recorded session\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "  any local process with the server token can wake this agent through mail sent \
+                 as its own project; the wake text is fixed and the wake limits still apply\n"
+            ),
+            "{text}"
+        );
         let text = shown(&on, Language::English);
         assert!(
             text.contains(
-                "  wake_unverified: true; any local process with the server token can wake this \
-                 agent; the wake text is fixed and the wake limits still apply\n"
+                "  wake_unverified: true (a listed project wakes it without a recorded sender \
+                 session)\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "  any local process with the server token can wake this agent through mail sent \
+                 as its own project or a listed one; the wake text is fixed and the wake limits \
+                 still apply\n"
             ),
             "{text}"
         );
         let text = shown(&on, Language::PortugueseBrazil);
         assert!(
             text.contains(
-                "  wake_unverified: true; qualquer processo local com o token do servidor pode \
-                 acordar este agente; o texto do acordar é fixo e os limites de acionamentos \
-                 continuam valendo\n"
+                "  qualquer processo local com o token do servidor pode acordar este agente com \
+                 mensagens enviadas como o próprio projeto ou um projeto listado; o texto do \
+                 acordar é fixo e os limites de acionamentos continuam valendo\n"
             ),
+            "{text}"
+        );
+        assert!(
+            text.contains("  wake_unverified: true (um projeto listado o acorda"),
             "{text}"
         );
         let text = shown(&off, Language::PortugueseBrazil);
         assert!(
             text.contains("  wake_unverified: false (um projeto listado"),
+            "{text}"
+        );
+        assert!(
+            text.contains("  próprio projeto: outros agentes de default/linha o acordam"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "pode acordar este agente com mensagens enviadas como o próprio projeto; o texto"
+            ),
             "{text}"
         );
     }

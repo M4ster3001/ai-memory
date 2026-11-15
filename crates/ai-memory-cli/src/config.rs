@@ -1846,16 +1846,18 @@ pub struct SupervisedAgent {
     /// Also wake for mail sent to the whole project, with no target harness.
     #[serde(default)]
     pub include_shared: bool,
-    /// Projects whose mail may wake the agent. A message wakes it only when
-    /// it comes from one of them and the server recorded the sender's
-    /// session there. Receipts about the agent's own mail always may.
+    /// Other projects whose mail may wake the agent. A message from another
+    /// project wakes it only when that project is listed and the server
+    /// recorded the sender's session there. Mail from another agent of the
+    /// agent's own project needs no entry, and receipts about the agent's
+    /// own mail always may wake it. Optional.
     #[serde(default)]
     pub wake_from: Vec<WakeFrom>,
     /// Also wake for mail from a `wake_from` project when the server has no
     /// session of the sender recorded there (the `unverified` label). Off by
     /// default. With it on, any local process holding the server token can
-    /// wake the agent; the wake text and the wake limits stay the same.
-    /// Needs at least one `wake_from` project.
+    /// wake the agent as that project; the wake text and the wake limits
+    /// stay the same. Needs a `wake_from` project other than the agent's own.
     #[serde(default)]
     pub wake_unverified: bool,
     /// The adapter that wakes the agent.
@@ -2018,8 +2020,14 @@ impl SupervisedAgent {
                 ai_memory_hooks::MAX_WAKE_FROM
             );
         }
-        if self.wake_unverified && self.wake_from.is_empty() {
-            anyhow::bail!("wake_unverified = true needs at least one wake_from project");
+        let other_project = self.wake_from.iter().any(|scope| {
+            (scope.workspace.trim(), scope.project.trim())
+                != (self.workspace.trim(), self.project.trim())
+        });
+        if self.wake_unverified && !other_project {
+            anyhow::bail!(
+                "wake_unverified = true needs at least one wake_from project other than the agent's own"
+            );
         }
         if !(1..=60).contains(&self.wakes_per_hour) || !(1..=1_440).contains(&self.wakes_per_day) {
             anyhow::bail!(
@@ -8616,7 +8624,8 @@ fn messaging_supervisor_entries_are_closed_typed_and_bounded() {
 }
 
 /// `wake_unverified` is off unless an entry sets it to a boolean, and it
-/// needs a `wake_from` project to mean anything.
+/// needs a `wake_from` project other than the agent's own to mean anything.
+/// `wake_from` itself is optional.
 #[test]
 fn messaging_supervisor_wake_unverified_is_an_opt_in_boolean() {
     use tempfile::TempDir;
@@ -8641,6 +8650,10 @@ fn messaging_supervisor_wake_unverified_is_an_opt_in_boolean() {
     assert!(config.messaging.supervisor.agents[0].wake_unverified);
     let config = load(&entry("", "wake_unverified = false\n")).unwrap();
     assert!(!config.messaging.supervisor.agents[0].wake_unverified);
+    assert!(config.messaging.supervisor.agents[0].wake_from.is_empty());
+    let no_wake_from = entry("", "").replace("wake_from = []\n", "");
+    let config = load(&no_wake_from).unwrap();
+    assert!(config.messaging.supervisor.agents[0].wake_from.is_empty());
 
     for bad in ["\"yes\"", "1", "\"true\"", "[true]"] {
         let error = format!(
@@ -8649,14 +8662,21 @@ fn messaging_supervisor_wake_unverified_is_an_opt_in_boolean() {
         );
         assert!(error.contains("wake_unverified"), "{bad}: {error}");
     }
-    let error = format!(
-        "{:#}",
-        load(&entry("", "wake_unverified = true\n")).unwrap_err()
-    );
-    assert!(
-        error.contains("wake_unverified = true needs at least one wake_from project"),
-        "{error}"
-    );
+    let own = "{ workspace = \"default\", project = \"api\" }";
+    for wake_from in ["", own] {
+        let error = format!(
+            "{:#}",
+            load(&entry(wake_from, "wake_unverified = true\n")).unwrap_err()
+        );
+        assert!(
+            error.contains(
+                "wake_unverified = true needs at least one wake_from project other than the agent's own"
+            ),
+            "{wake_from}: {error}"
+        );
+    }
+    let both = format!("{own}, {web}");
+    assert!(load(&entry(&both, "wake_unverified = true\n")).is_ok());
 }
 
 // --- `[sessions] idle_end_after_hours` ------------------------------

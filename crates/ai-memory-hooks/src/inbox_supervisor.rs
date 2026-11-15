@@ -5,9 +5,11 @@
 //!
 //! - `POST /inbox/wake-candidates` applies its sender gate on the server. The
 //!   supervisor sends the projects it may be woken by (`wake_from`); the
-//!   answer says, per pending message, only whether the sender is one of them
-//!   with a recorded session, is one of them without one, is someone else, or
-//!   is the server (a receipt). Sender names and ids never leave the server.
+//!   answer says, per pending message, only whether the sender is another
+//!   agent of the watched project, the watched agent itself, one of the
+//!   listed projects with a recorded session, one of them without one,
+//!   someone else, or the server (a receipt). Sender names and ids never
+//!   leave the server.
 //! - `POST /inbox/wake-report` records what a wake did, from enumerated values
 //!   only (`state`, `reason`, a bounded `retry_after_secs`), so the server can
 //!   set the delivery state, write the timeline and send the sender its
@@ -67,9 +69,19 @@ pub(crate) struct WakeCandidatesRequest {
 }
 
 /// Who sent a pending message, as far as the sender gate is concerned.
+/// The labels are checked in order: receipt, own project, `wake_from`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum WakeSender {
+    /// The watched project itself, from a harness other than the watched
+    /// agent. Mail inside one project needs no `wake_from` and no recorded
+    /// session.
+    SameProject,
+    /// The watched project itself, from the watched agent's own harness: an
+    /// agent's mail to itself, which must not wake it (a wake that makes it
+    /// write to itself again would loop). Two sessions of one harness in one
+    /// project cannot be told apart, so their mail to each other lands here.
+    SameAgent,
     /// A project in `wake_from`, and the server recorded the sender's
     /// session there when the message was sent.
     Listed,
@@ -283,8 +295,14 @@ pub(crate) async fn handle_wake_candidates(
     let messages = candidates
         .into_iter()
         .map(|candidate| {
+            let own_project = candidate.from_workspace_id == scope.workspace_id
+                && candidate.from_project_id == scope.project_id;
             let sender = match candidate.kind {
                 MessageKind::Receipt => WakeSender::System,
+                MessageKind::Message if own_project && candidate.from_agent == agent => {
+                    WakeSender::SameAgent
+                }
+                MessageKind::Message if own_project => WakeSender::SameProject,
                 MessageKind::Message
                     if listed
                         .contains(&(candidate.from_workspace_id, candidate.from_project_id)) =>
