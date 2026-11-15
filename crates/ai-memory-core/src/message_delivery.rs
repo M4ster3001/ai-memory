@@ -93,11 +93,12 @@ wire_enum! {
     /// queue state that the claim guards read.
     ///
     /// The server sets `queued`, `awaiting_agent`, `delivered`, `expired` and
-    /// `cancelled` today. `wake_attempted`, `wake_failed`, `agent_unavailable`
-    /// and `quota_exhausted` belong to the host wake supervisor and `dead` to
-    /// delivery leases; both are later stages of the design, and nothing sets
-    /// these values yet. They are part of the stored vocabulary so a reader
-    /// never fails on them.
+    /// `cancelled` itself. `wake_attempted`, `wake_failed`, `agent_unavailable`
+    /// and `quota_exhausted` come from the host wake supervisor's reports
+    /// (`POST /inbox/wake-report`, [`crate::message_wake::WakeOutcome`]).
+    /// `dead` belongs to delivery leases, a later stage of the design, and
+    /// nothing sets it yet; it is part of the stored vocabulary so a reader
+    /// never fails on it.
     DeliveryState, "delivery state" {
         /// Stored and claimable; no wake attempted.
         Queued => "queued",
@@ -105,15 +106,15 @@ wire_enum! {
         /// project. It becomes `queued` when that harness first starts a
         /// session there.
         AwaitingAgent => "awaiting_agent",
-        /// Reserved: a wake was launched.
+        /// The wake supervisor launched a wake that its adapter accepted.
         WakeAttempted => "wake_attempted",
         /// Popped by the recipient. Terminal.
         Delivered => "delivered",
-        /// Reserved: a wake adapter failed.
+        /// A wake failed or was not launched; the reason says why.
         WakeFailed => "wake_failed",
-        /// Reserved: no adapter or session could reach the recipient.
+        /// The wake adapter could not run at all.
         AgentUnavailable => "agent_unavailable",
-        /// Reserved: the recipient's harness reported exhausted quota.
+        /// The recipient's harness reported exhausted quota.
         QuotaExhausted => "quota_exhausted",
         /// The time to live passed while it waited. Terminal.
         Expired => "expired",
@@ -128,8 +129,10 @@ wire_enum! {
     /// Why a message is in its delivery state. Never free text.
     ///
     /// The server records `agent_not_registered`, `no_pop_timeout`, `ttl` and
-    /// `sender_cancelled` today. The other values are the wake supervisor's
-    /// vocabulary from the design and are not produced yet.
+    /// `sender_cancelled` itself. The wake supervisor reports the adapter,
+    /// budget and approval reasons. `session_not_found`, `rate_limited`,
+    /// `auth_failed` and `sender_unverified` are the design's vocabulary for
+    /// later adapters and are not produced yet.
     DeliveryReason, "delivery reason" {
         /// Addressed to a harness not registered in the recipient project.
         AgentNotRegistered => "agent_not_registered",
@@ -139,21 +142,21 @@ wire_enum! {
         Ttl => "ttl",
         /// The sender cancelled it.
         SenderCancelled => "sender_cancelled",
-        /// Reserved.
+        /// The wake adapter exited with an error or was killed by a signal.
         AdapterExitNonzero => "adapter_exit_nonzero",
-        /// Reserved.
+        /// The wake adapter ran past its timeout and was stopped.
         AdapterTimeout => "adapter_timeout",
-        /// Reserved.
+        /// The wake adapter's program could not be started.
         BinaryMissing => "binary_missing",
-        /// Reserved.
+        /// The wake adapter has no valid operator approval.
         NotApproved => "not_approved",
-        /// Reserved.
+        /// The recipient's wake budget is spent for now.
         BudgetExhausted => "budget_exhausted",
-        /// Reserved.
+        /// The recipient's session refused the wake as busy.
         SessionBusy => "session_busy",
         /// Reserved.
         SessionNotFound => "session_not_found",
-        /// Reserved: [`crate::quota::quota_signal`] matched the output.
+        /// [`crate::quota::quota_signal`] matched the wake adapter's output.
         QuotaMarker => "quota_marker",
         /// Reserved.
         RateLimited => "rate_limited",
@@ -173,11 +176,11 @@ wire_enum! {
         Delayed => "delayed",
         /// Its time to live passed (`failure`).
         Expired => "expired",
-        /// Reserved (`failure`).
+        /// A wake failed (`failure`).
         WakeFailed => "wake_failed",
-        /// Reserved (`failure`).
+        /// The wake adapter could not run (`failure`).
         AgentUnavailable => "agent_unavailable",
-        /// Reserved (`failure`).
+        /// The recipient is out of quota (`failure`).
         QuotaExhausted => "quota_exhausted",
         /// Reserved (`failure`).
         Dead => "dead",
@@ -201,6 +204,14 @@ wire_enum! {
         ReceiptSent => "receipt_sent",
         /// A receipt could not be stored (sender inbox full) and was dropped.
         ReceiptDropped => "receipt_dropped",
+        /// The wake supervisor launched a wake.
+        WakeAttempted => "wake_attempted",
+        /// A wake failed or was not launched.
+        WakeFailed => "wake_failed",
+        /// The wake adapter could not run.
+        AgentUnavailable => "agent_unavailable",
+        /// The recipient's harness reported exhausted quota.
+        QuotaExhausted => "quota_exhausted",
     }
 }
 
@@ -472,8 +483,8 @@ pub struct MessageDelivery {
     pub state: DeliveryState,
     /// Why, when there is a reason to give.
     pub reason: Option<DeliveryReason>,
-    /// When the recipient's quota resets, when known. Set only with
-    /// `quota_exhausted`, which nothing produces yet.
+    /// When the recipient's quota resets, when its harness stated it. Set
+    /// only with `quota_exhausted`.
     pub retry_after: Option<Timestamp>,
     /// When the message expires if nobody pops it. `None` for mail sent
     /// before delivery states existed.
@@ -502,6 +513,9 @@ pub struct DeliveryReceipt {
     pub reason: Option<DeliveryReason>,
     /// When the server generated the receipt.
     pub at: Timestamp,
+    /// When the recipient's quota resets, on a `quota_exhausted` receipt
+    /// whose harness stated it.
+    pub retry_after: Option<Timestamp>,
 }
 
 /// Subject of a receipt: `receipt: <outcome> <original id>`.
