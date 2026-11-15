@@ -52,7 +52,12 @@ untrusted-message rules apply to shared and addressed mail alike.
 
 Every listed message carries `delivery` (`state`: queued, awaiting_agent,
 delivered, expired or cancelled, plus a `reason` from a fixed list and
-`expires_at`). To see what happened to mail you sent, call
+`expires_at`). Where the operator runs the wake supervisor, the state can
+also be wake_attempted, wake_failed, agent_unavailable or quota_exhausted;
+the last one may give `retry_after`, when the recipient's quota resets. Each
+of these still leaves the message in the recipient's inbox. Which agents get
+woken, and by whom, is the operator's configuration on the host; never edit
+it or run `ai-memory message supervise approve` for the user. To see what happened to mail you sent, call
 `memory_message_list` with `box: "outbox"`, `include_settled: true` and, for
 one message, `message_id`. `memory_message_send` takes optional `priority`
 (`low`, `normal`, `high`), `ttl_seconds` (shortens only) and `notify` (`never`,

@@ -7,7 +7,10 @@ requests: #25 (`feat/agent-inbox-watcher`, the Python script) and #26
 signal and `ai-memory message watch`). Slice 2 (delivery states, deadlines,
 receipts, the agent registry and the shared quota classifier) is implemented
 on `feat/delivery-status`; [Slice 2 as built](#slice-2-as-built) lists where
-it differs from this note. Everything else is a proposal. The note was
+it differs from this note. Slice 3a (the minimal supervisor with the
+`codex_queue` adapter) is implemented on `feat/supervisor`;
+[Slice 3a as built](#slice-3a-as-built) lists its differences. Everything else
+is a proposal. The note was
 written against `160cafdd` and `ff7ea8de` (workspace version 3.4.5; the
 highest migration there is V101, not V99 as an earlier draft said; #26 adds
 none). Line numbers below refer to those commits. It
@@ -738,7 +741,7 @@ One `CHANGELOG.md` entry per slice under `[Unreleased]`.
 |---|---|---|
 | 1 | Commit signal, `GET /inbox/watch`, `message watch`, Python bridge | implemented, #25/#26 open |
 | 2 | Delivery states, TTL, priority, no-pop alerts, receipts, presence (passive), shared quota classifier, outbox delivery view, capabilities endpoint, agent registry | implemented on `feat/delivery-status` except presence and the capabilities endpoint ([as built](#slice-2-as-built)) |
-| 3 | Supervisor with live adapters, approval, budgets, reports, heartbeat, service unit, `message adopt` | proposal, **next priority after 2** |
+| 3 | Supervisor with live adapters, approval, budgets, reports, heartbeat, service unit, `message adopt` | 3a (supervisor, `codex_queue`, approval, budgets, reports, printed unit) implemented on `feat/supervisor` ([as built](#slice-3a-as-built)); heartbeat, presence, `adopt` and the Claude adapters are open |
 | 4 | Dead-session wake through managed-workstream resume | proposal |
 | 5 | Validator unification and envelope v1, nonce fence | proposal (could run in parallel with 2) |
 | 6 | Leases and ack, loop caps, rate limit, quarantine | proposal |
@@ -922,6 +925,73 @@ V103 (delivery). It departs from §4.4, §4.6 and §9 in these places:
   only) or receipts waking the sender, which needs slice 3. The quota
   classifier is exposed and tested; nothing maps an adapter error to
   `quota_exhausted` yet.
+
+## Slice 3a as built
+
+Slice 3a landed on `feat/supervisor` as `ai-memory message supervise`, the
+`codex_queue` adapter, terminal approval, budgets and wake reports, plus
+migration V104. Owner decisions applied: Q1 (host supervisor only), Q3
+(terminal approval), Q5 (`codex queue` without `--resume` first), Q6 (a
+receipt wakes only through a live adapter), Q8 (4 per hour, 24 per day per
+agent, 20 per hour in total), and the later decision that at most 2 adapters
+run at once and never two for one agent unless the operator raises
+`max_concurrent_wakes` (at most 8). It departs from §4.7, §4.8 and §9 here:
+
+- Slice 2 said the CHECK lists would spare later slices a rebuild. That held
+  for `agent_messages`, not for `message_delivery_events`, whose `event` CHECK
+  listed only server events. V104 rebuilds that table (keeping row ids) to add
+  `wake_attempted`, `wake_failed`, `agent_unavailable` and `quota_exhausted`.
+- There is no `from_agent_source` column. A sender counts as verified when the
+  message has `from_session_id`, which the MCP send sets only when the session
+  id the client named exists in the sending project. The server code calls
+  that id "a name, not a credential", so the gate keeps out unlisted and
+  unnamed senders, not a same-user process that knows a session id.
+- The sender gate runs on the server. `POST /inbox/wake-candidates` takes the
+  entry's `wake_from` list and answers `listed`, `unverified`, `unlisted` or
+  `system` per pending message, resolving `wake_from` with the caller's own
+  read access, so the supervisor never learns a sender's name. Unverified and
+  unlisted mail is not reported; the design's `sender_unverified` `delay`
+  receipt is not sent, and the normal "not popped yet" alert covers that mail.
+- `POST /inbox/wake-report` takes `{workspace, project, agent, message_ids,
+  state, reason, retry_after_secs}`. The design's `entry`, `adapter`,
+  `exit_class` and `attempt` fields are left out: the server does not need
+  them, and each attempt is one timeline event. Allowed state and reason pairs
+  are fixed in `WakeOutcome::from_report`. Both routes need `Write` on the
+  inbox.
+- Configuration is `[messaging.supervisor]` with `[[messaging.supervisor.agents]]`
+  entries holding one `adapter` table (`kind = "codex_queue"`, `program`,
+  `thread`), not `[[supervisor.agents]]` with `live` and `dead` tables. There
+  is no `dead_runs_per_day` and no `cwd` key until slice 4 brings stopped-session
+  adapters; the working directory is the state directory.
+- Approval prints the canonical program path and SHA-256, the argv with a
+  placeholder id, the working directory, the environment names and
+  `wake_from`, and asks `[y/N]`. It does not run a self-test wake first, which
+  would execute the adapter before consent. The digest covers the entry, the
+  argv shape, the program path and content hash, the working directory and the
+  timeout; ownership and mode are checked before every run instead of being
+  hashed. `message supervise` started in a terminal offers the same prompt.
+- The temporary-directory check uses a fixed list (`/tmp`, `/var/tmp`,
+  `/dev/shm`) and also refuses a program in any world-writable directory;
+  `TMPDIR` is not read, following invariant #1.
+- The quota circuit uses a fixed 900 seconds when the harness states no reset,
+  the same value as `llm_quota_cooldown_secs`, without reading that key.
+- Instead of a local JSONL audit log, the supervisor writes one stderr line per
+  wake or report for the service manager's journal, with entry names, adapter
+  ids, message ids, counts and outcomes. The timeline events are the audit.
+- The process group is killed with the system `kill` at a fixed path, because
+  the workspace forbids `unsafe` and has no safe `killpg` wrapper.
+- `message supervise unit` prints a systemd user unit or a LaunchAgent and
+  installs nothing; `setup --messaging-supervisor` and `uninstall` support
+  were not added. There is no Windows unit.
+- Receipts gained `retry_after` in their structured block, stored on the
+  receipt row.
+
+Still open from slice 3: the presence heartbeat (`POST /inbox/presence`),
+`message adopt` and operator registration, `claim_policy`, the Claude Code
+channel and other live adapters, stopped-session adapters (slice 4), the
+single validator, signed webhooks, leases and ack. Cross-project authorization
+(`--allow-from`, slice 3b) will decide only who may wake an agent; receiving
+mail stays as it is.
 
 ## 12. Sources
 

@@ -13,6 +13,26 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- Added `ai-memory message supervise`, a host process that wakes the agents
+  listed under `[messaging.supervisor]` in `config.toml` when mail arrives for
+  them. It runs only a closed set of adapters, today `codex_queue`
+  (`codex queue --thread <id> --message <fixed text>`, never `--resume`),
+  without a shell, with a cleared environment, a fixed working directory and a
+  timeout. An adapter runs only after `message supervise approve <name>` on a
+  terminal; the approval covers the entry and the SHA-256 of the program, so a
+  changed binary needs a new one. Only mail from a `wake_from` project whose
+  sender session the server recorded wakes an agent. Budgets default to 4
+  wakes an hour and 24 a day per agent and 20 an hour in total, with at most 2
+  adapters at once and never two for one agent; failures back off, and a
+  quota failure pauses the agent until its reset time. Each message wakes its
+  agent at most once. Outcomes reach the server as `wake_attempted`,
+  `wake_failed`, `agent_unavailable` or `quota_exhausted` with an enumerated
+  reason and `retry_after`, through the new `POST /inbox/wake-candidates` and
+  `POST /inbox/wake-report` routes (write access to the inbox), and the sender
+  gets a receipt; receipts now carry `retry_after`. `message supervise unit`
+  prints a systemd user unit or a LaunchAgent and installs nothing. Migration
+  V104 lets the delivery timeline record wake events. See
+  [`docs/agent-messaging.md`](docs/agent-messaging.md#the-wake-supervisor).
 - Added delivery states and receipts for agent messages. Every message now
   carries a `delivery` block (`queued`, `awaiting_agent`, `delivered`,
   `expired` or `cancelled`, a reason from a fixed list, `expires_at` and

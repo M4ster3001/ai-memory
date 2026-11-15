@@ -299,6 +299,31 @@ Default deadlines of cross-project agent messages. A sender can shorten a messag
 | `no_pop_alert_normal_minutes` | `120` | `AI_MEMORY_MESSAGING__NO_POP_ALERT_NORMAL_MINUTES` | Minutes before an unpopped `normal` message gets its alert and `delay` receipt. `0` turns it off. |
 | `no_pop_alert_high_minutes` | `15` | `AI_MEMORY_MESSAGING__NO_POP_ALERT_HIGH_MINUTES` | The same alert for `high` priority. `0` turns it off. |
 
+## `[messaging.supervisor]`
+
+The host wake supervisor, `ai-memory message supervise`. The server ignores this table; unknown keys are refused. See [agent messaging](agent-messaging.md#the-wake-supervisor).
+
+| Key | Default | Env equivalent | Purpose |
+| --- | --- | --- | --- |
+| `max_wakes_per_hour` | `20` | `AI_MEMORY_MESSAGING__SUPERVISOR__MAX_WAKES_PER_HOUR` | Adapter launches allowed across all supervised agents in any rolling hour, 1 to 1000. |
+| `max_concurrent_wakes` | `2` | `AI_MEMORY_MESSAGING__SUPERVISOR__MAX_CONCURRENT_WAKES` | Adapters running at the same time, each for a different agent, 1 to 8. Raise it only when the operator asks; one agent never has two wakes in flight. |
+| `idle_exit_minutes` | `0` | `AI_MEMORY_MESSAGING__SUPERVISOR__IDLE_EXIT_MINUTES` | Stop after this many minutes with no new mail and no wake. `0` never stops. |
+| `agents` | `[]` | none | `[[messaging.supervisor.agents]]` tables, at most 16, one per agent and per conversation. Keys below. |
+
+Keys of each `[[messaging.supervisor.agents]]` table:
+
+| Key | Default | Env equivalent | Purpose |
+| --- | --- | --- | --- |
+| `name` | required | none | Local label, 1 to 40 of `a-z`, `0-9`, `-`. Approval and budgets are kept under it. |
+| `agent` | required | none | Canonical harness name whose mail wakes it, such as `codex`. |
+| `workspace`, `project` | required | none | The inbox to watch. |
+| `include_shared` | `false` | none | Also wake for mail sent to the whole project. |
+| `wake_from` | `[]` | none | Up to 32 `{ workspace, project }` tables. A message wakes the agent only from one of them, with the sender's session recorded by the server. Receipts about the agent's own mail always may. |
+| `adapter` | required | none | `{ kind = "codex_queue", program = "<absolute path of codex>", thread = "<thread id or name>" }`. The only adapter kind today. |
+| `wakes_per_hour` | `4` | none | Adapter launches for this agent in any rolling hour, 1 to 60. |
+| `wakes_per_day` | `24` | none | Adapter launches for this agent in any rolling day, 1 to 1440. |
+| `timeout_secs` | `60` | none | Seconds before a running adapter and its process group are killed, 5 to 300. |
+
 ## `[profile]`
 
 Defined by `ProfileSettings` in `ai-memory-core`.
