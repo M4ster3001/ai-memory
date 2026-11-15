@@ -20,8 +20,10 @@ version in [`docs/changelog/`](docs/changelog/):
   without a shell, with a cleared environment, a fixed working directory and a
   timeout. An adapter runs only after `message supervise approve <name>` on a
   terminal; the approval covers the entry and the SHA-256 of the program, so a
-  changed binary needs a new one. Only mail from a `wake_from` project whose
-  sender session the server recorded wakes an agent. Budgets default to 4
+  changed binary needs a new one. Mail from another agent of the agent's own
+  project wakes it with no further authorization; mail from another project
+  wakes it only from a `wake_from` project whose sender session the server
+  recorded. Budgets default to 4
   wakes an hour and 24 a day per agent and 20 an hour in total, with at most 2
   adapters at once and never two for one agent; failures back off, and a
   quota failure pauses the agent until its reset time. Each message wakes its
@@ -37,12 +39,23 @@ version in [`docs/changelog/`](docs/changelog/):
   Off by default. When `true`, mail from a `wake_from` project that the server
   labels `unverified` (no recorded sender session, as from a client that does
   not forward its session id) wakes the agent too; `unlisted` mail never does.
-  Any local process with the server token can then wake that agent, still
-  with the fixed wake text and within the same budgets, backoff and quota
-  circuit. `message supervise approve` shows the value and, when on, that
-  risk; turning it on or off needs a new approval. It needs at least one
-  `wake_from` project. Entries without the key keep their approval. See
+  Any local process with the server token can then wake that agent as the
+  listed project, still with the fixed wake text and within the same budgets,
+  backoff and quota circuit. `message supervise approve` shows the value and
+  the risk; turning it on or off needs a new approval. It needs a
+  `wake_from` project other than the agent's own. Entries without the key
+  keep their approval. See
   [`docs/agent-messaging.md`](docs/agent-messaging.md#who-may-wake-an-agent).
+- Added the `same_project` and `same_agent` labels to
+  `POST /inbox/wake-candidates`. Mail from another agent of the watched
+  project wakes it with no `wake_from` entry and no recorded session, since
+  only mail between projects needs authorization; `wake_from` is now
+  optional. The agent's own mail to itself (`same_agent`) never wakes it, so
+  a wake cannot loop. Receipts stay `system`. Any local process with the
+  server token can wake a supervised agent by sending as its project, within
+  the fixed wake text and the same limits, and `approve` says so. The approval
+  digest is unchanged. A supervisor reads a label it does not know as one
+  that never wakes; upgrade the server and the supervisor together.
 - Added delivery states and receipts for agent messages. Every message now
   carries a `delivery` block (`queued`, `awaiting_agent`, `delivered`,
   `expired` or `cancelled`, a reason from a fixed list, `expires_at` and

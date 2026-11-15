@@ -447,9 +447,12 @@ read decides, so a missed wake-up only delays an answer until its timeout.
 program, and it runs on the operator's host, never in the server. It
 long-polls `/inbox/watch` for each `[[messaging.supervisor.agents]]` entry,
 asks `POST /inbox/wake-candidates` which new messages pass the entry's sender
-gate (the server resolves `wake_from` with the caller's read access and
-answers `listed`, `unverified`, `unlisted` or `system`, never a sender name;
-`unverified` wakes only an entry that sets `wake_unverified`),
+gate (the server compares the sending project with the watched inbox by
+resolved ids, resolves `wake_from` with the caller's read access, and answers
+`same_project`, `same_agent`, `listed`, `unverified`, `unlisted` or `system`,
+never a sender name; mail inside the project wakes without authorization
+except the agent's own mail to itself, and `unverified` wakes only an entry
+that sets `wake_unverified`),
 and runs the entry's adapter from `ai-memory-core::message_wake`, a closed enum
 whose only member is `codex_queue`. The adapter runs from a canonical path
 without a shell, with an allowlisted environment, the state directory as
