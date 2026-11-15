@@ -706,6 +706,29 @@ mid_session = "follow-cwd"
 # no_pop_alert_normal_minutes = 120
 # no_pop_alert_high_minutes = 15
 
+# The host wake supervisor, `ai-memory message supervise` (the server ignores
+# this table). It wakes each listed agent through a fixed adapter when mail
+# from a `wake_from` project with a recorded sender session arrives, and only
+# after `ai-memory message supervise approve <name>` on a terminal. Budgets
+# count adapter launches; `max_concurrent_wakes` above 2 is for an operator
+# who asked for it. `idle_exit_minutes = 0` never stops. Each agent is one
+# `[[messaging.supervisor.agents]]` table, for example:
+#   [[messaging.supervisor.agents]]
+#   name = "codex-api"
+#   agent = "codex"
+#   workspace = "default"
+#   project = "api"
+#   wake_from = [{ workspace = "default", project = "web" }]
+#   adapter = { kind = "codex_queue", program = "/home/you/.local/bin/codex", thread = "<codex thread id>" }
+#   wakes_per_hour = 4
+#   wakes_per_day = 24
+#   timeout_secs = 60
+# See docs/agent-messaging.md.
+# [messaging.supervisor]
+# max_wakes_per_hour = 20
+# max_concurrent_wakes = 2
+# idle_exit_minutes = 0
+
 # Scheduled server jobs. `enabled` is the master switch. The interval keys are
 # in seconds and 0 disables that job. The forget sweep and lint persist their
 # cadence across restarts, and overdue work starts after a bounded startup

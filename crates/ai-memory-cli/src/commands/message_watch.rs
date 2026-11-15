@@ -234,7 +234,7 @@ fn emit(line: &str) {
     let _ = stdout.flush();
 }
 
-fn clock() -> String {
+pub(crate) fn clock() -> String {
     jiff::Zoned::now().strftime("%H:%M:%S").to_string()
 }
 
@@ -254,13 +254,13 @@ fn canonical_agent(raw: &str) -> Result<AgentKind> {
 
 /// A message id is used in a command line and a model-visible sentence only
 /// in its canonical hyphenated form.
-fn canonical_message_id(raw: &str) -> Option<String> {
+pub(crate) fn canonical_message_id(raw: &str) -> Option<String> {
     let parsed = uuid::Uuid::parse_str(raw).ok()?;
     let canonical = parsed.hyphenated().to_string();
     (canonical == raw).then_some(canonical)
 }
 
-fn valid_cursor(raw: &str) -> Option<&str> {
+pub(crate) fn valid_cursor(raw: &str) -> Option<&str> {
     (!raw.is_empty() && raw.len() <= 20 && raw.bytes().all(|b| b.is_ascii_digit())).then_some(raw)
 }
 
@@ -365,7 +365,7 @@ fn admit_announcement(announced: &mut VecDeque<Instant>, now: Instant) -> Admiss
 }
 
 /// An HTTP 401 or 403 from the server: retrying cannot help.
-fn refused_credential(error: &anyhow::Error) -> Option<u16> {
+pub(crate) fn refused_credential(error: &anyhow::Error) -> Option<u16> {
     error
         .chain()
         .find_map(|cause| cause.downcast_ref::<ServerResponseError>())
@@ -376,7 +376,7 @@ fn refused_credential(error: &anyhow::Error) -> Option<u16> {
 /// A failure worth waiting out: nothing answered, the reply timed out, the
 /// server was busy (429) or failed (5xx). A 400 or 404 is a request the server
 /// will refuse again.
-fn transient(error: &anyhow::Error) -> bool {
+pub(crate) fn transient(error: &anyhow::Error) -> bool {
     if server_unreachable(error) {
         return true;
     }

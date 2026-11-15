@@ -33,6 +33,7 @@ mod marker_scope;
 mod mcp_bridge_stdio;
 mod message_delivery_e2e;
 mod message_e2e;
+mod message_supervise_e2e;
 mod message_watch_e2e;
 mod opencode_dialect;
 mod packaging;

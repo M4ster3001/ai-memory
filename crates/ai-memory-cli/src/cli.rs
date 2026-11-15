@@ -843,6 +843,42 @@ pub enum MessageCommand {
     /// Wait for new mail addressed to a harness, without a model, and print
     /// one line per new message id.
     Watch(MessageWatchArgs),
+    /// Wake the agents listed under `[messaging.supervisor]` when mail they
+    /// may be woken for arrives, through operator-approved adapters only.
+    Supervise(MessageSuperviseArgs),
+}
+
+/// Arguments for `message supervise`.
+#[derive(Debug, Args)]
+pub struct MessageSuperviseArgs {
+    /// Approve an adapter, or print the service unit, instead of supervising.
+    #[command(subcommand)]
+    pub command: Option<SuperviseCommand>,
+    /// Check every supervised inbox once, wake what is due, and exit.
+    #[arg(long)]
+    pub once: bool,
+    /// Directory for the wake ledger, the approvals and the single-instance
+    /// lock (default: `supervisor` under the data directory). Put it before
+    /// `approve`.
+    #[arg(long)]
+    pub state_dir: Option<PathBuf>,
+}
+
+/// Subcommands for `message supervise`.
+#[derive(Debug, Subcommand)]
+pub enum SuperviseCommand {
+    /// Review one supervised agent's adapter on this terminal and approve it.
+    Approve(SuperviseApproveArgs),
+    /// Print the per-user service unit that runs the supervisor. Nothing is
+    /// installed.
+    Unit,
+}
+
+/// Arguments for `message supervise approve`.
+#[derive(Debug, Args)]
+pub struct SuperviseApproveArgs {
+    /// The `name` of the `[[messaging.supervisor.agents]]` entry.
+    pub name: String,
 }
 
 /// Arguments for `message send`.
