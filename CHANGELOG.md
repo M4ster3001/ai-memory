@@ -33,6 +33,16 @@ version in [`docs/changelog/`](docs/changelog/):
   prints a systemd user unit or a LaunchAgent and installs nothing. Migration
   V104 lets the delivery timeline record wake events. See
   [`docs/agent-messaging.md`](docs/agent-messaging.md#the-wake-supervisor).
+- Added `wake_unverified` to each `[[messaging.supervisor.agents]]` entry.
+  Off by default. When `true`, mail from a `wake_from` project that the server
+  labels `unverified` (no recorded sender session, as from a client that does
+  not forward its session id) wakes the agent too; `unlisted` mail never does.
+  Any local process with the server token can then wake that agent, still
+  with the fixed wake text and within the same budgets, backoff and quota
+  circuit. `message supervise approve` shows the value and, when on, that
+  risk; turning it on or off needs a new approval. It needs at least one
+  `wake_from` project. Entries without the key keep their approval. See
+  [`docs/agent-messaging.md`](docs/agent-messaging.md#who-may-wake-an-agent).
 - Added delivery states and receipts for agent messages. Every message now
   carries a `delivery` block (`queued`, `awaiting_agent`, `delivered`,
   `expired` or `cancelled`, a reason from a fixed list, `expires_at` and

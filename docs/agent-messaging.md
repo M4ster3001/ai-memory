@@ -801,7 +801,8 @@ agent and the inbox from the configuration. No subject, body or sender name.
 A message wakes its agent only when it comes from a
 project in `wake_from` and the server recorded the sender's hook session in
 that project when it was sent. Mail from any other project, or from a listed
-project without a recorded session, stays in the inbox, unannounced. The
+project without a recorded session (unless the entry sets `wake_unverified`,
+below), stays in the inbox, unannounced. The
 supervisor sends its `wake_from` list to the server, which answers per message
 `listed`, `unverified`, `unlisted` or `system`, so sender names never reach the
 supervisor. A delivery receipt about the agent's own mail (`system`) may wake
@@ -811,6 +812,35 @@ starts a stopped session will not be allowed to.
 A recorded session is a session id the sender's client named and the server
 found in the sending project. It is not a cryptographic proof: a process that
 runs as the same user and can read the bearer token can name one too.
+
+A client that does not forward its hook session id with the send, such as a
+static MCP client, always sends `unverified` mail. For an entry that should be
+woken by such a project, set `wake_unverified = true`:
+
+```toml
+[[messaging.supervisor.agents]]
+name = "codex-api"
+agent = "codex"
+workspace = "default"
+project = "api"
+wake_from = [{ workspace = "default", project = "web" }]
+wake_unverified = true
+adapter = { kind = "codex_queue", program = "/home/you/.local/bin/codex", thread = "019a7c2e-0b1d-7f00-9c1e-3a5b6d7e8f90" }
+```
+
+With it on, `unverified` mail from a `wake_from` project wakes the agent like
+`listed` mail. `unlisted` mail still never does. The option is off by
+default, needs at least one `wake_from` project, and the decision stays in
+the supervisor; the server answers the same labels either way.
+
+Turning it on widens who can wake the agent. Any local process that holds the
+server token can send mail as a `wake_from` project without naming a
+session, so it can wake this agent. What that process can do stays bounded:
+the wake text is the fixed template above, so nothing it writes reaches the
+adapter, and the per-agent and global budgets, the backoff and the quota
+circuit apply to these wakes as to any other. Turn it on only for a project
+whose client cannot forward its session, and only on a host where the token
+is readable by you alone.
 
 #### Approval
 
@@ -822,11 +852,15 @@ ai-memory message supervise approve codex-api
 ```
 
 The command shows the program's canonical path and SHA-256, the exact argv
-with a placeholder id, the working directory, the environment variable names
-and the projects that may wake the agent, then asks `[y/N]`. It refuses to
+with a placeholder id, the working directory, the environment variable names,
+the projects that may wake the agent and the value of `wake_unverified`, then
+asks `[y/N]`. When `wake_unverified` is on, that line also says that any
+local process with the server token can wake the agent, that the wake text is
+fixed and that the wake limits still apply. It refuses to
 run without a terminal. The approval is a digest of all of that, written
 atomically to `approvals.json` in the state directory. A new program file
-(an upgrade too), a different thread, inbox or `wake_from` list voids it, and
+(an upgrade too), a different thread, inbox or `wake_from` list, or turning
+`wake_unverified` on or off voids it, and
 the supervisor reports `wake_failed/not_approved` until you approve again. The
 running supervisor rereads the approvals, so it needs no restart. Started in a
 terminal, `message supervise` offers the same prompt for each entry that lacks

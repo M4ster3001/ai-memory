@@ -448,7 +448,8 @@ program, and it runs on the operator's host, never in the server. It
 long-polls `/inbox/watch` for each `[[messaging.supervisor.agents]]` entry,
 asks `POST /inbox/wake-candidates` which new messages pass the entry's sender
 gate (the server resolves `wake_from` with the caller's read access and
-answers `listed`, `unverified`, `unlisted` or `system`, never a sender name),
+answers `listed`, `unverified`, `unlisted` or `system`, never a sender name;
+`unverified` wakes only an entry that sets `wake_unverified`),
 and runs the entry's adapter from `ai-memory-core::message_wake`, a closed enum
 whose only member is `codex_queue`. The adapter runs from a canonical path
 without a shell, with an allowlisted environment, the state directory as

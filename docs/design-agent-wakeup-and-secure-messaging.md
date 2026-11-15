@@ -952,6 +952,11 @@ run at once and never two for one agent unless the operator raises
   read access, so the supervisor never learns a sender's name. Unverified and
   unlisted mail is not reported; the design's `sender_unverified` `delay`
   receipt is not sent, and the normal "not popped yet" alert covers that mail.
+  Later, owner decision (2026-11-15): an entry may set `wake_unverified = true`
+  so `unverified` mail from its `wake_from` projects wakes it too, for a
+  sending client that never forwards its session id. The supervisor decides;
+  the server's labels are unchanged. The option is off by default, is part of
+  the approval digest only when on, and is shown with its risk at approval.
 - `POST /inbox/wake-report` takes `{workspace, project, agent, message_ids,
   state, reason, retry_after_secs}`. The design's `entry`, `adapter`,
   `exit_class` and `attempt` fields are left out: the server does not need

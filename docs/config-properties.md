@@ -319,6 +319,7 @@ Keys of each `[[messaging.supervisor.agents]]` table:
 | `workspace`, `project` | required | none | The inbox to watch. |
 | `include_shared` | `false` | none | Also wake for mail sent to the whole project. |
 | `wake_from` | `[]` | none | Up to 32 `{ workspace, project }` tables. A message wakes the agent only from one of them, with the sender's session recorded by the server. Receipts about the agent's own mail always may. |
+| `wake_unverified` | `false` | none | `true` also wakes the agent for mail from a `wake_from` project when the server recorded no session of the sender (`unverified`). Any local process with the server token can then wake the agent. The wake text stays fixed and the budgets still apply. Needs at least one `wake_from` project; changing it voids the approval. See [who may wake an agent](agent-messaging.md#who-may-wake-an-agent). |
 | `adapter` | required | none | `{ kind = "codex_queue", program = "<absolute path of codex>", thread = "<thread id or name>" }`. The only adapter kind today. |
 | `wakes_per_hour` | `4` | none | Adapter launches for this agent in any rolling hour, 1 to 60. |
 | `wakes_per_day` | `24` | none | Adapter launches for this agent in any rolling day, 1 to 1440. |

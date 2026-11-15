@@ -709,7 +709,10 @@ mid_session = "follow-cwd"
 # The host wake supervisor, `ai-memory message supervise` (the server ignores
 # this table). It wakes each listed agent through a fixed adapter when mail
 # from a `wake_from` project with a recorded sender session arrives, and only
-# after `ai-memory message supervise approve <name>` on a terminal. Budgets
+# after `ai-memory message supervise approve <name>` on a terminal.
+# `wake_unverified = true` also wakes for mail from a `wake_from` project with
+# no recorded session; any local process with the server token can then wake
+# the agent, within the same fixed text and budgets. Budgets
 # count adapter launches; `max_concurrent_wakes` above 2 is for an operator
 # who asked for it. `idle_exit_minutes = 0` never stops. Each agent is one
 # `[[messaging.supervisor.agents]]` table, for example:
@@ -719,6 +722,7 @@ mid_session = "follow-cwd"
 #   workspace = "default"
 #   project = "api"
 #   wake_from = [{ workspace = "default", project = "web" }]
+#   wake_unverified = false
 #   adapter = { kind = "codex_queue", program = "/home/you/.local/bin/codex", thread = "<codex thread id>" }
 #   wakes_per_hour = 4
 #   wakes_per_day = 24
