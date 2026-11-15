@@ -2517,6 +2517,24 @@ pub struct InboxWatchSnapshot {
     pub total: u64,
 }
 
+/// A pending message the wake supervisor may consider, with what it needs to
+/// apply its sender gate and nothing else: never subject, body, evidence or
+/// the sender's names. Returned by [`ReaderPool::wake_candidates`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WakeCandidate {
+    /// The message.
+    pub id: MessageId,
+    /// An agent's message, or a server-generated receipt.
+    pub kind: ai_memory_core::MessageKind,
+    /// The sending project's workspace.
+    pub from_workspace_id: WorkspaceId,
+    /// The sending project.
+    pub from_project_id: ProjectId,
+    /// Whether the server recorded the sender's hook session in the sending
+    /// project at send time (`from_session_id`).
+    pub sender_session_recorded: bool,
+}
+
 /// One workspace scope with the id + name needed to write its
 /// self-describing `_meta.md` manifest. Returned by
 /// [`ReaderPool::list_all_workspace_scopes`].
@@ -9838,6 +9856,64 @@ impl ReaderPool {
                 messages,
                 total: u64::try_from(total).unwrap_or(0),
             })
+        })
+        .await
+    }
+
+    /// The pending mail `agent` could be woken for in one inbox, as
+    /// [`Self::inbox_watch_snapshot`] selects it, with each message's kind,
+    /// sending project ids and whether its sender's session was recorded.
+    /// Oldest first, at most `limit` rows.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn wake_candidates(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        agent: AgentKind,
+        include_shared: bool,
+        limit: usize,
+    ) -> StoreResult<Vec<WakeCandidate>> {
+        let limit = i64::try_from(limit.clamp(1, 1_000)).unwrap_or(1_000);
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, kind, from_workspace_id, from_project_id, from_session_id IS NOT NULL \
+                 FROM agent_messages \
+                 WHERE to_workspace_id = ?1 AND to_project_id = ?2 AND state = 'pending' \
+                   AND (to_agent = ?3 OR (?4 AND to_agent IS NULL)) \
+                 ORDER BY created_at ASC, id ASC LIMIT ?5",
+            )?;
+            let rows = stmt.query_map(
+                params![
+                    workspace_id.as_bytes(),
+                    project_id.as_bytes(),
+                    agent.as_str(),
+                    include_shared,
+                    limit,
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                        row.get::<_, bool>(4)?,
+                    ))
+                },
+            )?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (id, kind, from_ws, from_pj, recorded) = row?;
+                out.push(WakeCandidate {
+                    id: MessageId::from_slice(&id)?,
+                    kind: kind.parse().map_err(StoreError::from)?,
+                    from_workspace_id: WorkspaceId::from_slice(&from_ws)?,
+                    from_project_id: ProjectId::from_slice(&from_pj)?,
+                    sender_session_recorded: recorded,
+                });
+            }
+            Ok(out)
         })
         .await
     }

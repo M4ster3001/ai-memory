@@ -1,5 +1,5 @@
-//! Delivery states, the agent registry, the deadline sweep and receipts
-//! (V102, V103).
+//! Delivery states, the agent registry, the deadline sweep, wake reports and
+//! receipts (V102 to V104).
 //!
 //! The guards pinned here: a receipt carries nothing the recipient wrote and
 //! never produces another receipt; at most one receipt per message and
@@ -611,4 +611,195 @@ async fn the_configured_policy_stamps_new_mail() {
     let ttl = row.delivery.expires_at.unwrap().as_microsecond() - row.created_at.as_microsecond();
     assert!((299_000_000..=301_000_000).contains(&ttl), "{ttl}");
     assert_eq!(row.delivery.no_pop_alert_at, None);
+}
+
+/// A wake report changes only pending mail in the reported inbox that the
+/// reported harness may claim: a popped message keeps `delivered`, and ids
+/// from another inbox or for another harness are untouched. A failure sends
+/// the sender one receipt per outcome; a quota report carries `retry_after`
+/// on the message and on its receipt.
+#[tokio::test]
+async fn wake_reports_touch_only_claimable_mail_and_bounce_once() {
+    use ai_memory_core::message_wake::WakeOutcome;
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let a = project(&store, "sender").await;
+    let b = project(&store, "inbox").await;
+    let c = project(&store, "elsewhere").await;
+    start_session(&store, b, AgentKind::Codex).await;
+    start_session(&store, b, AgentKind::ClaudeCode).await;
+    let send = |to, agent: Option<AgentKind>| {
+        let mut m = message(a, to, "BODY-CANARY");
+        m.to_agent = agent;
+        let writer = store.writer.clone();
+        async move { writer.insert_message(m).await.unwrap() }
+    };
+    let mine = send(b, Some(AgentKind::Codex)).await;
+    let shared = send(b, None).await;
+    let other_harness = send(b, Some(AgentKind::ClaudeCode)).await;
+    let other_inbox = send(c, Some(AgentKind::Codex)).await;
+    let popped = send(b, Some(AgentKind::Codex)).await;
+    store
+        .writer
+        .pop_message(claim(b, AgentKind::Codex), Some(popped))
+        .await
+        .unwrap();
+
+    let report = store
+        .writer
+        .record_wake_report(
+            b.0,
+            b.1,
+            AgentKind::Codex,
+            vec![mine, shared, other_harness, other_inbox, popped, mine],
+            WakeOutcome::Attempted,
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.updated, 2, "{report:?}");
+    assert_eq!(report.receipts, 0, "an attempted wake sends no receipt");
+    for (id, state) in [
+        (mine, DeliveryState::WakeAttempted),
+        (shared, DeliveryState::WakeAttempted),
+        (other_harness, DeliveryState::Queued),
+        (other_inbox, DeliveryState::AwaitingAgent),
+        (popped, DeliveryState::Delivered),
+    ] {
+        assert_eq!(outbox_row(&store, a, id).await.delivery.state, state);
+    }
+
+    // Quota: state, reason and reset time on the message and its receipt.
+    let quota = WakeOutcome::QuotaExhausted {
+        retry_after_secs: Some(3_600),
+    };
+    let before = jiff::Timestamp::now();
+    let report = store
+        .writer
+        .record_wake_report(b.0, b.1, AgentKind::Codex, vec![mine], quota)
+        .await
+        .unwrap();
+    assert_eq!((report.updated, report.receipts), (1, 1));
+    let row = outbox_row(&store, a, mine).await;
+    assert_eq!(row.delivery.state, DeliveryState::QuotaExhausted);
+    assert_eq!(row.delivery.reason, Some(DeliveryReason::QuotaMarker));
+    let retry = row.delivery.retry_after.unwrap();
+    assert!(
+        retry >= before + jiff::SignedDuration::from_secs(3_590),
+        "{retry}"
+    );
+    // The same outcome again records the event but sends no second receipt.
+    let report = store
+        .writer
+        .record_wake_report(b.0, b.1, AgentKind::Codex, vec![mine], quota)
+        .await
+        .unwrap();
+    assert_eq!((report.updated, report.receipts), (1, 0));
+    let receipts: Vec<_> = inbox(&store, a)
+        .await
+        .into_iter()
+        .filter(|m| m.kind == MessageKind::Receipt)
+        .collect();
+    assert_eq!(receipts.len(), 1, "{receipts:?}");
+    let receipt = receipts[0].receipt.as_ref().unwrap();
+    assert_eq!(receipt.outcome, ReceiptOutcome::QuotaExhausted);
+    assert_eq!(receipt.reason, Some(DeliveryReason::QuotaMarker));
+    assert_eq!(receipt.retry_after, Some(retry));
+    assert!(!receipts[0].body.contains("CANARY"));
+
+    // A budget refusal is a different outcome: one more receipt.
+    let report = store
+        .writer
+        .record_wake_report(
+            b.0,
+            b.1,
+            AgentKind::Codex,
+            vec![mine],
+            WakeOutcome::Failed(DeliveryReason::BudgetExhausted),
+        )
+        .await
+        .unwrap();
+    assert_eq!((report.updated, report.receipts), (1, 1));
+    let events: Vec<DeliveryEventKind> = store
+        .reader
+        .message_delivery_events(a.0, a.1, mine)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|e| e.event)
+        .collect();
+    assert_eq!(
+        events,
+        [
+            DeliveryEventKind::WakeAttempted,
+            DeliveryEventKind::QuotaExhausted,
+            DeliveryEventKind::ReceiptSent,
+            DeliveryEventKind::QuotaExhausted,
+            DeliveryEventKind::WakeFailed,
+            DeliveryEventKind::ReceiptSent,
+        ]
+    );
+    // The other inbox's message is out of reach whatever the report says.
+    let report = store
+        .writer
+        .record_wake_report(
+            b.0,
+            b.1,
+            AgentKind::Codex,
+            vec![other_inbox],
+            WakeOutcome::Failed(DeliveryReason::AdapterExitNonzero),
+        )
+        .await
+        .unwrap();
+    assert_eq!((report.updated, report.receipts), (0, 0));
+}
+
+/// The wake candidates name kind and sender provenance only, for the
+/// harness's claimable mail.
+#[tokio::test]
+async fn wake_candidates_report_kind_and_recorded_sender_sessions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let a = project(&store, "sender").await;
+    let b = project(&store, "inbox").await;
+    let session = start_session(&store, a, AgentKind::ClaudeCode).await;
+    start_session(&store, b, AgentKind::Codex).await;
+    let mut verified = message(a, b, "x");
+    verified.to_agent = Some(AgentKind::Codex);
+    verified.from_session_id = Some(session);
+    let verified = store.writer.insert_message(verified).await.unwrap();
+    let mut named = message(a, b, "y");
+    named.to_agent = Some(AgentKind::Codex);
+    let named = store.writer.insert_message(named).await.unwrap();
+    let shared = store
+        .writer
+        .insert_message(message(a, b, "z"))
+        .await
+        .unwrap();
+
+    let only_mine = store
+        .reader
+        .wake_candidates(b.0, b.1, AgentKind::Codex, false, 100)
+        .await
+        .unwrap();
+    let ids: Vec<_> = only_mine.iter().map(|c| c.id).collect();
+    assert_eq!(ids, [verified, named]);
+    assert!(only_mine[0].sender_session_recorded);
+    assert!(!only_mine[1].sender_session_recorded);
+    assert_eq!(only_mine[0].from_project_id, a.1);
+    assert_eq!(only_mine[0].kind, MessageKind::Message);
+    let with_shared = store
+        .reader
+        .wake_candidates(b.0, b.1, AgentKind::Codex, true, 100)
+        .await
+        .unwrap();
+    assert_eq!(with_shared.len(), 3);
+    assert_eq!(with_shared[2].id, shared);
+    assert!(
+        store
+            .reader
+            .wake_candidates(b.0, b.1, AgentKind::ClaudeCode, false, 100)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }

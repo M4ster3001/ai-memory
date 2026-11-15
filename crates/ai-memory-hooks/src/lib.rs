@@ -31,6 +31,7 @@ mod gemini;
 mod grants;
 pub mod hermes;
 pub mod idle_end;
+mod inbox_supervisor;
 mod inbox_watch;
 mod json_repair;
 pub mod log;
@@ -69,6 +70,7 @@ pub use hermes::{hermes_is_delegated_child, hermes_is_first_turn, shape_hermes_l
 pub use idle_end::{
     IDLE_END_BATCH, IDLE_END_INTERVAL_SECS, IdleEndTickInput, IdleEndTickOutcome, run_idle_end_tick,
 };
+pub use inbox_supervisor::MAX_WAKE_FROM;
 pub use inbox_watch::MAX_INBOX_WATCH_WAIT_MS;
 pub use json_repair::replace_lone_surrogate_escapes;
 pub use payload::{

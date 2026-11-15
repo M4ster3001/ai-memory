@@ -82,13 +82,17 @@ struct CancelMessagesResponse {
 }
 
 /// Dispatch `ai-memory message`. Returns the process exit code, which only
-/// `watch` sets to anything but 0.
+/// `watch` and `supervise` set to anything but 0.
 ///
 /// # Errors
 /// Returns [`anyhow::Error`] when an explicit mutating scope or target is
 /// empty, the scope cannot be resolved, stdin cannot be read, the server is
 /// unreachable, or it answers non-2xx.
-pub async fn run(config: &Config, args: MessageArgs) -> Result<i32> {
+pub async fn run(
+    config: &Config,
+    args: MessageArgs,
+    config_path: Option<&std::path::Path>,
+) -> Result<i32> {
     match args.command {
         MessageCommand::Send(args) => send(config, args).await.map(|()| 0),
         MessageCommand::List(args) => list(config, args).await.map(|()| 0),
@@ -96,6 +100,9 @@ pub async fn run(config: &Config, args: MessageArgs) -> Result<i32> {
         MessageCommand::Cancel(args) => cancel(config, args).await.map(|()| 0),
         MessageCommand::Status(args) => status(config, args).await.map(|()| 0),
         MessageCommand::Watch(args) => message_watch::run(config, args).await,
+        MessageCommand::Supervise(args) => {
+            super::message_supervise::run(config, args, config_path).await
+        }
     }
 }
 

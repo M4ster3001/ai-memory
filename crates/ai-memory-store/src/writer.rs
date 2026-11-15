@@ -84,6 +84,14 @@ pub(crate) enum WriteCmd {
         batch: usize,
         reply: oneshot::Sender<StoreResult<crate::message_delivery::DeadlineSweepOutcome>>,
     },
+    RecordWakeReport {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        agent: ai_memory_core::AgentKind,
+        ids: Vec<ai_memory_core::MessageId>,
+        outcome: ai_memory_core::message_wake::WakeOutcome,
+        reply: oneshot::Sender<StoreResult<crate::message_delivery::WakeReportOutcome>>,
+    },
     SetAccessMode {
         project_id: ProjectId,
         mode: crate::AccessMode,
@@ -1121,6 +1129,34 @@ impl WriterHandle {
         self.send(WriteCmd::SweepMessageDeadlines {
             now_us,
             batch,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Apply a wake supervisor's report to pending messages in one inbox, in
+    /// one transaction: delivery state, timeline events and the receipts
+    /// their senders asked for. See
+    /// [`crate::message_delivery`]'s `record_wake_report`.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn record_wake_report(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        agent: ai_memory_core::AgentKind,
+        ids: Vec<ai_memory_core::MessageId>,
+        outcome: ai_memory_core::message_wake::WakeOutcome,
+    ) -> StoreResult<crate::WakeReportOutcome> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RecordWakeReport {
+            workspace_id,
+            project_id,
+            agent,
+            ids,
+            outcome,
             reply: tx,
         })
         .await?;
@@ -4125,6 +4161,33 @@ fn worker_loop(
                     outcome.new_rows.iter().copied().for_each(signal);
                 }
                 send_or_warn(reply, result, "sweep_message_deadlines");
+            }
+            WriteCmd::RecordWakeReport {
+                workspace_id,
+                project_id,
+                agent,
+                ids,
+                outcome,
+                reply,
+            } => {
+                let now = jiff::Timestamp::now().as_microsecond();
+                let result = conn.transaction().map_err(StoreError::from).and_then(|tx| {
+                    let report = crate::message_delivery::record_wake_report(
+                        &tx,
+                        &workspace_id,
+                        &project_id,
+                        agent,
+                        &ids,
+                        outcome,
+                        now,
+                    )?;
+                    tx.commit()?;
+                    Ok(report)
+                });
+                if let Ok(report) = &result {
+                    report.new_rows.iter().copied().for_each(signal);
+                }
+                send_or_warn(reply, result, "record_wake_report");
             }
             WriteCmd::SetAccessMode {
                 project_id,

@@ -1781,6 +1781,9 @@ pub struct MessagingSettings {
     pub no_pop_alert_normal_minutes: u32,
     /// The same alert for `high` priority. `0` turns it off.
     pub no_pop_alert_high_minutes: u32,
+    /// `[messaging.supervisor]`: the host wake supervisor
+    /// (`ai-memory message supervise`).
+    pub supervisor: SupervisorSettings,
 }
 
 impl Default for MessagingSettings {
@@ -1791,7 +1794,236 @@ impl Default for MessagingSettings {
             ttl_high_hours: 24,
             no_pop_alert_normal_minutes: 120,
             no_pop_alert_high_minutes: 15,
+            supervisor: SupervisorSettings::default(),
         }
+    }
+}
+
+/// `[messaging.supervisor]`: which agents `ai-memory message supervise` may
+/// wake, with which adapter, and how often. Read by the supervisor only; the
+/// server ignores it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SupervisorSettings {
+    /// Adapter launches allowed across every supervised agent in any rolling
+    /// hour (1 to 1000).
+    pub max_wakes_per_hour: u32,
+    /// Stop after this many minutes with no new mail and no wake. `0` (the
+    /// default) never stops.
+    pub idle_exit_minutes: u32,
+    /// Most adapters running at the same time, each for a different agent
+    /// (1 to 8, default 2). One agent never has two wakes in flight.
+    pub max_concurrent_wakes: u32,
+    /// `[[messaging.supervisor.agents]]`: the supervised agents.
+    pub agents: Vec<SupervisedAgent>,
+}
+
+impl Default for SupervisorSettings {
+    fn default() -> Self {
+        Self {
+            max_wakes_per_hour: 20,
+            idle_exit_minutes: 0,
+            max_concurrent_wakes: 2,
+            agents: Vec::new(),
+        }
+    }
+}
+
+/// One `[[messaging.supervisor.agents]]` entry: an agent whose inbox the
+/// supervisor watches and the adapter that wakes it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisedAgent {
+    /// Local label, `[a-z0-9-]`, 1 to 40 characters. Approval and budgets
+    /// are kept under it.
+    pub name: String,
+    /// Canonical harness name whose mail wakes it (for example `codex`).
+    pub agent: String,
+    /// Workspace of the inbox to watch.
+    pub workspace: String,
+    /// Project of the inbox to watch.
+    pub project: String,
+    /// Also wake for mail sent to the whole project, with no target harness.
+    #[serde(default)]
+    pub include_shared: bool,
+    /// Projects whose mail may wake the agent. A message wakes it only when
+    /// it comes from one of them and the server recorded the sender's
+    /// session there. Receipts about the agent's own mail always may.
+    #[serde(default)]
+    pub wake_from: Vec<WakeFrom>,
+    /// The adapter that wakes the agent.
+    pub adapter: WakeAdapterConfig,
+    /// Adapter launches allowed in any rolling hour (default 4).
+    #[serde(default = "default_wakes_per_hour")]
+    pub wakes_per_hour: u32,
+    /// Adapter launches allowed in any rolling day (default 24).
+    #[serde(default = "default_wakes_per_day")]
+    pub wakes_per_day: u32,
+    /// Seconds before a running adapter is stopped (5 to 300, default 60).
+    #[serde(default = "default_wake_timeout_secs")]
+    pub timeout_secs: u32,
+}
+
+const fn default_wakes_per_hour() -> u32 {
+    4
+}
+const fn default_wakes_per_day() -> u32 {
+    24
+}
+const fn default_wake_timeout_secs() -> u32 {
+    60
+}
+
+/// A project a supervised agent may be woken by.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WakeFrom {
+    /// Its workspace.
+    pub workspace: String,
+    /// Its project.
+    pub project: String,
+}
+
+/// The adapter of a supervised agent: a closed set, selected by `kind`, with
+/// typed fields. There is no free-form command.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WakeAdapterConfig {
+    /// `codex queue --thread <thread> --message <wake text>` against a live
+    /// Codex conversation.
+    CodexQueue {
+        /// Absolute path of the `codex` binary.
+        program: PathBuf,
+        /// The Codex thread id (or name) to queue the wake in.
+        thread: String,
+    },
+}
+
+impl WakeAdapterConfig {
+    /// The typed adapter, with its fields validated.
+    ///
+    /// # Errors
+    /// A field the adapter does not accept.
+    pub fn adapter(&self) -> anyhow::Result<ai_memory_core::message_wake::WakeAdapter> {
+        match self {
+            Self::CodexQueue { thread, .. } => {
+                Ok(ai_memory_core::message_wake::WakeAdapter::CodexQueue {
+                    conversation: ai_memory_core::message_wake::ConversationRef::parse(thread)?,
+                })
+            }
+        }
+    }
+
+    /// The configured program.
+    #[must_use]
+    pub fn program(&self) -> &Path {
+        match self {
+            Self::CodexQueue { program, .. } => program,
+        }
+    }
+
+    /// What the adapter wakes: its kind and conversation.
+    fn target(&self) -> (&'static str, &str) {
+        match self {
+            Self::CodexQueue { thread, .. } => ("codex_queue", thread.as_str()),
+        }
+    }
+}
+
+const MAX_SUPERVISED_AGENTS: usize = 16;
+const MAX_CONCURRENT_WAKES: u32 = 8;
+
+impl SupervisorSettings {
+    fn validate(&self) -> anyhow::Result<()> {
+        if !(1..=1_000).contains(&self.max_wakes_per_hour) {
+            anyhow::bail!(
+                "messaging.supervisor.max_wakes_per_hour must be between 1 and 1000; got {}",
+                self.max_wakes_per_hour
+            );
+        }
+        if self.idle_exit_minutes > 525_600 {
+            anyhow::bail!(
+                "messaging.supervisor.idle_exit_minutes must be 0 (never) or at most 525600; got {}",
+                self.idle_exit_minutes
+            );
+        }
+        if !(1..=MAX_CONCURRENT_WAKES).contains(&self.max_concurrent_wakes) {
+            anyhow::bail!(
+                "messaging.supervisor.max_concurrent_wakes must be between 1 and {MAX_CONCURRENT_WAKES}; got {}",
+                self.max_concurrent_wakes
+            );
+        }
+        if self.agents.len() > MAX_SUPERVISED_AGENTS {
+            anyhow::bail!(
+                "messaging.supervisor.agents may list at most {MAX_SUPERVISED_AGENTS} agents"
+            );
+        }
+        // One entry per agent and per conversation, so two wakes can never
+        // run for the same agent: each entry runs its wakes one at a time.
+        let mut names = std::collections::BTreeSet::new();
+        let mut inboxes = std::collections::BTreeSet::new();
+        let mut targets = std::collections::BTreeSet::new();
+        for entry in &self.agents {
+            entry
+                .validate()
+                .with_context(|| format!("messaging.supervisor.agents entry {:?}", entry.name))?;
+            if !names.insert(entry.name.as_str()) {
+                anyhow::bail!("messaging.supervisor.agents names {:?} twice", entry.name);
+            }
+            if !inboxes.insert((&entry.agent, &entry.workspace, &entry.project)) {
+                anyhow::bail!(
+                    "messaging.supervisor.agents entry {:?} supervises an agent another entry already supervises",
+                    entry.name
+                );
+            }
+            if !targets.insert(entry.adapter.target()) {
+                anyhow::bail!(
+                    "messaging.supervisor.agents entry {:?} wakes a conversation another entry already wakes",
+                    entry.name
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+impl SupervisedAgent {
+    fn validate(&self) -> anyhow::Result<()> {
+        let name_ok = (1..=40).contains(&self.name.len())
+            && self
+                .name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+        if !name_ok {
+            anyhow::bail!("name must be 1 to 40 lowercase letters, digits or '-'");
+        }
+        if ai_memory_core::AgentKind::from_wire(&self.agent).as_str() != self.agent {
+            anyhow::bail!("agent must be a canonical harness name, such as codex or claude-code");
+        }
+        for (key, value) in [("workspace", &self.workspace), ("project", &self.project)] {
+            if value.trim().is_empty() || value.len() > 256 || value.chars().any(char::is_control) {
+                anyhow::bail!("{key} must be a non-empty name without control characters");
+            }
+        }
+        if self.wake_from.len() > ai_memory_hooks::MAX_WAKE_FROM {
+            anyhow::bail!(
+                "wake_from may name at most {} projects",
+                ai_memory_hooks::MAX_WAKE_FROM
+            );
+        }
+        if !(1..=60).contains(&self.wakes_per_hour) || !(1..=1_440).contains(&self.wakes_per_day) {
+            anyhow::bail!(
+                "wakes_per_hour must be between 1 and 60 and wakes_per_day between 1 and 1440"
+            );
+        }
+        if !(5..=300).contains(&self.timeout_secs) {
+            anyhow::bail!("timeout_secs must be between 5 and 300");
+        }
+        self.adapter.adapter()?;
+        if !self.adapter.program().is_absolute() {
+            anyhow::bail!("the adapter program must be an absolute path");
+        }
+        Ok(())
     }
 }
 
@@ -1810,6 +2042,7 @@ impl MessagingSettings {
     }
 
     fn validate(&self) -> anyhow::Result<()> {
+        self.supervisor.validate()?;
         for (key, value, max) in [
             ("messaging.ttl_low_days", self.ttl_low_days, 365),
             ("messaging.ttl_normal_days", self.ttl_normal_days, 365),
@@ -8289,6 +8522,87 @@ fn messaging_defaults_overrides_and_bounds() {
         let key = bad.split(' ').next().unwrap();
         assert!(error.contains(key), "{bad}: {error}");
     }
+}
+
+// --- `[messaging.supervisor]` ------------------------------------------
+
+/// The supervisor table parses into the closed adapter set, applies the owner's
+/// defaults (4/h, 24/day, 20/h total, 2 at once, never idle-stop) and refuses
+/// a free-form command, an unknown adapter or key, a relative program, a
+/// thread that could read as an option, and two entries for one agent or one
+/// conversation.
+#[test]
+fn messaging_supervisor_entries_are_closed_typed_and_bounded() {
+    use tempfile::TempDir;
+    let tmp = TempDir::new().unwrap();
+    let config_path = tmp.path().join("config.toml");
+    let load = |body: &str| {
+        std::fs::write(&config_path, body).unwrap();
+        Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+    };
+    let entry = |name: &str, agent: &str, adapter: &str| {
+        format!(
+            "[[messaging.supervisor.agents]]\nname = \"{name}\"\nagent = \"{agent}\"\n\
+             workspace = \"default\"\nproject = \"api\"\n\
+             wake_from = [{{ workspace = \"default\", project = \"web\" }}]\n\
+             adapter = {adapter}\n"
+        )
+    };
+    let codex = |thread: &str| {
+        format!("{{ kind = \"codex_queue\", program = \"/usr/bin/codex\", thread = \"{thread}\" }}")
+    };
+    let config = load(&entry("codex-api", "codex", &codex("work-chat"))).unwrap();
+    let settings = &config.messaging.supervisor;
+    assert_eq!(settings.max_wakes_per_hour, 20);
+    assert_eq!(settings.max_concurrent_wakes, 2);
+    assert_eq!(settings.idle_exit_minutes, 0);
+    let agent = &settings.agents[0];
+    assert_eq!(
+        (
+            agent.wakes_per_hour,
+            agent.wakes_per_day,
+            agent.timeout_secs
+        ),
+        (4, 24, 60)
+    );
+    assert_eq!(agent.adapter.adapter().unwrap().id(), "codex_queue");
+
+    let refused = [
+        entry(
+            "codex-api",
+            "codex",
+            "{ kind = \"exec\", command = \"sh -c id\" }",
+        ),
+        entry(
+            "codex-api",
+            "codex",
+            "{ kind = \"codex_queue\", program = \"/usr/bin/codex\", thread = \"t\", args = [\"--resume\"] }",
+        ),
+        entry(
+            "codex-api",
+            "codex",
+            "{ kind = \"codex_queue\", program = \"codex\", thread = \"t\" }",
+        ),
+        entry("codex-api", "codex", &codex("--resume")),
+        entry("codex-api", "codex", &codex("a b")),
+        entry("Codex", "codex", &codex("t")),
+        entry("codex-api", "Codex", &codex("t")),
+        entry("codex-api", "codex", &codex("t")) + "command = \"id\"\n",
+        entry("codex-api", "codex", &codex("t")) + "timeout_secs = 3600\n",
+        entry("codex-api", "codex", &codex("t")) + "wakes_per_hour = 0\n",
+        entry("a", "codex", &codex("t")) + &entry("a", "codex", &codex("u")),
+        entry("a", "codex", &codex("t")) + &entry("b", "codex", &codex("u")),
+        entry("a", "codex", &codex("t")) + &entry("b", "grok", &codex("t")),
+        "[messaging.supervisor]\nmax_concurrent_wakes = 9\n".to_owned(),
+        "[messaging.supervisor]\nmax_concurrent_wakes = 0\n".to_owned(),
+        "[messaging.supervisor]\nmax_wakes_per_hour = 0\n".to_owned(),
+        "[messaging.supervisor]\nwakes = 3\n".to_owned(),
+    ];
+    for body in refused {
+        assert!(load(&body).is_err(), "accepted:\n{body}");
+    }
+    let raised = load("[messaging.supervisor]\nmax_concurrent_wakes = 8\n").unwrap();
+    assert_eq!(raised.messaging.supervisor.max_concurrent_wakes, 8);
 }
 
 // --- `[sessions] idle_end_after_hours` ------------------------------

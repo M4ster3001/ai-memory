@@ -6200,6 +6200,7 @@ pub(crate) fn row_to_agent_message(
                     .transpose()
                     .map_err(StoreError::from)?,
                 at: created_at,
+                retry_after: retry_after_us.map(|us| ts(us, "retry_after")).transpose()?,
             }),
             _ => None,
         };

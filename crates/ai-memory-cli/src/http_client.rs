@@ -479,6 +479,45 @@ pub(crate) async fn get_json_bounded<T: DeserializeOwned>(
         .with_context(|| format!("parsing JSON body from GET {}", display_url(&url)))
 }
 
+/// POST a JSON body like [`post_json`], bounded in time and size like
+/// [`get_json_bounded`]. For a long-running client that must never hang on a
+/// server that stopped answering.
+///
+/// # Errors
+/// As [`post_json`], plus a timeout or an oversized body.
+pub(crate) async fn post_json_bounded<B: Serialize, T: DeserializeOwned>(
+    endpoint: &ServerEndpoint,
+    path: &str,
+    body: &B,
+    timeout: Duration,
+    max_body_bytes: usize,
+) -> Result<T> {
+    let client = http_client();
+    let url = endpoint.build_url(path);
+    let req = endpoint.authenticate(client.post(&url).json(body).timeout(timeout));
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| augment_connect_error(e, endpoint, &url))?;
+    let mut resp = require_success(&endpoint.i18n, reqwest::Method::POST, resp).await?;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| augment_connect_error(e, endpoint, &url))?
+    {
+        if bytes.len().saturating_add(chunk.len()) > max_body_bytes {
+            anyhow::bail!(
+                "the response from POST {} exceeded {max_body_bytes} bytes",
+                display_url(&url)
+            );
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("parsing JSON body from POST {}", display_url(&url)))
+}
+
 /// PATCH JSON body to `<endpoint>{path}`, deserialise JSON response.
 ///
 /// # Errors

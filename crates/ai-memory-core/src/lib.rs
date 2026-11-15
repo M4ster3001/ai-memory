@@ -22,6 +22,7 @@ pub use latency::{LATENCY_BUCKET_BOUNDS_US, LatencyHistogram, LatencySnapshot, L
 pub mod log_ledger;
 pub mod message;
 pub mod message_delivery;
+pub mod message_wake;
 pub mod observation;
 pub mod okf;
 pub mod page;

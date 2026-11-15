@@ -443,6 +443,24 @@ signal or `wait_ms` (at most 25,000), then reads ids, a shared flag and
 timestamps; it never returns a subject, body or sender. It holds at most 64
 waiters and answers 429 past that. The signal is a hint after commit and the
 read decides, so a missed wake-up only delays an answer until its timeout.
+`ai-memory message supervise` is the one ai-memory process that starts another
+program, and it runs on the operator's host, never in the server. It
+long-polls `/inbox/watch` for each `[[messaging.supervisor.agents]]` entry,
+asks `POST /inbox/wake-candidates` which new messages pass the entry's sender
+gate (the server resolves `wake_from` with the caller's read access and
+answers `listed`, `unverified`, `unlisted` or `system`, never a sender name),
+and runs the entry's adapter from `ai-memory-core::message_wake`, a closed enum
+whose only member is `codex_queue`. The adapter runs from a canonical path
+without a shell, with an allowlisted environment, the state directory as
+working directory and a timeout that kills its process group, and only after
+the operator approved a digest of the entry, the argv shape and the program's
+SHA-256 on a terminal. `WakeLedger` keeps budgets, backoff, the quota circuit
+and once-per-message bookkeeping in `ledger.json`; a semaphore bounds
+concurrent adapters (two by default) and each entry runs one at a time.
+Outcomes go back as enums through `POST /inbox/wake-report`, which needs
+`Write` on the inbox; the writer compare-and-sets the pending rows of that
+inbox and harness, records a timeline event (V104 admits the wake events) and
+queues the sender's receipt in the same transaction.
 `GET /recap?session_id=` answers a prompt that starts with `reload context`
 (Claude Code and Codex in the `UserPromptSubmit` envelope, Grok on the next
 `PostToolUse`, OpenCode through its system/context hooks). It is read-only and
@@ -693,7 +711,8 @@ prunable rather than only after it ages in place.
 | `token_calls` context and `token_call_tools` | V94 nullable native turn/response coordinates and response time, plus bounded tool references keyed by session/response. One writer transaction persists counters, provenance and session totals; tools cascade with their response. Missing context stays unknown. Server-side UTC/model/harness/session/turn/tool filters run after scope/owner checks and before pagination. |
 | `agent_messages.state` `editing` | V95 lets a sender hold a pending message out of the queue while editing it. The claim path selects only `pending`, so a held message cannot be popped by order or by id. The row keeps its id and `created_at`, and `edited_at` records the last text change. `ops::begin_message_edit` and `finish_message_edit` are single `UPDATE`s scoped to the recipient coordinate and the expected state, so a collected, cancelled or foreign message is left alone. Saving goes through the sanitizer and `message_send` admission. |
 | `agent_registrations` | V102 one row per `(workspace, project, agent_kind)` once that harness has started a session there, inserted in the session's own transaction and backfilled from `sessions`. Routing only: it decides whether addressed mail is `queued` or `awaiting_agent` and never who may claim it. |
-| `agent_messages` delivery columns, `message_delivery_events` | V103 rebuilds `agent_messages`: queue `state` gains `expired`; `delivery_state`/`delivery_reason` (closed vocabularies, some reserved for the wake supervisor), `priority`, `notify`, `expires_at`, `no_pop_alert_at`, `retry_after`, and `kind` with `receipt_for`/`receipt_outcome`/`receipt_reason` for server receipts (CHECK: a receipt has `notify = 'never'`; unique per message and outcome). Legacy rows get a derived delivery state, no deadline and `notify = 'never'`. `message_delivery_events` is the enum-only timeline. The server's one-minute sweep (batch 100) expires due mail and records alerts in one writer transaction; see `docs/agent-messaging.md`. |
+| `agent_messages` delivery columns, `message_delivery_events` | V103 rebuilds `agent_messages`: queue `state` gains `expired`; `delivery_state`/`delivery_reason` (closed vocabularies; the wake states come from the supervisor's reports), `priority`, `notify`, `expires_at`, `no_pop_alert_at`, `retry_after`, and `kind` with `receipt_for`/`receipt_outcome`/`receipt_reason` for server receipts (CHECK: a receipt has `notify = 'never'`; unique per message and outcome). Legacy rows get a derived delivery state, no deadline and `notify = 'never'`. `message_delivery_events` is the enum-only timeline. The server's one-minute sweep (batch 100) expires due mail and records alerts in one writer transaction; see `docs/agent-messaging.md`. |
+| `message_delivery_events` wake events | V104 rebuilds the timeline table so its `event` CHECK admits `wake_attempted`, `wake_failed`, `agent_unavailable` and `quota_exhausted`, the events the wake supervisor's reports record. Existing rows keep their ids. |
 | `observations.file_path` | V99 nullable checkout-relative path of the one file a kept file-tool PostToolUse named, set only with `[ingest] index_file_paths` on (off by default) and only from the `_ai_memory_file` field of the native hook client and the generated TypeScript integrations. `Sanitized::<NewObservation>::new` clears a rooted, `..`, over-long or scrub-altered path. The partial index `idx_observations_file_path` covers `(workspace_id, project_id, file_path, created_at)`. The column travels with its row through prune, purge, move and merge. `ReaderPool::observations_for_file` reads one project, applies the session owner rule before its limit, and has no `global` or `scopes` path ([design](design-file-path-index.md)). |
 | `client_activity` | Server-wide MCP tool-call counters split into reads/writes and bucketed by UTC day. The MCP request choke point flushes buffered calls on a one-minute background interval; failed batches retry from bounded memory. Each day stores at most 128 sanitized client labels plus `other`, so an untrusted `clientInfo.name` cannot create traffic-proportional rows. |
 | `auto_improve_proposals` | Staged learning and maintenance edits with immutable target snapshots and append-only decision events. Pending-target uniqueness is scoped by the qualified staging identity; unattributed proposals retain the historical shared bucket. |

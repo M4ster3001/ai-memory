@@ -182,7 +182,7 @@ async fn dispatch(
         }
         Command::Handoffs(args) => commands::handoffs::run(&config, args).await,
         Command::Message(args) => {
-            let exit_code = commands::message::run(&config, args).await?;
+            let exit_code = commands::message::run(&config, args, config_path.as_deref()).await?;
             if exit_code != 0 {
                 std::process::exit(exit_code);
             }

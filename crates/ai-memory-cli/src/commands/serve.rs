@@ -7699,6 +7699,8 @@ mod tests {
             "/hook",
             "/handoff",
             "/inbox/watch",
+            "/inbox/wake-candidates",
+            "/inbox/wake-report",
             "/workstream/runs",
         ] {
             protected_host = protected_host.route(
@@ -7729,6 +7731,8 @@ mod tests {
             (axum::http::Method::POST, "/hook"),
             (axum::http::Method::GET, "/handoff"),
             (axum::http::Method::GET, "/inbox/watch"),
+            (axum::http::Method::POST, "/inbox/wake-candidates"),
+            (axum::http::Method::POST, "/inbox/wake-report"),
             (axum::http::Method::POST, "/workstream/runs"),
         ] {
             let response = router

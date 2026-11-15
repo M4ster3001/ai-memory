@@ -346,13 +346,16 @@ never free text:
 | `delivered` | popped | yes |
 | `expired` | the time to live passed while it waited (reason `ttl`) | yes |
 | `cancelled` | the sender cancelled it (reason `sender_cancelled`) | yes |
+| `wake_attempted` | the [wake supervisor](#the-wake-supervisor) ran the recipient's adapter and the adapter accepted the wake | no |
+| `wake_failed` | the supervisor's wake failed or was not run (reason `adapter_exit_nonzero`, `adapter_timeout`, `session_busy`, `not_approved` or `budget_exhausted`) | no |
+| `agent_unavailable` | the adapter's program could not be started (reason `binary_missing`) | no |
+| `quota_exhausted` | the recipient's harness reported exhausted quota (reason `quota_marker`); `retry_after` says when it resets, when the harness said so | no |
 
-`wake_attempted`, `wake_failed`, `agent_unavailable`, `quota_exhausted` and
-`dead` are reserved for the wake supervisor and delivery leases described in
-[the design note](design-agent-wakeup-and-secure-messaging.md). Nothing sets
-them yet, and `retry_after` stays empty until a wake adapter reports a quota
-reset. When the "not popped yet" alert fires, a queued message keeps its state
-and gets the reason `no_pop_timeout`.
+`dead` is reserved for delivery leases described in
+[the design note](design-agent-wakeup-and-secure-messaging.md), and nothing
+sets it yet. When the "not popped yet" alert fires, a queued message keeps its
+state and gets the reason `no_pop_timeout`. A message in any of the wake states
+is still in the inbox and is popped as usual.
 
 ### Priority and time to live
 
@@ -756,6 +759,145 @@ The queued text names only the id. If the chat is busy, the message is
 delivered after the current turn. Because the watcher announces each id once, a
 message that was queued but never popped is not announced again; pop it by hand
 or resend.
+
+### The wake supervisor
+
+`ai-memory message supervise` replaces a per-agent watcher with one process on
+the host. It watches the inbox of every agent listed under
+`[messaging.supervisor]` in `config.toml`, runs that agent's wake adapter when
+mail arrives that may wake it, and reports what happened to the server, which
+updates the [delivery state](#delivery-states-and-receipts) and sends the
+sender the receipt it asked for. It never pops, reads or forwards a message.
+The server never runs a command; this supervisor is the only ai-memory process
+that does, and only the adapters below.
+
+```toml
+[[messaging.supervisor.agents]]
+name = "codex-api"
+agent = "codex"
+workspace = "default"
+project = "api"
+wake_from = [{ workspace = "default", project = "web" }]
+adapter = { kind = "codex_queue", program = "/home/you/.local/bin/codex", thread = "019a7c2e-0b1d-7f00-9c1e-3a5b6d7e8f90" }
+```
+
+Every key, default and bound is in
+[the configuration reference](config-properties.md#messagingsupervisor).
+
+#### Adapters
+
+The set is closed and typed. Today it has one entry,
+`codex_queue`, which runs
+`<program> queue --thread <thread> --message <wake text>` without a shell and
+never with `--resume` (against a running Codex chat, `--resume` fails with
+`already has an active writer`). `thread` is a lowercase UUID or a name of
+letters, digits, `.`, `_` and `-` that starts with a letter or digit. There is
+no field for a command of your own; `message watch --exec` remains for manual
+use. The wake text is fixed: the message count, the newest message id, the
+agent and the inbox from the configuration. No subject, body or sender name.
+
+#### Who may wake an agent
+
+A message wakes its agent only when it comes from a
+project in `wake_from` and the server recorded the sender's hook session in
+that project when it was sent. Mail from any other project, or from a listed
+project without a recorded session, stays in the inbox, unannounced. The
+supervisor sends its `wake_from` list to the server, which answers per message
+`listed`, `unverified`, `unlisted` or `system`, so sender names never reach the
+supervisor. A delivery receipt about the agent's own mail (`system`) may wake
+it, because `codex_queue` reaches a running session; a later adapter that
+starts a stopped session will not be allowed to.
+
+A recorded session is a session id the sender's client named and the server
+found in the sending project. It is not a cryptographic proof: a process that
+runs as the same user and can read the bearer token can name one too.
+
+#### Approval
+
+An adapter runs only after the operator approved it on a
+terminal:
+
+```bash
+ai-memory message supervise approve codex-api
+```
+
+The command shows the program's canonical path and SHA-256, the exact argv
+with a placeholder id, the working directory, the environment variable names
+and the projects that may wake the agent, then asks `[y/N]`. It refuses to
+run without a terminal. The approval is a digest of all of that, written
+atomically to `approvals.json` in the state directory. A new program file
+(an upgrade too), a different thread, inbox or `wake_from` list voids it, and
+the supervisor reports `wake_failed/not_approved` until you approve again. The
+running supervisor rereads the approvals, so it needs no restart. Started in a
+terminal, `message supervise` offers the same prompt for each entry that lacks
+an approval.
+
+The program must be a regular executable file, owned by you or root, not group-
+or world-writable, in a directory that is not world-writable, and not under
+`/tmp`, `/var/tmp` or `/dev/shm`. A program that fails these checks is
+reported as `not_approved`; a missing one as `agent_unavailable/binary_missing`.
+
+#### How it runs
+
+The adapter starts from the program's canonical path with the
+state directory as working directory, no stdin, and an environment cleared
+down to `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_ALL`, `LC_CTYPE`, `TZ`, the
+`XDG_*` base directories, the harness's own home variable (`CODEX_HOME`) and a
+`PATH` of the program's directories plus `/usr/local/bin:/usr/bin:/bin`. No
+ai-memory token and no provider key are passed. After `timeout_secs` (default
+60) its process group is killed. The first 4 KiB of stdout and stderr are read
+only to classify the result (exit 0 is `wake_attempted`; Codex's
+`usage_limit_reached` is `quota_exhausted`, with `retry_after` when the error
+gives `resets_in_seconds`; `already has an active writer` is `session_busy`)
+and then dropped. Nothing of the output is logged, stored or sent.
+
+#### Limits
+
+Per agent, 4 wakes an hour and 24 a day; across agents, 20 an hour.
+One wake covers every new message for the agent at that moment, and each
+message wakes its agent at most once, so a message the agent already popped,
+or one it was woken for before a restart, is not announced again. Past a
+budget, the message is reported `wake_failed/budget_exhausted` once and woken
+when the window rolls. After a failed wake the supervisor waits 1 minute, then
+5, 30 and 120 minutes before the next attempt. A quota failure stops wakes for
+that agent until `retry_after`, or 15 minutes when the harness did not say;
+mail that arrives meanwhile is reported `quota_exhausted` without running the
+adapter. At most 2 adapters run at once, each for a different agent, and one
+agent never has two wakes in flight; `max_concurrent_wakes` raises the first
+limit when you ask for it. Budgets, backoff and woken ids are saved in
+`ledger.json`, so a restart does not reset them.
+
+#### Running it
+
+In a terminal, `ai-memory message supervise` runs until
+stopped; `--once` checks every inbox once and exits; `--state-dir` moves the
+state from `supervisor` under the data directory. A lock allows one supervisor
+per state directory (exit 73), and a refused credential stops it (exit 77). It
+logs one line per wake or report to stderr: entry names, adapter ids, message
+ids, counts and outcomes, never argv, thread ids or output. Set
+`idle_exit_minutes` to stop after a quiet period; by default it never stops.
+
+To keep it running across logins, print a per-user service unit and install it
+yourself. Nothing is installed by the command:
+
+```bash
+ai-memory message supervise unit > ~/.config/systemd/user/ai-memory-supervisor.service
+systemctl --user daemon-reload
+systemctl --user enable --now ai-memory-supervisor.service
+```
+
+On macOS it prints a LaunchAgent for
+`~/Library/LaunchAgents/com.github.akitaonrails.ai-memory.supervisor.plist`,
+loaded with `launchctl bootstrap gui/$(id -u) <path>`. Both restart the
+supervisor after a failure and leave it stopped after the idle exit. There is
+no Windows unit.
+
+The supervisor needs a credential with write access to every inbox it watches:
+its routes (`POST /inbox/wake-candidates` and `POST /inbox/wake-report`, beside
+`GET /inbox/watch`) change what senders see. Both refuse unknown fields and
+values outside the lists above, and a report changes only pending mail in the
+named inbox that the named harness may claim, so a message popped in the
+meantime keeps `delivered`.
 
 ### The Python script
 

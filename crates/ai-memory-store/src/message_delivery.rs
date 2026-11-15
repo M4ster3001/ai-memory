@@ -1,16 +1,17 @@
-//! Delivery state, agent registration, deadline sweep and receipts for agent
-//! messages (V102, V103). Every function here runs inside a transaction the
-//! single writer already holds, so a state change, its timeline event and any
-//! receipt it causes commit together.
+//! Delivery state, agent registration, deadline sweep, wake reports and
+//! receipts for agent messages (V102 to V104). Every function here runs inside
+//! a transaction the single writer already holds, so a state change, its
+//! timeline event and any receipt it causes commit together.
 //!
 //! A receipt is built from columns of the original row, a fixed template and
 //! enumerated values. No text from the recipient is read, and a receipt row
 //! can never ask for a receipt (the V103 CHECK repeats that rule).
 
 use ai_memory_core::{
-    AgentKind, DeliveryEventKind, DeliveryReason, MessageId, NotifyOn, ProjectId, ReceiptOutcome,
-    WorkspaceId,
+    AgentKind, DeliveryEventKind, DeliveryReason, DeliveryState, MessageId, NotifyOn, ProjectId,
+    ReceiptOutcome, WorkspaceId,
     message_delivery::{RECEIPT_TTL_SECS, receipt_body, receipt_subject},
+    message_wake::WakeOutcome,
 };
 use jiff::Timestamp;
 use rusqlite::{OptionalExtension, Transaction, params};
@@ -40,6 +41,19 @@ pub struct DeadlineSweepOutcome {
     pub receipts: usize,
     /// Receipts dropped because the sender's inbox was full.
     pub receipts_dropped: usize,
+    /// Inboxes that gained a receipt (for watcher signals).
+    pub(crate) new_rows: Vec<NewInboxRow>,
+}
+
+/// What one wake report changed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WakeReportOutcome {
+    /// Messages whose delivery state the report set. A message popped,
+    /// cancelled or expired in the meantime, or one outside the reported
+    /// inbox and harness, is left alone and not counted.
+    pub updated: usize,
+    /// Receipts queued in a sender's inbox.
+    pub receipts: usize,
     /// Inboxes that gained a receipt (for watcher signals).
     pub(crate) new_rows: Vec<NewInboxRow>,
 }
@@ -197,6 +211,7 @@ fn queue_receipt(
     source: &ReceiptSource,
     outcome: ReceiptOutcome,
     reason: Option<DeliveryReason>,
+    retry_after: Option<i64>,
     at: i64,
 ) -> StoreResult<ReceiptResult> {
     // A receipt is never the subject of a receipt.
@@ -255,9 +270,9 @@ fn queue_receipt(
              id, from_workspace_id, from_project_id, from_agent, from_session_id, \
              from_owner_user, to_workspace_id, to_project_id, subject, body, state, created_at, \
              nature, evidence, to_agent, kind, priority, notify, expires_at, delivery_state, \
-             receipt_for, receipt_outcome, receipt_reason \
+             receipt_for, receipt_outcome, receipt_reason, retry_after \
          ) VALUES (?1, ?2, ?3, 'other', NULL, NULL, ?4, ?5, ?6, ?7, 'pending', ?8, \
-             'unknown', NULL, ?9, 'receipt', 'normal', 'never', ?10, 'queued', ?11, ?12, ?13)",
+             'unknown', NULL, ?9, 'receipt', 'normal', 'never', ?10, 'queued', ?11, ?12, ?13, ?14)",
         params![
             id.as_bytes(),
             source.to_workspace_id,
@@ -272,6 +287,7 @@ fn queue_receipt(
             source.id,
             outcome.as_str(),
             reason.map(|r| r.as_str()),
+            retry_after,
         ],
     )?;
     record_event(tx, &source.id, at, DeliveryEventKind::ReceiptSent, reason)?;
@@ -308,7 +324,7 @@ pub(crate) fn mark_delivered(
         receipt_source,
     )?;
     Ok(
-        match queue_receipt(tx, &source, ReceiptOutcome::Delivered, None, at)? {
+        match queue_receipt(tx, &source, ReceiptOutcome::Delivered, None, None, at)? {
             ReceiptResult::Queued(row) => Some(row),
             ReceiptResult::Skipped | ReceiptResult::Dropped => None,
         },
@@ -422,7 +438,7 @@ fn tally_receipt(
     reason: Option<DeliveryReason>,
     now: i64,
 ) -> StoreResult<()> {
-    match queue_receipt(tx, source, receipt, reason, now)? {
+    match queue_receipt(tx, source, receipt, reason, None, now)? {
         ReceiptResult::Queued(row) => {
             outcome.receipts += 1;
             outcome.new_rows.push(row);
@@ -431,6 +447,102 @@ fn tally_receipt(
         ReceiptResult::Skipped => {}
     }
     Ok(())
+}
+
+/// Apply a wake supervisor's report to `ids` in one inbox: set the delivery
+/// state and reason, record a timeline event, and queue the receipt the
+/// sender asked for on a failure outcome. Each change is a compare-and-set on
+/// a pending message in this inbox addressed to `agent` or shared, so a
+/// message the recipient already popped keeps `delivered`, and an id from
+/// another inbox or for another harness is ignored.
+pub(crate) fn record_wake_report(
+    tx: &Transaction<'_>,
+    workspace_id: &WorkspaceId,
+    project_id: &ProjectId,
+    agent: AgentKind,
+    ids: &[MessageId],
+    outcome: WakeOutcome,
+    now: i64,
+) -> StoreResult<WakeReportOutcome> {
+    let state = outcome.state();
+    let reason = outcome.reason();
+    let retry_after = outcome.retry_after_secs().map(|secs| {
+        now.saturating_add(i64::try_from(secs.saturating_mul(1_000_000)).unwrap_or(i64::MAX))
+    });
+    let (event, receipt) = match state {
+        DeliveryState::WakeAttempted => (DeliveryEventKind::WakeAttempted, None),
+        DeliveryState::WakeFailed => (
+            DeliveryEventKind::WakeFailed,
+            Some(ReceiptOutcome::WakeFailed),
+        ),
+        DeliveryState::AgentUnavailable => (
+            DeliveryEventKind::AgentUnavailable,
+            Some(ReceiptOutcome::AgentUnavailable),
+        ),
+        DeliveryState::QuotaExhausted => (
+            DeliveryEventKind::QuotaExhausted,
+            Some(ReceiptOutcome::QuotaExhausted),
+        ),
+        other => {
+            return Err(StoreError::Memory(
+                ai_memory_core::MemoryError::InvalidInput(format!(
+                    "{} is not a wake outcome",
+                    other.as_str()
+                )),
+            ));
+        }
+    };
+    let mut seen = std::collections::BTreeSet::new();
+    let mut result = WakeReportOutcome::default();
+    for id in ids {
+        if !seen.insert(*id.as_bytes()) {
+            continue;
+        }
+        let source = tx
+            .query_row(
+                &format!(
+                    "SELECT {RECEIPT_SOURCE_COLUMNS} FROM agent_messages \
+                     WHERE id = ?1 AND to_workspace_id = ?2 AND to_project_id = ?3 \
+                       AND state = 'pending' AND (to_agent IS NULL OR to_agent = ?4)"
+                ),
+                params![
+                    id.as_bytes(),
+                    workspace_id.as_bytes(),
+                    project_id.as_bytes(),
+                    agent.as_str()
+                ],
+                receipt_source,
+            )
+            .optional()?;
+        let Some(source) = source else {
+            continue;
+        };
+        let changed = tx.execute(
+            "UPDATE agent_messages SET delivery_state = ?2, delivery_reason = ?3, retry_after = ?4 \
+             WHERE id = ?1 AND state = 'pending'",
+            params![
+                source.id,
+                state.as_str(),
+                reason.map(|r| r.as_str()),
+                retry_after
+            ],
+        )?;
+        if changed == 0 {
+            continue;
+        }
+        result.updated += 1;
+        record_event(tx, &source.id, now, event, reason)?;
+        if let Some(receipt) = receipt {
+            match queue_receipt(tx, &source, receipt, reason, retry_after, now)? {
+                ReceiptResult::Queued(row) => {
+                    result.receipts += 1;
+                    result.new_rows.push(row);
+                }
+                ReceiptResult::Skipped | ReceiptResult::Dropped => {}
+            }
+        }
+    }
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -458,7 +570,7 @@ mod tests {
         };
         for outcome in ReceiptOutcome::ALL {
             assert!(matches!(
-                queue_receipt(&tx, &source, *outcome, None, 1).unwrap(),
+                queue_receipt(&tx, &source, *outcome, None, None, 1).unwrap(),
                 ReceiptResult::Skipped
             ));
         }

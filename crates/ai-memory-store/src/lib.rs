@@ -26,7 +26,7 @@ mod inbox_signals;
 mod maintenance;
 mod message_delivery;
 pub use message_delivery::{
-    DeadlineSweepOutcome, DeliveryEvent, MAX_SWEEP_BATCH, MessageListFilter,
+    DeadlineSweepOutcome, DeliveryEvent, MAX_SWEEP_BATCH, MessageListFilter, WakeReportOutcome,
 };
 mod migrations;
 mod ops;
@@ -119,7 +119,7 @@ pub use reader::{
     SessionEndDisposition, SessionKindSummary, SessionLine, SessionObservationSnapshot,
     SessionPromptTitles, SessionSummary, SessionToolTitles, SessionUsageView, SettledPage,
     StatusCounts, StorageStatus, StoredEmbedding, StoredPageBody, StreamTimings, TokenCallOrder,
-    TokenCallQuery, TokenCallView, TokenUsageReport, VectorQuery, WorkspaceScopeRow,
+    TokenCallQuery, TokenCallView, TokenUsageReport, VectorQuery, WakeCandidate, WorkspaceScopeRow,
     WorkspaceSummary, f32_vec_to_bytes, highlighted_snippet_html, plain_snippet,
     project_name_fold_key,
 };

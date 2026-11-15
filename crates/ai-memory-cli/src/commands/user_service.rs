@@ -233,6 +233,114 @@ fn render_systemd(spec: &ServiceSpec) -> Result<ServiceUnit> {
     })
 }
 
+/// The messaging supervisor's systemd user unit and LaunchAgent label.
+pub(crate) const SUPERVISOR_SYSTEMD_UNIT_NAME: &str = "ai-memory-supervisor.service";
+pub(crate) const SUPERVISOR_LAUNCHD_LABEL: &str = "com.github.akitaonrails.ai-memory.supervisor";
+
+/// Render the per-user unit that runs `ai-memory message supervise` with the
+/// same binary, data dir and config the server unit uses. It restarts the
+/// supervisor when it fails and leaves it stopped after a clean exit (the
+/// optional idle stop). There is no Windows form: the supervisor's process
+/// handling is written for Linux and macOS.
+///
+/// Nothing is installed here; `message supervise unit` prints the result.
+///
+/// # Errors
+/// As [`render`], and on Windows.
+pub(crate) fn render_supervisor(
+    manager: ServiceManager,
+    spec: &ServiceSpec,
+) -> Result<ServiceUnit> {
+    let exe = checked_path("binary", &spec.exe)?;
+    let data_dir = checked_path("data dir", &spec.data_dir)?;
+    let config = checked_path("config file", &spec.config_path)?;
+    let home = checked_path("home", &spec.home)?;
+    match manager {
+        ServiceManager::SystemdUser => {
+            // No PrivateTmp or NoNewPrivileges: the supervisor starts harness
+            // binaries, which may keep sockets or state under /tmp or need
+            // their own privileges.
+            let unstamped = format!(
+                "# Printed by `ai-memory message supervise unit`.\n\
+                 [Unit]\n\
+                 Description=ai-memory messaging supervisor (user service)\n\
+                 Documentation=https://github.com/akitaonrails/ai-memory/blob/main/docs/agent-messaging.md\n\
+                 \n\
+                 [Service]\n\
+                 Type=simple\n\
+                 EnvironmentFile=-%h/.config/ai-memory/env\n\
+                 ExecStart={} --data-dir {} --config {} message supervise\n\
+                 Restart=on-failure\n\
+                 RestartSec=30s\n\
+                 \n\
+                 [Install]\n\
+                 WantedBy=default.target\n",
+                systemd_word(exe),
+                systemd_word(data_dir),
+                systemd_word(config),
+            );
+            let path = unit_path(
+                ServiceManager::SystemdUser,
+                &spec.home,
+                spec.xdg_config_home.as_deref(),
+            )
+            .with_file_name(SUPERVISOR_SYSTEMD_UNIT_NAME);
+            Ok(ServiceUnit {
+                manager,
+                path,
+                contents: stamp(manager, &unstamped),
+                host: None,
+            })
+        }
+        ServiceManager::Launchd => {
+            let string = |text: &str| format!("<string>{}</string>", xml_text(text));
+            let program = [
+                exe,
+                "--data-dir",
+                data_dir,
+                "--config",
+                config,
+                "message",
+                "supervise",
+            ]
+            .map(string)
+            .join("\n    ");
+            let logs = format!("{home}/Library/Logs/ai-memory");
+            let contents = format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                 <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+                 <!-- Printed by `ai-memory message supervise unit`. -->\n\
+                 <plist version=\"1.0\">\n\
+                 <dict>\n  \
+                 <key>Label</key>\n  {label}\n  \
+                 <key>ProgramArguments</key>\n  <array>\n    {program}\n  </array>\n  \
+                 <key>RunAtLoad</key>\n  <true/>\n  \
+                 <key>KeepAlive</key>\n  <dict>\n    <key>SuccessfulExit</key>\n    <false/>\n  </dict>\n  \
+                 <key>StandardOutPath</key>\n  {stdout}\n  \
+                 <key>StandardErrorPath</key>\n  {stderr}\n\
+                 </dict>\n\
+                 </plist>\n",
+                label = string(SUPERVISOR_LAUNCHD_LABEL),
+                stdout = string(&format!("{logs}/supervisor.stdout.log")),
+                stderr = string(&format!("{logs}/supervisor.stderr.log")),
+            );
+            Ok(ServiceUnit {
+                manager,
+                path: spec
+                    .home
+                    .join("Library")
+                    .join("LaunchAgents")
+                    .join(format!("{SUPERVISOR_LAUNCHD_LABEL}.plist")),
+                contents: stamp(manager, &contents),
+                host: None,
+            })
+        }
+        ServiceManager::WindowsRun => {
+            bail!("the messaging supervisor has no Windows service; run it from a terminal")
+        }
+    }
+}
+
 /// Where `manager`'s unit for ai-memory lives: under `$XDG_CONFIG_HOME` (when
 /// absolute) or `~/.config` for systemd, `~/Library/LaunchAgents` for launchd.
 pub(crate) fn unit_path(
@@ -2077,5 +2185,69 @@ mod logon_binary_tests {
     #[test]
     fn the_live_check_is_quiet_off_windows() {
         assert_eq!(check_logon_binary(Path::new(DATA_DIR)), None);
+    }
+}
+
+#[cfg(test)]
+mod supervisor_unit_tests {
+    use super::*;
+
+    fn spec(root: &str) -> ServiceSpec {
+        ServiceSpec {
+            exe: PathBuf::from(format!("{root}/bin/ai memory")),
+            data_dir: PathBuf::from(format!("{root}/data%x")),
+            config_path: PathBuf::from(format!("{root}/cfg/$config.toml")),
+            home: PathBuf::from(root),
+            xdg_config_home: None,
+        }
+    }
+
+    #[test]
+    fn the_systemd_supervisor_unit_runs_supervise_with_quoted_paths() {
+        let unit = render_supervisor(ServiceManager::SystemdUser, &spec("/home/u")).unwrap();
+        assert_eq!(
+            unit.path,
+            PathBuf::from("/home/u/.config/systemd/user/ai-memory-supervisor.service")
+        );
+        assert!(
+            unit.contents.contains(
+                "ExecStart=\"/home/u/bin/ai memory\" --data-dir \"/home/u/data%%x\" \
+                 --config \"/home/u/cfg/$$config.toml\" message supervise\n"
+            ),
+            "{}",
+            unit.contents
+        );
+        assert!(unit.contents.contains("Restart=on-failure"));
+        assert!(is_rendered_by_setup(&unit.contents));
+    }
+
+    #[test]
+    fn the_launchd_supervisor_agent_restarts_only_after_a_failure() {
+        let unit = render_supervisor(ServiceManager::Launchd, &spec("/Users/u&v")).unwrap();
+        assert_eq!(
+            unit.path,
+            PathBuf::from(
+                "/Users/u&v/Library/LaunchAgents/com.github.akitaonrails.ai-memory.supervisor.plist"
+            )
+        );
+        assert!(unit.contents.starts_with("<?xml"));
+        assert!(
+            unit.contents
+                .contains("<string>/Users/u&amp;v/bin/ai memory</string>")
+        );
+        assert!(unit.contents.contains("<string>supervise</string>"));
+        assert!(
+            unit.contents
+                .contains("<key>SuccessfulExit</key>\n    <false/>")
+        );
+        assert!(is_rendered_by_setup(&unit.contents));
+    }
+
+    #[test]
+    fn there_is_no_windows_supervisor_unit_and_paths_must_be_absolute() {
+        assert!(render_supervisor(ServiceManager::WindowsRun, &spec("/home/u")).is_err());
+        let mut relative = spec("/home/u");
+        relative.exe = PathBuf::from("ai-memory");
+        assert!(render_supervisor(ServiceManager::SystemdUser, &relative).is_err());
     }
 }

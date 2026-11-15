@@ -2964,4 +2964,75 @@ mod tests {
             .unwrap();
         assert!(plan.contains("idx_observations_file_path"), "{plan}");
     }
+
+    /// V104 rebuilds the delivery timeline to admit the wake supervisor's
+    /// events. Existing events keep their ids and values; unknown events are
+    /// still refused.
+    #[test]
+    fn v104_keeps_timeline_rows_and_admits_wake_events() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        run_to(&mut conn, 103).unwrap();
+        conn.execute_batch(
+            "INSERT INTO workspaces(id,name,created_at) VALUES(zeroblob(16),'mail',1);
+             INSERT INTO projects(id,workspace_id,name,created_at) VALUES(zeroblob(16),zeroblob(16),'mail',1);
+             INSERT INTO agent_messages(id,from_workspace_id,from_project_id,from_agent,to_workspace_id,to_project_id,body,state,created_at)
+                 VALUES(x'01000000000000000000000000000000',zeroblob(16),zeroblob(16),'other',zeroblob(16),zeroblob(16),'b','pending',5);
+             INSERT INTO message_delivery_events(id,message_id,at,event,reason)
+                 VALUES(7,x'01000000000000000000000000000000',9,'no_pop_alert','no_pop_timeout');",
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "INSERT INTO message_delivery_events(message_id,at,event) \
+                 VALUES(x'01000000000000000000000000000000',10,'wake_attempted')",
+                [],
+            )
+            .is_err(),
+            "V103 refuses the supervisor's events"
+        );
+        run(&mut conn).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        let kept: (i64, i64, String, Option<String>) = conn
+            .query_row(
+                "SELECT id, at, event, reason FROM message_delivery_events",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            kept,
+            (7, 9, "no_pop_alert".into(), Some("no_pop_timeout".into()))
+        );
+        for event in [
+            "wake_attempted",
+            "wake_failed",
+            "agent_unavailable",
+            "quota_exhausted",
+        ] {
+            conn.execute(
+                "INSERT INTO message_delivery_events(message_id,at,event) \
+                 VALUES(x'01000000000000000000000000000000',11,?1)",
+                [event],
+            )
+            .unwrap();
+        }
+        assert!(
+            conn.execute(
+                "INSERT INTO message_delivery_events(message_id,at,event) \
+                 VALUES(x'01000000000000000000000000000000',12,'woke_up')",
+                [],
+            )
+            .is_err()
+        );
+        let indexed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' \
+                 AND name='idx_message_delivery_events_message'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexed, 1);
+    }
 }
