@@ -786,6 +786,7 @@ async fn wake_candidates_report_kind_and_recorded_sender_sessions() {
     assert!(only_mine[0].sender_session_recorded);
     assert!(!only_mine[1].sender_session_recorded);
     assert_eq!(only_mine[0].from_project_id, a.1);
+    assert_eq!(only_mine[0].from_agent, AgentKind::Codex);
     assert_eq!(only_mine[0].kind, MessageKind::Message);
     let with_shared = store
         .reader

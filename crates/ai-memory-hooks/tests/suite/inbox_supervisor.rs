@@ -72,6 +72,33 @@ async fn send(h: &Harness, verified: bool, to_agent: Option<AgentKind>) -> Strin
         .to_string()
 }
 
+/// Mail sent from the watched project itself, by `from_agent`, with no
+/// recorded session.
+async fn send_inside_inbox(h: &Harness, from_agent: AgentKind) -> String {
+    h.state
+        .writer
+        .insert_message(NewAgentMessage {
+            from_workspace_id: h.inbox.0,
+            from_project_id: h.inbox.1,
+            from_agent,
+            from_session_id: None,
+            from_owner_user: None,
+            to_workspace_id: h.inbox.0,
+            to_project_id: h.inbox.1,
+            to_agent: Some(AgentKind::Codex),
+            subject: Some("SUBJECT-CANARY".into()),
+            body: "BODY-CANARY".into(),
+            nature: MessageNature::Unknown,
+            evidence: None,
+            priority: ai_memory_core::MessagePriority::Normal,
+            notify: ai_memory_core::NotifyOn::DEFAULT,
+            ttl_secs: None,
+        })
+        .await
+        .unwrap()
+        .to_string()
+}
+
 fn candidates_body(wake_from: &[(&str, &str)]) -> Value {
     json!({
         "workspace": WORKSPACE,
@@ -128,6 +155,50 @@ async fn candidates_classify_senders_without_naming_them() {
     )
     .await;
     assert_eq!(body.matches("\"unlisted\"").count(), 3, "{body}");
+}
+
+/// Mail inside the watched project is `same_project` without `wake_from` or
+/// a recorded session, and the watched agent's mail to itself is
+/// `same_agent` even when its own project is listed. Mail from another
+/// project keeps the `wake_from` labels.
+#[tokio::test]
+async fn candidates_label_mail_inside_the_watched_project() {
+    let h = harness().await;
+    let colleague = send_inside_inbox(&h, AgentKind::ClaudeCode).await;
+    let itself = send_inside_inbox(&h, AgentKind::Codex).await;
+    let outsider = send(&h, false, Some(AgentKind::Codex)).await;
+    for wake_from in [vec![], vec![(WORKSPACE, INBOX)]] {
+        let (status, body) = call(
+            &h.app,
+            post(
+                "/inbox/wake-candidates",
+                &candidates_body(&wake_from),
+                None,
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let json: Value = serde_json::from_str(&body).unwrap();
+        let senders: Vec<(&str, &str)> = json["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| (m["id"].as_str().unwrap(), m["sender"].as_str().unwrap()))
+            .collect();
+        assert_eq!(
+            senders,
+            [
+                (colleague.as_str(), "same_project"),
+                (itself.as_str(), "same_agent"),
+                (outsider.as_str(), "unlisted"),
+            ],
+            "wake_from = {wake_from:?}"
+        );
+        for leaked in ["CANARY", SENDER, "claude-code"] {
+            assert!(!body.contains(leaked), "{leaked} leaked: {body}");
+        }
+    }
 }
 
 #[tokio::test]

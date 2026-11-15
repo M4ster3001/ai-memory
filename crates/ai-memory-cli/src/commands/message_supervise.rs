@@ -1518,6 +1518,72 @@ mod tests {
         assert_eq!(off_digest, approval_digest(&legacy, &checked, &cwd));
     }
 
+    /// The digest of an entry that does not set `wake_unverified` is the one
+    /// the first supervisor recorded: pinned for the shape of the entry in
+    /// use (an agent woken by its own project listed in `wake_from`).
+    #[test]
+    fn an_entry_without_wake_unverified_keeps_its_recorded_digest() {
+        let entry = Entry {
+            name: "codex-linha".into(),
+            agent: AgentKind::Codex,
+            workspace: "default".into(),
+            project: "LinhaDeSucataUnity".into(),
+            include_shared: false,
+            wake_from: vec![WakeFrom {
+                workspace: "default".into(),
+                project: "LinhaDeSucataUnity".into(),
+            }],
+            wake_unverified: false,
+            adapter: WakeAdapter::CodexQueue {
+                conversation: ai_memory_core::message_wake::ConversationRef::parse(
+                    "01a1d9f4-c02a-7380-abcc-ad938cc031d2",
+                )
+                .unwrap(),
+            },
+            program: PathBuf::from("/opt/codex/bin/codex"),
+            budget: WakeBudget {
+                per_hour: 4,
+                per_day: 24,
+            },
+            timeout: Duration::from_secs(60),
+        };
+        let program = CheckedProgram {
+            path: PathBuf::from("/opt/codex/bin/codex"),
+            configured_dir: PathBuf::from("/opt/codex/bin"),
+            sha256: "0".repeat(64),
+        };
+        let cwd = Path::new("/srv/supervisor/state");
+        assert_eq!(
+            approval_digest(&entry, &program, cwd),
+            "bcf6e633fab17aaa7a47ee554f534b67a0c10d239bdad121502499bf0e362bd2"
+        );
+        let mut on = entry.clone();
+        on.wake_unverified = true;
+        assert_ne!(
+            approval_digest(&on, &program, cwd),
+            approval_digest(&entry, &program, cwd)
+        );
+    }
+
+    /// A label from a newer server is read as `Unknown` and never wakes,
+    /// so the rest of the answer still counts.
+    #[test]
+    fn an_unknown_sender_label_never_wakes() {
+        let reply: CandidatesReply = serde_json::from_str(
+            r#"{"messages":[
+                {"id":"0190f0a4-5c1e-7a2b-9c3d-4e5f60718291","sender":"from_the_future"},
+                {"id":"0190f0a4-5c1e-7a2b-9c3d-4e5f60718292","sender":"same_project"}
+            ],"unresolved_wake_from":0}"#,
+        )
+        .unwrap();
+        assert_eq!(reply.messages[0].sender, CandidateSender::Unknown);
+        let fresh: Vec<String> = reply.messages.iter().map(|m| m.id.clone()).collect();
+        assert_eq!(
+            wakeable(&entry(Path::new("/x")), &reply.messages, &fresh),
+            ["0190f0a4-5c1e-7a2b-9c3d-4e5f60718292"]
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn the_approval_prompt_shows_wake_unverified_and_its_risk() {
@@ -1729,10 +1795,13 @@ mod tests {
         let base = entry(Path::new("/x"));
         assert!(base.adapter.wakes_live_session());
         for (sender, off, on) in [
+            (CandidateSender::SameProject, true, true),
+            (CandidateSender::SameAgent, false, false),
             (CandidateSender::Listed, true, true),
             (CandidateSender::Unverified, false, true),
             (CandidateSender::Unlisted, false, false),
             (CandidateSender::System, true, true),
+            (CandidateSender::Unknown, false, false),
         ] {
             for (wake_unverified, expected) in [(false, off), (true, on)] {
                 let mut e = base.clone();

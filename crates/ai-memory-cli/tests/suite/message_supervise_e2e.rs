@@ -26,6 +26,13 @@
 //! 10. Approved with the option on, that message wakes the agent once.
 //! 11. An unlisted sender still wakes nobody.
 //!
+//! Phase four (a fresh state directory, `wake_unverified` off again):
+//! 12. The agent's own mail to itself wakes nobody.
+//! 13. Another agent of the watched project wakes it once, with no
+//!     `wake_from` entry for that project and no recorded session, while
+//!     unverified mail from the listed project sent at the same time stays
+//!     out of the wake.
+//!
 //! The approval is written the way `message supervise approve` records it,
 //! because that command insists on a terminal.
 
@@ -137,6 +144,18 @@ mod slow {
         /// Send to the codex in the inbox. `session` is the sender's native
         /// hook session id, forwarded as the session-aware MCP bridge does.
         async fn send(&self, from: &str, session: Option<&str>, body: &str) -> String {
+            self.send_as(from, session, None, body).await
+        }
+
+        /// [`Self::send`] with a declared `from_agent`, as a static MCP
+        /// client names its harness.
+        async fn send_as(
+            &self,
+            from: &str,
+            session: Option<&str>,
+            from_agent: Option<&str>,
+            body: &str,
+        ) -> String {
             let mut request = self
                 .client
                 .post(format!("{}/mcp", self.base))
@@ -146,17 +165,21 @@ mod slow {
                 request = request.header("x-memory-actor-session-id", session);
             }
             let text = request
-                .body(
+                .body({
+                    let mut arguments = json!({
+                        "from_workspace": WORKSPACE, "from_project": from,
+                        "to_workspace": WORKSPACE, "to_project": INBOX,
+                        "to_agent": "codex", "subject": "SUBJECT-CANARY", "body": body,
+                    });
+                    if let Some(agent) = from_agent {
+                        arguments["from_agent"] = json!(agent);
+                    }
                     json!({
                         "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                        "params": {"name": "memory_message_send", "arguments": {
-                            "from_workspace": WORKSPACE, "from_project": from,
-                            "to_workspace": WORKSPACE, "to_project": INBOX,
-                            "to_agent": "codex", "subject": "SUBJECT-CANARY", "body": body,
-                        }},
+                        "params": {"name": "memory_message_send", "arguments": arguments},
                     })
-                    .to_string(),
-                )
+                    .to_string()
+                })
                 .send()
                 .await
                 .unwrap()
@@ -524,5 +547,57 @@ mod slow {
         assert_eq!(f.calls(), 4, "an unlisted sender woke the agent");
         f.pop(&unlisted);
         f.pop(&unverified);
+
+        // 12. Phase four: the agent's own mail to itself wakes nobody.
+        let state = f.dd().join("supervisor-4");
+        f.write_config(false);
+        f.approve(&state, false);
+        let itself = f.send_as(INBOX, None, Some("codex"), "to myself").await;
+        f.supervise_once(&state);
+        assert_eq!(f.calls(), 4, "the agent's mail to itself woke it");
+
+        // 13. Another agent of the project wakes it, unverified mail from the
+        //     listed project does not join the wake.
+        let outside = f.send(SENDER, None, "listed, no session").await;
+        let colleague = f
+            .send_as(INBOX, None, Some("claude-code"), "same project")
+            .await;
+        f.supervise_once(&state);
+        assert_eq!(
+            f.calls(),
+            5,
+            "same-project mail did not wake the agent once"
+        );
+        let args = f.last_args();
+        assert_eq!(args.len(), 5, "{args:?}");
+        assert!(args[4].contains(&colleague), "{}", args[4]);
+        assert!(!args[4].contains(&outside), "{}", args[4]);
+        assert!(!args[4].contains(&itself), "{}", args[4]);
+        assert!(
+            !args[4].contains("same project"),
+            "sender text reached the adapter"
+        );
+        let colleague_status: Value = serde_json::from_str(&f.cli(&[
+            "message",
+            "status",
+            "--workspace",
+            WORKSPACE,
+            "--project",
+            INBOX,
+            "--id",
+            &colleague,
+            "--json",
+        ]))
+        .unwrap();
+        assert_eq!(
+            colleague_status["delivery"]["state"], "wake_attempted",
+            "{colleague_status}"
+        );
+        assert_eq!(f.status(&outside)["delivery"]["state"], "queued");
+        f.supervise_once(&state);
+        assert_eq!(f.calls(), 5, "the same message woke twice");
+        for id in [&itself, &outside, &colleague] {
+            f.pop(id);
+        }
     }
 }
