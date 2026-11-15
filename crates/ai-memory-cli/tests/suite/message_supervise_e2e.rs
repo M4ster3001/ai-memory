@@ -19,6 +19,13 @@
 //!    circuit reports the next message the same way without running the
 //!    adapter.
 //!
+//! Phase three (a fresh state directory):
+//! 8. Mail from the listed project without a recorded session stays queued
+//!    while `wake_unverified` is off.
+//! 9. Turning `wake_unverified` on voids the approval: `not_approved`.
+//! 10. Approved with the option on, that message wakes the agent once.
+//! 11. An unlisted sender still wakes nobody.
+//!
 //! The approval is written the way `message supervise approve` records it,
 //! because that command insists on a terminal.
 
@@ -165,14 +172,15 @@ mod slow {
             sent["message_id"].as_str().unwrap().to_owned()
         }
 
-        /// Record an approval exactly as `message supervise approve` does.
-        fn approve(&self, state: &Path) {
+        /// Record an approval exactly as `message supervise approve` does,
+        /// for the entry with `wake_unverified` set as given.
+        fn approve(&self, state: &Path, wake_unverified: bool) {
             std::fs::create_dir_all(state).unwrap();
             std::fs::set_permissions(state, std::fs::Permissions::from_mode(0o700)).unwrap();
             let cwd = std::fs::canonicalize(state).unwrap();
             let program = std::fs::canonicalize(self.program()).unwrap();
             let sha256 = hex(&Sha256::digest(std::fs::read(&program).unwrap()));
-            let parts = [
+            let mut parts = vec![
                 "ai-memory.supervisor-approval/v1".to_owned(),
                 NAME.to_owned(),
                 "codex".to_owned(),
@@ -187,6 +195,9 @@ mod slow {
                 cwd.to_str().unwrap().to_owned(),
                 "60".to_owned(),
             ];
+            if wake_unverified {
+                parts.push("wake_unverified".to_owned());
+            }
             let mut hasher = Sha256::new();
             for part in &parts {
                 hasher.update((part.len() as u64).to_le_bytes());
@@ -204,6 +215,41 @@ mod slow {
         fn set_mode(&self, mode: &str) {
             std::fs::write(self.bin.path().join("mode"), mode).unwrap();
         }
+
+        fn write_config(&self, wake_unverified: bool) {
+            write_config(self.dd(), self.bin.path(), wake_unverified);
+        }
+
+        /// The argv of the newest adapter call.
+        fn last_args(&self) -> Vec<String> {
+            let record = std::fs::read_to_string(self.record()).unwrap();
+            let last = record.rsplit("CALL\n").next().unwrap_or_default();
+            last.lines()
+                .filter_map(|line| line.strip_prefix("ARG "))
+                .map(str::to_owned)
+                .collect()
+        }
+    }
+
+    fn write_config(data_dir: &Path, bin: &Path, wake_unverified: bool) {
+        std::fs::write(
+            data_dir.join("config.toml"),
+            format!(
+                "[messaging.supervisor]\n\
+                 max_wakes_per_hour = 20\n\n\
+                 [[messaging.supervisor.agents]]\n\
+                 name = \"{NAME}\"\n\
+                 agent = \"codex\"\n\
+                 workspace = \"{WORKSPACE}\"\n\
+                 project = \"{INBOX}\"\n\
+                 wake_from = [{{ workspace = \"{WORKSPACE}\", project = \"{SENDER}\" }}]\n\
+                 wake_unverified = {wake_unverified}\n\
+                 adapter = {{ kind = \"codex_queue\", program = \"{}\", thread = \"{THREAD}\" }}\n\
+                 wakes_per_hour = 2\n",
+                bin.join("codex").display()
+            ),
+        )
+        .unwrap();
     }
 
     fn hex(bytes: &[u8]) -> String {
@@ -266,23 +312,7 @@ mod slow {
             .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
             .unwrap();
         fake_codex(bin.path());
-        std::fs::write(
-            data_dir.path().join("config.toml"),
-            format!(
-                "[messaging.supervisor]\n\
-                 max_wakes_per_hour = 20\n\n\
-                 [[messaging.supervisor.agents]]\n\
-                 name = \"{NAME}\"\n\
-                 agent = \"codex\"\n\
-                 workspace = \"{WORKSPACE}\"\n\
-                 project = \"{INBOX}\"\n\
-                 wake_from = [{{ workspace = \"{WORKSPACE}\", project = \"{SENDER}\" }}]\n\
-                 adapter = {{ kind = \"codex_queue\", program = \"{}\", thread = \"{THREAD}\" }}\n\
-                 wakes_per_hour = 2\n",
-                bin.path().join("codex").display()
-            ),
-        )
-        .unwrap();
+        write_config(data_dir.path(), bin.path(), false);
         let client = reqwest::Client::new();
         let (server, base) = start_serve(&client, &data_dir.path().join("serve.log"), |port| {
             let mut cmd = hermetic(BIN);
@@ -328,7 +358,7 @@ mod slow {
     async fn the_supervisor_wakes_once_within_budget_and_reports_every_refusal() {
         let f = fixture().await;
         let state = f.dd().join("supervisor-1");
-        f.approve(&state);
+        f.approve(&state, false);
 
         // 1. One wake, fixed argv, no sender text, minimal environment.
         let first = f
@@ -411,7 +441,7 @@ mod slow {
 
         // 6. Phase two: a changed binary is no longer approved.
         let state = f.dd().join("supervisor-2");
-        f.approve(&state);
+        f.approve(&state, false);
         let script = std::fs::read_to_string(f.program()).unwrap();
         std::fs::write(f.program(), format!("{script}# changed\n")).unwrap();
         let fourth = f.send(SENDER, Some(SENDER_SESSION), "fourth").await;
@@ -421,7 +451,7 @@ mod slow {
         assert_eq!(report["delivery"]["reason"], "not_approved", "{report}");
 
         // 7. Approved again, the adapter runs and reports exhausted quota.
-        f.approve(&state);
+        f.approve(&state, false);
         f.set_mode("quota");
         f.supervise_once(&state);
         assert_eq!(f.calls(), 3);
@@ -449,5 +479,50 @@ mod slow {
         let report = f.status(&fifth);
         assert_eq!(report["delivery"]["state"], "quota_exhausted", "{report}");
         assert!(report["delivery"]["retry_after"].is_string(), "{report}");
+        f.pop(&fourth);
+        f.pop(&fifth);
+
+        // 8. Phase three: unverified mail stays queued while the option is off.
+        let state = f.dd().join("supervisor-3");
+        f.set_mode("ok");
+        f.approve(&state, false);
+        let unverified = f.send(SENDER, None, "unverified again").await;
+        f.supervise_once(&state);
+        assert_eq!(
+            f.calls(),
+            3,
+            "an unverified sender woke with the option off"
+        );
+        assert_eq!(f.status(&unverified)["delivery"]["state"], "queued");
+
+        // 9. Turning the option on needs a new approval.
+        f.write_config(true);
+        f.supervise_once(&state);
+        assert_eq!(f.calls(), 3, "wake_unverified ran without a new approval");
+        let report = f.status(&unverified);
+        assert_eq!(report["delivery"]["reason"], "not_approved", "{report}");
+
+        // 10. Approved with the option on, the unverified message wakes once.
+        f.approve(&state, true);
+        f.supervise_once(&state);
+        assert_eq!(f.calls(), 4);
+        let args = f.last_args();
+        assert_eq!(args.len(), 5, "{args:?}");
+        assert!(args[4].contains(&unverified), "{}", args[4]);
+        assert!(
+            !args[4].contains("unverified again"),
+            "sender text reached the adapter"
+        );
+        let report = f.status(&unverified);
+        assert_eq!(report["delivery"]["state"], "wake_attempted", "{report}");
+        f.supervise_once(&state);
+        assert_eq!(f.calls(), 4, "the same message woke twice");
+
+        // 11. An unlisted sender never wakes, even with the option on.
+        let unlisted = f.send(OTHER, Some(OTHER_SESSION), "unlisted again").await;
+        f.supervise_once(&state);
+        assert_eq!(f.calls(), 4, "an unlisted sender woke the agent");
+        f.pop(&unlisted);
+        f.pop(&unverified);
     }
 }

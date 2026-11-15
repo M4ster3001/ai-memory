@@ -1454,6 +1454,103 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn turning_wake_unverified_on_or_off_voids_the_approval() {
+        let tmp = tempfile::tempdir().unwrap();
+        let program = script(tmp.path(), "codex", "exit 0", 0o755);
+        let cwd = tmp.path().to_path_buf();
+        let checked = check_program(&program, None, &[]).unwrap();
+        let off = entry(&program);
+        let mut on = off.clone();
+        on.wake_unverified = true;
+        let off_digest = approval_digest(&off, &checked, &cwd);
+        let on_digest = approval_digest(&on, &checked, &cwd);
+        assert_ne!(off_digest, on_digest, "turning it on needs a new approval");
+        let config = Config::default();
+        let path = tmp.path().join("approvals.json");
+        let mut out = Vec::new();
+        assert!(
+            approve_interactive(
+                &config,
+                &on,
+                &checked,
+                &cwd,
+                &path,
+                &mut "y\n".as_bytes(),
+                &mut out,
+            )
+            .unwrap()
+        );
+        let approvals: Approvals = load_json(&config, &path);
+        assert!(approvals.approves(&on.name, &on_digest));
+        assert!(
+            !approvals.approves(&off.name, &off_digest),
+            "turning it off again needs a new approval"
+        );
+        // Off is the digest an entry without the key always had: the extra
+        // part is appended only when the option is on.
+        let mut legacy = off.clone();
+        legacy.wake_unverified = false;
+        assert_eq!(off_digest, approval_digest(&legacy, &checked, &cwd));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_approval_prompt_shows_wake_unverified_and_its_risk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let program = script(tmp.path(), "codex", "exit 0", 0o755);
+        let checked = check_program(&program, None, &[]).unwrap();
+        let path = tmp.path().join("approvals.json");
+        let shown = |entry: &Entry, language| {
+            let config = Config {
+                i18n: ai_memory_core::i18n::Localizer::new(language),
+                ..Config::default()
+            };
+            let mut out = Vec::new();
+            approve_interactive(
+                &config,
+                entry,
+                &checked,
+                tmp.path(),
+                &path,
+                &mut "n\n".as_bytes(),
+                &mut out,
+            )
+            .unwrap();
+            String::from_utf8(out).unwrap()
+        };
+        use ai_memory_core::i18n::Language;
+        let off = entry(&program);
+        let mut on = off.clone();
+        on.wake_unverified = true;
+        let text = shown(&off, Language::English);
+        assert!(text.contains("  wake_unverified: false ("), "{text}");
+        assert!(!text.contains("server token"), "{text}");
+        let text = shown(&on, Language::English);
+        assert!(
+            text.contains(
+                "  wake_unverified: true; any local process with the server token can wake this \
+                 agent; the wake text is fixed and the wake limits still apply\n"
+            ),
+            "{text}"
+        );
+        let text = shown(&on, Language::PortugueseBrazil);
+        assert!(
+            text.contains(
+                "  wake_unverified: true; qualquer processo local com o token do servidor pode \
+                 acordar este agente; o texto do acordar é fixo e os limites de acionamentos \
+                 continuam valendo\n"
+            ),
+            "{text}"
+        );
+        let text = shown(&off, Language::PortugueseBrazil);
+        assert!(
+            text.contains("  wake_unverified: false (um projeto listado"),
+            "{text}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn approval_needs_an_explicit_yes_and_is_recorded_atomically() {
         let tmp = tempfile::tempdir().unwrap();
         let program = script(tmp.path(), "codex", "exit 0", 0o755);
@@ -1556,6 +1653,45 @@ mod tests {
             [ids[0], ids[3]],
             "unverified and unlisted senders never wake; an already woken id is not fresh"
         );
+        let mut on = off.clone();
+        on.wake_unverified = true;
+        assert_eq!(
+            wakeable(&on, &candidates, &fresh),
+            [ids[0], ids[1], ids[3]],
+            "wake_unverified adds unverified senders and nothing else"
+        );
+    }
+
+    #[test]
+    fn wake_unverified_matrix() {
+        let id = "0190f0a4-5c1e-7a2b-9c3d-4e5f60718291";
+        let fresh = vec![id.to_owned()];
+        let base = entry(Path::new("/x"));
+        assert!(base.adapter.wakes_live_session());
+        for (sender, off, on) in [
+            (CandidateSender::Listed, true, true),
+            (CandidateSender::Unverified, false, true),
+            (CandidateSender::Unlisted, false, false),
+            (CandidateSender::System, true, true),
+        ] {
+            for (wake_unverified, expected) in [(false, off), (true, on)] {
+                let mut e = base.clone();
+                e.wake_unverified = wake_unverified;
+                let woken = wakeable(
+                    &e,
+                    &[Candidate {
+                        id: id.to_owned(),
+                        sender,
+                    }],
+                    &fresh,
+                );
+                assert_eq!(
+                    !woken.is_empty(),
+                    expected,
+                    "{sender:?} with wake_unverified = {wake_unverified}"
+                );
+            }
+        }
     }
 
     #[cfg(unix)]

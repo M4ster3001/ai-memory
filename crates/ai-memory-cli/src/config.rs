@@ -8615,6 +8615,50 @@ fn messaging_supervisor_entries_are_closed_typed_and_bounded() {
     assert_eq!(raised.messaging.supervisor.max_concurrent_wakes, 8);
 }
 
+/// `wake_unverified` is off unless an entry sets it to a boolean, and it
+/// needs a `wake_from` project to mean anything.
+#[test]
+fn messaging_supervisor_wake_unverified_is_an_opt_in_boolean() {
+    use tempfile::TempDir;
+    let tmp = TempDir::new().unwrap();
+    let config_path = tmp.path().join("config.toml");
+    let load = |body: &str| {
+        std::fs::write(&config_path, body).unwrap();
+        Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+    };
+    let entry = |wake_from: &str, extra: &str| {
+        format!(
+            "[[messaging.supervisor.agents]]\nname = \"codex-api\"\nagent = \"codex\"\n\
+             workspace = \"default\"\nproject = \"api\"\n\
+             wake_from = [{wake_from}]\n{extra}\
+             adapter = {{ kind = \"codex_queue\", program = \"/usr/bin/codex\", thread = \"t\" }}\n"
+        )
+    };
+    let web = "{ workspace = \"default\", project = \"web\" }";
+    let config = load(&entry(web, "")).unwrap();
+    assert!(!config.messaging.supervisor.agents[0].wake_unverified);
+    let config = load(&entry(web, "wake_unverified = true\n")).unwrap();
+    assert!(config.messaging.supervisor.agents[0].wake_unverified);
+    let config = load(&entry("", "wake_unverified = false\n")).unwrap();
+    assert!(!config.messaging.supervisor.agents[0].wake_unverified);
+
+    for bad in ["\"yes\"", "1", "\"true\"", "[true]"] {
+        let error = format!(
+            "{:#}",
+            load(&entry(web, &format!("wake_unverified = {bad}\n"))).unwrap_err()
+        );
+        assert!(error.contains("wake_unverified"), "{bad}: {error}");
+    }
+    let error = format!(
+        "{:#}",
+        load(&entry("", "wake_unverified = true\n")).unwrap_err()
+    );
+    assert!(
+        error.contains("wake_unverified = true needs at least one wake_from project"),
+        "{error}"
+    );
+}
+
 // --- `[sessions] idle_end_after_hours` ------------------------------
 
 /// The key defaults to `0` (off) when absent, parses from TOML, and the
