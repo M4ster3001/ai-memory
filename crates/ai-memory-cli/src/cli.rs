@@ -843,8 +843,9 @@ pub enum MessageCommand {
     /// Wait for new mail addressed to a harness, without a model, and print
     /// one line per new message id.
     Watch(MessageWatchArgs),
-    /// Wake the agents listed under `[messaging.supervisor]` when mail they
-    /// may be woken for arrives, through operator-approved adapters only.
+    /// Wake the agents listed under `[messaging.supervisor]`, and the agents
+    /// hook sessions reported to the server, when mail they may be woken for
+    /// arrives, through operator-approved adapters only.
     Supervise(MessageSuperviseArgs),
 }
 
@@ -867,7 +868,8 @@ pub struct MessageSuperviseArgs {
 /// Subcommands for `message supervise`.
 #[derive(Debug, Subcommand)]
 pub enum SuperviseCommand {
-    /// Review one supervised agent's adapter on this terminal and approve it.
+    /// Review one supervised agent's adapter, or the program of an adapter for
+    /// discovered agents, on this terminal and approve it.
     Approve(SuperviseApproveArgs),
     /// Print the per-user service unit that runs the supervisor. Nothing is
     /// installed.
@@ -878,7 +880,16 @@ pub enum SuperviseCommand {
 #[derive(Debug, Args)]
 pub struct SuperviseApproveArgs {
     /// The `name` of the `[[messaging.supervisor.agents]]` entry.
-    pub name: String,
+    #[arg(required_unless_present = "adapter", conflicts_with = "adapter")]
+    pub name: Option<String>,
+    /// Approve the program an adapter runs for every discovered agent
+    /// (`codex_queue`), instead of one configured entry.
+    #[arg(long)]
+    pub adapter: Option<String>,
+    /// Absolute path of the program to approve with `--adapter` (default:
+    /// the adapter's program found on `PATH`).
+    #[arg(long, requires = "adapter")]
+    pub program: Option<PathBuf>,
 }
 
 /// Arguments for `message send`.

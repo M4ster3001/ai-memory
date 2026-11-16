@@ -71,6 +71,60 @@ impl ConversationRef {
     }
 }
 
+/// How the agent bus can reach a session of a harness: the native id a hook
+/// reported, recorded in `agent_wake_handles` (`docs/design-agent-bus.md`).
+/// Only harnesses with a documented way to address a session by its id have
+/// a kind; every other harness is never woken through the registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WakeHandleKind {
+    /// A Claude Code session id, as `claude --resume <id>` takes it.
+    ClaudeSession,
+    /// A Codex thread id, as `codex queue --thread <id>` takes it.
+    CodexThread,
+}
+
+impl WakeHandleKind {
+    /// Every kind, for exhaustive tests.
+    pub const ALL: [Self; 2] = [Self::ClaudeSession, Self::CodexThread];
+
+    /// The handle kind of `agent`'s sessions, if it has one.
+    #[must_use]
+    pub const fn for_agent(agent: AgentKind) -> Option<Self> {
+        match agent {
+            AgentKind::ClaudeCode => Some(Self::ClaudeSession),
+            AgentKind::Codex => Some(Self::CodexThread),
+            _ => None,
+        }
+    }
+
+    /// The stored spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ClaudeSession => "claude_session",
+            Self::CodexThread => "codex_thread",
+        }
+    }
+
+    /// Parse the stored spelling.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.as_str() == raw)
+    }
+}
+
+/// The wake handle a hook event reports for `agent`, or `None`. A handle
+/// exists only for a harness with a [`WakeHandleKind`] whose native session
+/// id is a canonical lowercase UUID: anything else was hashed into the stored
+/// session id, and the bus never wakes a session through a guessed id.
+#[must_use]
+pub fn reported_wake_handle(agent: AgentKind, native_session_id: &str) -> Option<WakeHandleKind> {
+    let kind = WakeHandleKind::for_agent(agent)?;
+    let uuid = uuid::Uuid::parse_str(native_session_id).ok()?;
+    (uuid.hyphenated().to_string() == native_session_id && !uuid.is_nil()).then_some(kind)
+}
+
 /// How a launched adapter process ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdapterRun {
@@ -96,13 +150,102 @@ pub enum WakeAdapter {
     },
 }
 
+/// The kind of a [`WakeAdapter`], without its target: what an operator
+/// approves once for every discovered agent the adapter can reach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum AdapterKind {
+    /// [`WakeAdapter::CodexQueue`].
+    CodexQueue,
+}
+
+impl AdapterKind {
+    /// Every kind, for exhaustive tests and help text.
+    pub const ALL: [Self; 1] = [Self::CodexQueue];
+
+    /// Stable adapter id, as [`WakeAdapter::id`] spells it.
+    #[must_use]
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::CodexQueue => "codex_queue",
+        }
+    }
+
+    /// Parse an adapter id.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.id() == raw)
+    }
+
+    /// The harness the adapter wakes.
+    #[must_use]
+    pub const fn agent(self) -> AgentKind {
+        match self {
+            Self::CodexQueue => AgentKind::Codex,
+        }
+    }
+
+    /// Environment variables the harness documents for locating its own
+    /// state, passed through from the supervisor's environment when set.
+    #[must_use]
+    pub const fn harness_env(self) -> &'static [&'static str] {
+        match self {
+            Self::CodexQueue => &["CODEX_HOME"],
+        }
+    }
+
+    /// The program name looked up on `PATH` when the operator approves the
+    /// adapter without naming a program.
+    #[must_use]
+    pub const fn program_name(self) -> &'static str {
+        match self {
+            Self::CodexQueue => "codex",
+        }
+    }
+
+    /// The argv after the program with `{handle}` for the session the
+    /// adapter targets and `{wake}` for the wake text. An approval for
+    /// discovered agents covers this shape.
+    #[must_use]
+    pub fn argv_shape(self) -> Vec<String> {
+        let shape: &[&str] = match self {
+            Self::CodexQueue => &["queue", "--thread", "{handle}", "--message", "{wake}"],
+        };
+        shape.iter().map(|part| (*part).to_owned()).collect()
+    }
+
+    /// The adapter that reaches a session through a recorded wake handle,
+    /// when this build has one for that handle kind. A Claude Code session
+    /// has none yet: it is not woken through the registry.
+    #[must_use]
+    pub fn for_handle(kind: WakeHandleKind, handle: &str) -> Option<WakeAdapter> {
+        match kind {
+            WakeHandleKind::CodexThread => {
+                let uuid = uuid::Uuid::parse_str(handle).ok()?;
+                if uuid.hyphenated().to_string() != handle {
+                    return None;
+                }
+                Some(WakeAdapter::CodexQueue {
+                    conversation: ConversationRef::parse(handle).ok()?,
+                })
+            }
+            WakeHandleKind::ClaudeSession => None,
+        }
+    }
+}
+
 impl WakeAdapter {
     /// Stable adapter id, used in configuration, logs and the approval
     /// digest.
     #[must_use]
     pub const fn id(&self) -> &'static str {
+        self.kind().id()
+    }
+
+    /// The adapter's kind.
+    #[must_use]
+    pub const fn kind(&self) -> AdapterKind {
         match self {
-            Self::CodexQueue { .. } => "codex_queue",
+            Self::CodexQueue { .. } => AdapterKind::CodexQueue,
         }
     }
 
@@ -135,9 +278,7 @@ impl WakeAdapter {
     /// state, passed through from the supervisor's environment when set.
     #[must_use]
     pub const fn harness_env(&self) -> &'static [&'static str] {
-        match self {
-            Self::CodexQueue { .. } => &["CODEX_HOME"],
-        }
+        self.kind().harness_env()
     }
 
     /// Turn how the process ended, and its captured output, into an outcome.
@@ -576,6 +717,75 @@ mod tests {
             &"x".repeat(65),
         ] {
             assert!(ConversationRef::parse(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn only_claude_and_codex_report_a_wake_handle_and_only_as_a_canonical_uuid() {
+        assert_eq!(
+            reported_wake_handle(AgentKind::Codex, ID),
+            Some(WakeHandleKind::CodexThread)
+        );
+        assert_eq!(
+            reported_wake_handle(AgentKind::ClaudeCode, ID),
+            Some(WakeHandleKind::ClaudeSession)
+        );
+        for agent in [AgentKind::Grok, AgentKind::GeminiCli, AgentKind::OpenCode] {
+            assert_eq!(reported_wake_handle(agent, ID), None, "{agent:?}");
+        }
+        for bad in [
+            "",
+            "work-chat",
+            "0190F0A4-5C1E-7A2B-9C3D-4E5F60718293",
+            "0190f0a45c1e7a2b9c3d4e5f60718293",
+            "{0190f0a4-5c1e-7a2b-9c3d-4e5f60718293}",
+            "00000000-0000-0000-0000-000000000000",
+            "--resume",
+        ] {
+            assert_eq!(reported_wake_handle(AgentKind::Codex, bad), None, "{bad:?}");
+        }
+        for kind in WakeHandleKind::ALL {
+            assert_eq!(WakeHandleKind::parse(kind.as_str()), Some(kind));
+        }
+        assert_eq!(WakeHandleKind::parse("codex"), None);
+    }
+
+    #[test]
+    fn a_handle_maps_to_an_adapter_whose_argv_matches_the_approved_shape() {
+        let adapter = AdapterKind::for_handle(WakeHandleKind::CodexThread, ID).unwrap();
+        assert_eq!(adapter, codex());
+        assert_eq!(adapter.kind(), AdapterKind::CodexQueue);
+        let shape = AdapterKind::CodexQueue.argv_shape();
+        let filled: Vec<String> = shape
+            .iter()
+            .map(|part| match part.as_str() {
+                "{handle}" => ID.to_owned(),
+                "{wake}" => "TEXT".to_owned(),
+                other => other.to_owned(),
+            })
+            .collect();
+        assert_eq!(adapter.args("TEXT"), filled);
+        assert_eq!(
+            AdapterKind::parse("codex_queue"),
+            Some(AdapterKind::CodexQueue)
+        );
+        assert_eq!(AdapterKind::parse("shell"), None);
+        assert_eq!(AdapterKind::CodexQueue.program_name(), "codex");
+        assert_eq!(
+            AdapterKind::for_handle(WakeHandleKind::ClaudeSession, ID),
+            None,
+            "no adapter reaches a Claude Code session through the registry yet"
+        );
+        for bad in [
+            "work-chat",
+            "--resume",
+            "0190F0A4-5C1E-7A2B-9C3D-4E5F60718293",
+        ] {
+            assert_eq!(
+                AdapterKind::for_handle(WakeHandleKind::CodexThread, bad),
+                None,
+                "{bad:?}"
+            );
         }
     }
 

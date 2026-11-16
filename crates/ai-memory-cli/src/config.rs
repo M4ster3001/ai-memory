@@ -1814,6 +1814,11 @@ pub struct SupervisorSettings {
     /// Most adapters running at the same time, each for a different agent
     /// (1 to 8, default 2). One agent never has two wakes in flight.
     pub max_concurrent_wakes: u32,
+    /// Also wake the agents that hook sessions reported to the server (the
+    /// agent bus, `GET /inbox/bus`), with no entry for them. Default `true`.
+    /// Needs the root credential; discovered agents are woken only by mail
+    /// from their own project.
+    pub discover: bool,
     /// `[[messaging.supervisor.agents]]`: the supervised agents.
     pub agents: Vec<SupervisedAgent>,
 }
@@ -1824,6 +1829,7 @@ impl Default for SupervisorSettings {
             max_wakes_per_hour: 20,
             idle_exit_minutes: 0,
             max_concurrent_wakes: 2,
+            discover: true,
             agents: Vec::new(),
         }
     }
@@ -1873,14 +1879,22 @@ pub struct SupervisedAgent {
     pub timeout_secs: u32,
 }
 
+/// Default hourly wake budget of a supervised agent, configured or
+/// discovered.
+pub(crate) const DEFAULT_WAKES_PER_HOUR: u32 = 4;
+/// Default daily wake budget of a supervised agent.
+pub(crate) const DEFAULT_WAKES_PER_DAY: u32 = 24;
+/// Default adapter timeout, in seconds.
+pub(crate) const DEFAULT_WAKE_TIMEOUT_SECS: u32 = 60;
+
 const fn default_wakes_per_hour() -> u32 {
-    4
+    DEFAULT_WAKES_PER_HOUR
 }
 const fn default_wakes_per_day() -> u32 {
-    24
+    DEFAULT_WAKES_PER_DAY
 }
 const fn default_wake_timeout_secs() -> u32 {
-    60
+    DEFAULT_WAKE_TIMEOUT_SECS
 }
 
 /// A project a supervised agent may be woken by.

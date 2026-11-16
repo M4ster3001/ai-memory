@@ -308,6 +308,7 @@ The host wake supervisor, `ai-memory message supervise`. The server ignores this
 | `max_wakes_per_hour` | `20` | `AI_MEMORY_MESSAGING__SUPERVISOR__MAX_WAKES_PER_HOUR` | Adapter launches allowed across all supervised agents in any rolling hour, 1 to 1000. |
 | `max_concurrent_wakes` | `2` | `AI_MEMORY_MESSAGING__SUPERVISOR__MAX_CONCURRENT_WAKES` | Adapters running at the same time, each for a different agent, 1 to 8. Raise it only when the operator asks; one agent never has two wakes in flight. |
 | `idle_exit_minutes` | `0` | `AI_MEMORY_MESSAGING__SUPERVISOR__IDLE_EXIT_MINUTES` | Stop after this many minutes with no new mail and no wake. `0` never stops. |
+| `discover` | `true` | `AI_MEMORY_MESSAGING__SUPERVISOR__DISCOVER` | Also wake the agents whose hook sessions reported a wake handle, with no table for them, for mail from their own project. Needs the root credential and an approved program per adapter. See [the agent bus](agent-messaging.md#discovered-agents). |
 | `agents` | `[]` | none | `[[messaging.supervisor.agents]]` tables, at most 16, one per agent and per conversation. Keys below. |
 
 Keys of each `[[messaging.supervisor.agents]]` table:

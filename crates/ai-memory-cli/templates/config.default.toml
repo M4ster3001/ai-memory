@@ -730,11 +730,16 @@ mid_session = "follow-cwd"
 #   wakes_per_hour = 4
 #   wakes_per_day = 24
 #   timeout_secs = 60
+# With `discover = true` (the default) it also wakes the agents whose hook
+# sessions reported a wake handle, with no table for them, when mail from their
+# own project arrives; that needs the root credential and
+# `ai-memory message supervise approve --adapter codex_queue` once.
 # See docs/agent-messaging.md.
 # [messaging.supervisor]
 # max_wakes_per_hour = 20
 # max_concurrent_wakes = 2
 # idle_exit_minutes = 0
+# discover = true
 
 # Scheduled server jobs. `enabled` is the master switch. The interval keys are
 # in seconds and 0 disables that job. The forget sweep and lint persist their

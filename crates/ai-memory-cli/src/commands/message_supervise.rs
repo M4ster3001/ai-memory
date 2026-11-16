@@ -41,7 +41,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ai_memory_core::message_wake::{
-    AdapterRun, WakeAdapter, WakeBudget, WakeGate, WakeLedger, WakeOutcome, wake_text,
+    AdapterKind, AdapterRun, WakeAdapter, WakeBudget, WakeGate, WakeHandleKind, WakeLedger,
+    WakeOutcome, wake_text,
 };
 use ai_memory_core::{AgentKind, DeliveryReason, DeliveryState, MessageId};
 use anyhow::{Context as _, Result};
@@ -58,7 +59,9 @@ use super::message_watch::{
 use super::user_service::{self, ServiceManager, ServiceSpec};
 use crate::cli::{MessageSuperviseArgs, SuperviseCommand};
 use crate::config::{Config, RuntimeEnv, SupervisedAgent, WakeFrom};
-use crate::http_client::{ServerEndpoint, get_json_bounded, post_json_bounded};
+use crate::http_client::{
+    ServerEndpoint, ServerResponseError, get_json_bounded, post_json_bounded,
+};
 
 const WATCH_WAIT: Duration = Duration::from_millis(ai_memory_hooks::MAX_INBOX_WATCH_WAIT_MS);
 const REPLY_GRACE: Duration = Duration::from_secs(10);
@@ -94,6 +97,11 @@ const PASSTHROUGH_ENV: &[&str] = &[
 /// Stand-in message id in the argv shown for approval.
 const EXAMPLE_ID: &str = "00000000-0000-0000-0000-000000000000";
 const APPROVAL_SCHEMA: &str = "ai-memory.supervisor-approval/v1";
+/// Schema of an approval that covers an adapter's program for every
+/// discovered agent.
+const PROGRAM_APPROVAL_SCHEMA: &str = "ai-memory.supervisor-program-approval/v1";
+/// Stand-in session id in the argv shown for a program approval.
+const EXAMPLE_HANDLE: &str = "00000000-0000-4000-8000-000000000000";
 
 /// Run `ai-memory message supervise` and its subcommands. Returns the
 /// process exit code.
@@ -111,18 +119,36 @@ pub(crate) async fn run(
         .clone()
         .unwrap_or_else(|| config.data_dir.join("supervisor"));
     match args.command {
-        Some(SuperviseCommand::Approve(approve)) => {
-            approve_command(config, &state_dir, &approve.name)
-        }
+        Some(SuperviseCommand::Approve(approve)) => match (&approve.name, &approve.adapter) {
+            (Some(name), None) => approve_command(config, &state_dir, name),
+            (None, Some(adapter)) => {
+                approve_program_command(config, &state_dir, adapter, approve.program.as_deref())
+            }
+            _ => anyhow::bail!("name one supervised agent, or one adapter with --adapter"),
+        },
         Some(SuperviseCommand::Unit) => unit_command(config, config_path),
         None => supervise(config, &state_dir, args.once).await,
     }
 }
 
+/// Where a supervised agent came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Origin {
+    /// A `[[messaging.supervisor.agents]]` entry, approved by its name.
+    Configured,
+    /// A wake handle hook ingest recorded (`GET /inbox/bus`). Its program
+    /// and approval are the ones recorded for its adapter kind.
+    Discovered,
+}
+
 /// One supervised agent, validated.
 #[derive(Debug, Clone)]
 struct Entry {
+    /// Ledger and log key. A configured entry's `name` (`[a-z0-9-]`), or
+    /// `workspace/project/agent` for a discovered one, so the two never
+    /// collide.
     name: String,
+    origin: Origin,
     agent: AgentKind,
     workspace: String,
     project: String,
@@ -141,6 +167,7 @@ impl Entry {
     fn from_config(raw: &SupervisedAgent) -> Result<Self> {
         Ok(Self {
             name: raw.name.clone(),
+            origin: Origin::Configured,
             agent: AgentKind::from_wire(&raw.agent),
             workspace: raw.workspace.trim().to_owned(),
             project: raw.project.trim().to_owned(),
@@ -156,6 +183,37 @@ impl Entry {
             timeout: Duration::from_secs(u64::from(raw.timeout_secs)),
         })
     }
+
+    /// The entry for an agent the bus reported, or `None` when this build
+    /// has no adapter for its handle kind or the handle is not valid for it.
+    fn discovered(target: &BusAgent) -> Option<Self> {
+        let agent = AgentKind::from_wire(&target.agent);
+        if agent.as_str() != target.agent {
+            return None;
+        }
+        let kind = WakeHandleKind::parse(&target.handle.kind)?;
+        if WakeHandleKind::for_agent(agent) != Some(kind) {
+            return None;
+        }
+        let adapter = AdapterKind::for_handle(kind, &target.handle.id)?;
+        Some(Self {
+            name: format!("{}/{}/{}", target.workspace, target.project, agent.as_str()),
+            origin: Origin::Discovered,
+            agent,
+            workspace: target.workspace.clone(),
+            project: target.project.clone(),
+            include_shared: false,
+            wake_from: Vec::new(),
+            wake_unverified: false,
+            adapter,
+            program: PathBuf::new(),
+            budget: WakeBudget {
+                per_hour: crate::config::DEFAULT_WAKES_PER_HOUR,
+                per_day: crate::config::DEFAULT_WAKES_PER_DAY,
+            },
+            timeout: Duration::from_secs(u64::from(crate::config::DEFAULT_WAKE_TIMEOUT_SECS)),
+        })
+    }
 }
 
 fn entries(config: &Config) -> Result<Vec<Entry>> {
@@ -166,7 +224,7 @@ fn entries(config: &Config) -> Result<Vec<Entry>> {
         .iter()
         .map(Entry::from_config)
         .collect::<Result<Vec<_>>>()?;
-    if entries.is_empty() {
+    if entries.is_empty() && !config.messaging.supervisor.discover {
         anyhow::bail!(
             "no supervised agent is configured; add a [[messaging.supervisor.agents]] entry to config.toml"
         );
@@ -331,11 +389,38 @@ fn approval_digest(entry: &Entry, program: &CheckedProgram, cwd: &Path) -> Strin
     hex(&hasher.finalize())
 }
 
+/// The canonical form of what a program approval covers for every
+/// discovered agent of one adapter kind: the argv shape (the session handle
+/// and the wake text are placeholders), the program path and content, the
+/// working directory and the timeout. Who may wake a discovered agent is not
+/// part of it: the rule is fixed (mail from its own project, `wake_from` is
+/// empty), not something the operator configures.
+fn program_digest(kind: AdapterKind, program: &CheckedProgram, cwd: &Path) -> String {
+    let parts = [
+        PROGRAM_APPROVAL_SCHEMA.to_owned(),
+        kind.id().to_owned(),
+        kind.argv_shape().join("\u{0}"),
+        program.path.to_string_lossy().into_owned(),
+        program.sha256.clone(),
+        cwd.to_string_lossy().into_owned(),
+        crate::config::DEFAULT_WAKE_TIMEOUT_SECS.to_string(),
+    ];
+    let mut hasher = Sha256::new();
+    for part in &parts {
+        hasher.update((part.len() as u64).to_le_bytes());
+        hasher.update(part.as_bytes());
+    }
+    hex(&hasher.finalize())
+}
+
 /// `approvals.json` in the state directory.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Approvals {
     #[serde(default)]
     entries: BTreeMap<String, Approval>,
+    /// Program approvals for discovered agents, by adapter id.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    programs: BTreeMap<String, Approval>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -351,6 +436,34 @@ impl Approvals {
         self.entries
             .get(name)
             .is_some_and(|approval| approval.digest == digest)
+    }
+
+    fn approves_program(&self, kind: AdapterKind, digest: &str) -> bool {
+        self.programs
+            .get(kind.id())
+            .is_some_and(|approval| approval.digest == digest)
+    }
+
+    /// The program an entry runs: its configured one, or the one recorded
+    /// for its adapter kind when it was discovered.
+    fn program_for(&self, entry: &Entry) -> Option<PathBuf> {
+        match entry.origin {
+            Origin::Configured => Some(entry.program.clone()),
+            Origin::Discovered => self
+                .programs
+                .get(entry.adapter.id())
+                .map(|approval| approval.program.clone()),
+        }
+    }
+
+    fn approves_entry(&self, entry: &Entry, program: &CheckedProgram, cwd: &Path) -> bool {
+        match entry.origin {
+            Origin::Configured => self.approves(&entry.name, &approval_digest(entry, program, cwd)),
+            Origin::Discovered => {
+                let kind = entry.adapter.kind();
+                self.approves_program(kind, &program_digest(kind, program, cwd))
+            }
+        }
     }
 }
 
@@ -629,6 +742,30 @@ struct ReportReply {
     receipts: usize,
 }
 
+/// Answer of `GET /inbox/bus`.
+#[derive(Debug, Deserialize)]
+struct BusReply {
+    cursor: String,
+    agents: Vec<BusAgent>,
+}
+
+/// One agent the bus reported: claimable mail addressed to it and the
+/// newest wake handle of its harness in its project.
+#[derive(Debug, Deserialize)]
+struct BusAgent {
+    workspace: String,
+    project: String,
+    agent: String,
+    handle: BusHandle,
+    pending: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BusHandle {
+    kind: String,
+    id: String,
+}
+
 /// The messages of `candidates` that may wake `entry`, in server order:
 /// another agent of the watched project (no authorization needed inside a
 /// project), a listed sender whose session the server recorded, a listed
@@ -651,6 +788,14 @@ fn wakeable(entry: &Entry, candidates: &[Candidate], fresh: &[String]) -> Vec<St
         .filter_map(|candidate| canonical_message_id(&candidate.id))
         .filter(|id| fresh.contains(id.as_str()))
         .collect()
+}
+
+/// The server answered 404: it predates the route.
+fn not_found(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<ServerResponseError>())
+        .is_some_and(|response| response.status() == reqwest::StatusCode::NOT_FOUND)
 }
 
 fn log(line: &str) {
@@ -696,6 +841,9 @@ struct Supervisor {
     ledger: tokio::sync::Mutex<LedgerFile>,
     permits: tokio::sync::Semaphore,
     activity: std::sync::Mutex<Instant>,
+    /// Discovered agents with a wake running or queued, so one agent never
+    /// has two.
+    in_flight: std::sync::Mutex<HashSet<String>>,
 }
 
 impl Supervisor {
@@ -810,7 +958,20 @@ impl Supervisor {
         // One agent's wakes run one at a time in its own task; the permit
         // bounds how many agents are woken at once.
         let _permit = self.permits.acquire().await?;
-        let configured = entry.program.clone();
+        let approvals: Approvals = load_json(&self.config, &self.approvals_path);
+        let Some(configured) = approvals.program_for(entry) else {
+            let outcome = WakeOutcome::Failed(DeliveryReason::NotApproved);
+            if self.report_once(entry, &ids, outcome).await {
+                log(&format!(
+                    "{}: not woken: no program is approved for the {} adapter; run \
+                     `ai-memory message supervise approve --adapter {}` in a terminal",
+                    entry.name,
+                    entry.adapter.id(),
+                    entry.adapter.id()
+                ));
+            }
+            return Ok(());
+        };
         let (owner, roots) = (self.owner, self.temp_roots.clone());
         let program =
             tokio::task::spawn_blocking(move || check_program(&configured, owner, &roots))
@@ -829,14 +990,17 @@ impl Supervisor {
                 return Ok(());
             }
         };
-        let approvals: Approvals = load_json(&self.config, &self.approvals_path);
-        if !approvals.approves(&entry.name, &approval_digest(entry, &program, &self.cwd)) {
+        if !approvals.approves_entry(entry, &program, &self.cwd) {
             let outcome = WakeOutcome::Failed(DeliveryReason::NotApproved);
             if self.report_once(entry, &ids, outcome).await {
+                let command = match entry.origin {
+                    Origin::Configured => format!("approve {}", entry.name),
+                    Origin::Discovered => format!("approve --adapter {}", entry.adapter.id()),
+                };
                 log(&format!(
                     "{}: not woken: the adapter is not approved, or its program or entry changed \
-                     since; run `ai-memory message supervise approve {}` in a terminal",
-                    entry.name, entry.name
+                     since; run `ai-memory message supervise {command}` in a terminal",
+                    entry.name
                 ));
             }
             return Ok(());
@@ -914,6 +1078,130 @@ impl Supervisor {
         ));
         self.report(entry, &ids, outcome).await;
         Ok(())
+    }
+
+    /// Whether a configured entry already supervises this inbox and harness;
+    /// the bus then leaves it to that entry.
+    fn configured_for(&self, target: &BusAgent) -> bool {
+        self.entries.iter().any(|entry| {
+            entry.agent.as_str() == target.agent
+                && entry.workspace == target.workspace.trim()
+                && entry.project == target.project.trim()
+        })
+    }
+
+    /// Handle one discovered agent in its own task unless a wake for it is
+    /// already running.
+    fn spawn_discovered(
+        self: &Arc<Self>,
+        entry: Entry,
+        pending: Vec<String>,
+        tasks: &mut tokio::task::JoinSet<()>,
+    ) {
+        let fresh = self
+            .in_flight
+            .lock()
+            .is_ok_and(|mut running| running.insert(entry.name.clone()));
+        if !fresh {
+            return;
+        }
+        let supervisor = Arc::clone(self);
+        tasks.spawn(async move {
+            if let Err(error) = supervisor.handle(&entry, &pending).await {
+                log(&format!(
+                    "{}: could not handle its mail: {}",
+                    entry.name,
+                    error.root_cause()
+                ));
+            }
+            if let Ok(mut running) = supervisor.in_flight.lock() {
+                running.remove(&entry.name);
+            }
+        });
+    }
+
+    /// Long-poll `GET /inbox/bus` and wake the discovered agents it lists.
+    /// A refused credential stops the supervisor; a server that does not know
+    /// the route, or a credential that is not root, turns discovery off and
+    /// leaves the configured entries running.
+    async fn bus(self: Arc<Self>, once: bool) -> Result<Stop> {
+        let mut cursor: Option<String> = None;
+        let mut failing = false;
+        let mut tasks = tokio::task::JoinSet::new();
+        loop {
+            while tasks.try_join_next().is_some() {}
+            let wait = if once || cursor.is_none() {
+                Duration::ZERO
+            } else {
+                WATCH_WAIT
+            };
+            let wait_ms = wait.as_millis().to_string();
+            let mut query = vec![("wait_ms", wait_ms.as_str())];
+            if let Some(after) = cursor.as_deref() {
+                query.push(("after", after));
+            }
+            let reply: Result<BusReply> = get_json_bounded(
+                &self.endpoint,
+                "/inbox/bus",
+                &query,
+                wait + REPLY_GRACE,
+                MAX_REPLY_BYTES,
+            )
+            .await;
+            match reply {
+                Ok(reply) => {
+                    if failing {
+                        log("agent bus: the server answers again");
+                        failing = false;
+                    }
+                    cursor = valid_cursor(&reply.cursor).map(str::to_owned);
+                    for target in &reply.agents {
+                        if self.configured_for(target) {
+                            continue;
+                        }
+                        let Some(entry) = Entry::discovered(target) else {
+                            continue;
+                        };
+                        let pending: Vec<String> = target
+                            .pending
+                            .iter()
+                            .filter_map(|id| canonical_message_id(id))
+                            .collect();
+                        self.spawn_discovered(entry, pending, &mut tasks);
+                    }
+                }
+                Err(error) => {
+                    if refused_credential(&error).is_some() {
+                        if refused_credential(&error) == Some(403) {
+                            log(
+                                "agent bus: the server refused to list every project (403); \
+                                 discovery needs the root credential and is off",
+                            );
+                            return Ok(Stop::Done);
+                        }
+                        log("agent bus: authentication refused; the supervisor stops");
+                        return Ok(Stop::AuthRefused);
+                    }
+                    if not_found(&error) {
+                        log("agent bus: the server has no /inbox/bus route; discovery is off");
+                        return Ok(Stop::Done);
+                    }
+                    if once || !transient(&error) {
+                        return Err(error);
+                    }
+                    if !failing {
+                        log("agent bus: the ai-memory server is unavailable; will keep trying");
+                        failing = true;
+                    }
+                    cursor = None;
+                    tokio::time::sleep(WATCH_WAIT).await;
+                }
+            }
+            if once {
+                while tasks.join_next().await.is_some() {}
+                return Ok(Stop::Done);
+            }
+        }
     }
 
     async fn watch(self: Arc<Self>, index: usize, once: bool) -> Result<Stop> {
@@ -1059,23 +1347,32 @@ async fn supervise(config: &Config, state_dir: &Path, once: bool) -> Result<i32>
             usize::try_from(settings.max_concurrent_wakes).unwrap_or(1),
         ),
         activity: std::sync::Mutex::new(Instant::now()),
+        in_flight: std::sync::Mutex::new(HashSet::new()),
         entries,
     });
     log(&format!(
-        "watching {} agent(s): {}",
+        "watching {} agent(s): {}{}",
         supervisor.entries.len(),
         supervisor
             .entries
             .iter()
             .map(|entry| entry.name.as_str())
             .collect::<Vec<_>>()
-            .join(", ")
+            .join(", "),
+        if settings.discover {
+            "; discovering the agents hook sessions report"
+        } else {
+            ""
+        }
     ));
     let idle = (settings.idle_exit_minutes > 0)
         .then(|| Duration::from_secs(u64::from(settings.idle_exit_minutes) * 60));
     let mut tasks = tokio::task::JoinSet::new();
     for index in 0..supervisor.entries.len() {
         tasks.spawn(supervisor.clone().watch(index, once));
+    }
+    if settings.discover {
+        tasks.spawn(supervisor.clone().bus(once));
     }
     let mut tick = tokio::time::interval(Duration::from_secs(30));
     let code = loop {
@@ -1290,6 +1587,191 @@ fn approve_command(config: &Config, state_dir: &Path, name: &str) -> Result<i32>
     Ok(if approved { 0 } else { 1 })
 }
 
+/// The program to approve for `kind`: the one named, or the first executable
+/// file called [`AdapterKind::program_name`] on `PATH`.
+fn locate_program(env: &RuntimeEnv, kind: AdapterKind, named: Option<&Path>) -> Option<PathBuf> {
+    if let Some(named) = named {
+        return Some(named.to_path_buf());
+    }
+    let path = env.var_os("PATH")?;
+    std::env::split_paths(&path)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(kind.program_name()))
+        .find(|candidate| candidate.is_file())
+}
+
+/// Show the operator what a program approval allows for every discovered
+/// agent of one adapter kind and ask on the terminal. Records the approval
+/// only on an explicit yes.
+fn approve_program_interactive(
+    config: &Config,
+    kind: AdapterKind,
+    program: &CheckedProgram,
+    cwd: &Path,
+    approvals_path: &Path,
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+) -> Result<bool> {
+    let i18n = &config.i18n;
+    let mut argv = vec![program.path.to_string_lossy().into_owned()];
+    argv.extend(
+        kind.argv_shape()
+            .into_iter()
+            .map(|part| match part.as_str() {
+                "{handle}" => EXAMPLE_HANDLE.to_owned(),
+                "{wake}" => wake_text(
+                    kind.agent(),
+                    "<workspace>",
+                    "<project>",
+                    1,
+                    EXAMPLE_ID.parse().unwrap_or_default(),
+                ),
+                _ => part,
+            }),
+    );
+    let env_keys: Vec<&str> = PASSTHROUGH_ENV
+        .iter()
+        .chain(kind.harness_env())
+        .copied()
+        .chain(std::iter::once("PATH"))
+        .collect();
+    let lines = [
+        crate::localization::diagnostic(
+            i18n,
+            format!(
+                "Approve the program of wake adapter {} for every discovered agent?",
+                kind.id()
+            ),
+        ),
+        crate::localization::diagnostic(
+            i18n,
+            format!(
+                "  program: {} (sha256 {})",
+                program.path.display(),
+                program.sha256
+            ),
+        ),
+        crate::localization::diagnostic(
+            i18n,
+            format!(
+                "  argv: {}",
+                super::show::terminal_text(&format!("{argv:?}"))
+            ),
+        ),
+        crate::localization::diagnostic(i18n, format!("  working directory: {}", cwd.display())),
+        crate::localization::diagnostic(i18n, format!("  environment: {}", env_keys.join(", "))),
+        crate::localization::diagnostic(
+            i18n,
+            "  targets: each session a hook reported for this harness, by its session id; \
+             only mail from another agent of the same project wakes it"
+                .to_owned(),
+        ),
+        crate::localization::diagnostic(
+            i18n,
+            "  any local process with the server token can wake these agents through mail sent \
+             as their own project; the wake text is fixed and the wake limits still apply"
+                .to_owned(),
+        ),
+    ];
+    for line in &lines {
+        writeln!(output, "{line}")?;
+    }
+    write!(
+        output,
+        "{}",
+        crate::localization::diagnostic(i18n, "Approve? [y/N] ".to_owned())
+    )?;
+    output.flush()?;
+    let mut answer = String::new();
+    input
+        .read_line(&mut answer)
+        .context("reading the approval answer")?;
+    let yes = matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes" | "s" | "sim"
+    );
+    if !yes {
+        writeln!(
+            output,
+            "{}",
+            crate::localization::diagnostic(i18n, "Not approved; nothing was recorded.".to_owned())
+        )?;
+        return Ok(false);
+    }
+    let mut approvals: Approvals = load_json(config, approvals_path);
+    approvals.programs.insert(
+        kind.id().to_owned(),
+        Approval {
+            digest: program_digest(kind, program, cwd),
+            program: program.path.clone(),
+            sha256: program.sha256.clone(),
+            approved_at: jiff::Timestamp::now().to_string(),
+        },
+    );
+    save_json(approvals_path, &approvals)
+        .with_context(|| format!("saving the approvals in {}", approvals_path.display()))?;
+    writeln!(
+        output,
+        "{}",
+        crate::localization::diagnostic(
+            i18n,
+            format!("Approved {}; the supervisor will run it.", kind.id())
+        )
+    )?;
+    Ok(true)
+}
+
+fn approve_program_command(
+    config: &Config,
+    state_dir: &Path,
+    adapter: &str,
+    named: Option<&Path>,
+) -> Result<i32> {
+    let Some(kind) = AdapterKind::parse(adapter) else {
+        anyhow::bail!(
+            "unknown adapter {}; the adapters are: {}",
+            super::show::terminal_text(adapter),
+            AdapterKind::ALL.map(AdapterKind::id).join(", ")
+        );
+    };
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!(
+            "approving a wake adapter needs a terminal; run `ai-memory message supervise approve --adapter {}` in one",
+            kind.id()
+        );
+    }
+    let Some(configured) = locate_program(&config.runtime_env, kind, named) else {
+        anyhow::bail!(
+            "no {} program was found on PATH; pass its absolute path with --program",
+            kind.program_name()
+        );
+    };
+    let owner = prepare_state_dir(state_dir)?;
+    let cwd = std::fs::canonicalize(state_dir).with_context(|| {
+        format!(
+            "creating the supervisor state directory {}",
+            state_dir.display()
+        )
+    })?;
+    let program = check_program(&configured, owner, &temp_roots()).map_err(|problem| {
+        anyhow::anyhow!(
+            "the program of {} cannot be approved: {}",
+            kind.id(),
+            problem.describe()
+        )
+    })?;
+    let approved = approve_program_interactive(
+        config,
+        kind,
+        &program,
+        &cwd,
+        &cwd.join("approvals.json"),
+        &mut std::io::stdin().lock(),
+        &mut std::io::stdout().lock(),
+    )?;
+    Ok(if approved { 0 } else { 1 })
+}
+
 fn unit_command(config: &Config, config_path: Option<&Path>) -> Result<i32> {
     let Some(manager) = ServiceManager::current() else {
         anyhow::bail!("the messaging supervisor has no Windows service; run it from a terminal");
@@ -1340,6 +1822,7 @@ mod tests {
     fn entry(program: &Path) -> Entry {
         Entry {
             name: "codex-linha".into(),
+            origin: Origin::Configured,
             agent: AgentKind::Codex,
             workspace: "default".into(),
             project: "linha".into(),
@@ -1437,6 +1920,92 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn bus_agent(agent: &str, kind: &str, id: &str) -> BusAgent {
+        BusAgent {
+            workspace: "default".into(),
+            project: "linha".into(),
+            agent: agent.into(),
+            handle: BusHandle {
+                kind: kind.into(),
+                id: id.into(),
+            },
+            pending: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_discovered_entry_needs_a_matching_harness_handle_and_adapter() {
+        let entry = Entry::discovered(&bus_agent("codex", "codex_thread", ID)).unwrap();
+        assert_eq!(entry.origin, Origin::Discovered);
+        assert_eq!(entry.name, "default/linha/codex");
+        assert!(entry.wake_from.is_empty(), "only its own project wakes it");
+        assert!(!entry.wake_unverified && !entry.include_shared);
+        assert_eq!(
+            entry.adapter.args("T"),
+            ["queue", "--thread", ID, "--message", "T"]
+        );
+        for refused in [
+            // Claude Code has no adapter yet.
+            bus_agent("claude-code", "claude_session", ID),
+            // A handle kind that does not belong to the harness.
+            bus_agent("codex", "claude_session", ID),
+            bus_agent("claude-code", "codex_thread", ID),
+            // Unknown or alias names, and handles that are not canonical UUIDs.
+            bus_agent("claude", "claude_session", ID),
+            bus_agent("codex", "shell", ID),
+            bus_agent("codex", "codex_thread", "--resume"),
+            bus_agent("codex", "codex_thread", "work-chat"),
+        ] {
+            assert!(Entry::discovered(&refused).is_none(), "{refused:?}");
+        }
+    }
+
+    #[test]
+    fn a_program_approval_covers_one_adapter_and_one_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let program = script(tmp.path(), "codex", "exit 0", 0o755);
+        let cwd = tmp.path().to_path_buf();
+        let checked = check_program(&program, None, &[]).unwrap();
+        let digest = program_digest(AdapterKind::CodexQueue, &checked, &cwd);
+        let mut approvals = Approvals::default();
+        approvals.programs.insert(
+            "codex_queue".into(),
+            Approval {
+                digest: digest.clone(),
+                program: checked.path.clone(),
+                sha256: checked.sha256.clone(),
+                approved_at: String::new(),
+            },
+        );
+        let discovered = Entry::discovered(&bus_agent("codex", "codex_thread", ID)).unwrap();
+        assert_eq!(
+            approvals.program_for(&discovered),
+            Some(checked.path.clone())
+        );
+        assert!(approvals.approves_entry(&discovered, &checked, &cwd));
+        // A program approval never approves a configured entry, nor does an
+        // entry approval cover discovered agents.
+        let configured = entry(&program);
+        assert!(!approvals.approves_entry(&configured, &checked, &cwd));
+        let mut by_name = Approvals::default();
+        by_name.entries.insert(
+            "codex-linha".into(),
+            Approval {
+                digest: approval_digest(&configured, &checked, &cwd),
+                program: checked.path.clone(),
+                sha256: checked.sha256.clone(),
+                approved_at: String::new(),
+            },
+        );
+        assert!(by_name.approves_entry(&configured, &checked, &cwd));
+        assert!(!by_name.approves_entry(&discovered, &checked, &cwd));
+        assert_eq!(by_name.program_for(&discovered), None);
+        // A changed binary voids it.
+        script(tmp.path(), "codex", "exit 0 # changed", 0o755);
+        let changed = check_program(&program, None, &[]).unwrap();
+        assert!(!approvals.approves_entry(&discovered, &changed, &cwd));
+    }
+
     #[test]
     fn the_approval_is_pinned_to_the_binary_content_and_the_entry() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1525,6 +2094,7 @@ mod tests {
     fn an_entry_without_wake_unverified_keeps_its_recorded_digest() {
         let entry = Entry {
             name: "codex-linha".into(),
+            origin: Origin::Configured,
             agent: AgentKind::Codex,
             workspace: "default".into(),
             project: "LinhaDeSucataUnity".into(),
