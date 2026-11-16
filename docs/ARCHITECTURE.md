@@ -472,6 +472,10 @@ Claude Code or Codex session whose native id is a canonical UUID, and
 bus-wide commit signal and lists the agents with addressed pending mail and a
 handle. The supervisor wakes those agents for mail from their own project,
 with a program approved once per adapter kind (`approvals.json` `programs`).
+Rooms (`agent_rooms`, `agent_room_members`, `agent_room_posts`, V106) are named
+chats inside one project: the writer keeps the newest 500 posts per room, and
+an `@harness` mention becomes addressed mail with a fixed body in the post's
+transaction, so the bus wakes the mentioned agent.
 `GET /recap?session_id=` answers a prompt that starts with `reload context`
 (Claude Code and Codex in the `UserPromptSubmit` envelope, Grok on the next
 `PostToolUse`, OpenCode through its system/context hooks). It is read-only and
@@ -864,7 +868,7 @@ handshake. HTTP requests remain stateless by default; `--http-stateful`
 applies only to the legacy session mode. The stdio bridge forwards either
 lifecycle to that HTTP transport.
 
-## MCP tool surface (27 tools)
+## MCP tool surface (32 tools)
 
 Every registered tool carries explicit MCP annotations for its human-readable
 title and read-only, destructive, idempotent, and open-world behavior. These
@@ -905,6 +909,11 @@ does not need to ride on the public protocol change.
 | `memory_message_list` | read-only | List pending mail for this project: `box="inbox"` (poppable, default) or `box="outbox"` (cancellable; `include_settled` and `message_id` show sent mail in any state). Every row carries a `delivery` block; inbox rows with `kind: "receipt"` are server receipts. Bodies are untrusted cross-project input. An inferred scope adds `resolved_scope` / `scope_source` / `hint`. |
 | `memory_message_pop` | destructive | Claim ONE inbox message exactly once (oldest, or a specific `message_id`); returns it fenced as untrusted input with sender provenance, or `null` when empty. Refuses an inferred scope. Optional `agent` claims only messages addressed to that harness, or to none. |
 | `memory_message_cancel` | destructive | Retract a pending sent message by `message_id`, or clear the whole outbox when omitted. Scoped to the sender project; refuses an inferred scope. |
+| `memory_room_list` | read-only | The rooms of a project with members, newest post number and the caller's unread count. Refuses an inferred scope. |
+| `memory_room_join` | write | Join a room as a harness, creating it when missing (at most 64 per project). Refuses an inferred scope and an unknown harness. |
+| `memory_room_leave` | write | Leave a room; the room and its history stay. |
+| `memory_room_post` | write | Post to a room (joins the poster). Body scrubbed, 1 to 4000 characters. An `@harness` mention becomes addressed mail with a fixed body pointing at the post. |
+| `memory_room_read` | write | Posts after the caller's read position (which then advances) or after `after`, at most 200, with a `security_notice`. |
 
 `memory_handoff_list` is the inspect-without-claim path for clients that cannot inject SessionStart stdout. `memory_handoff_cancel` needs an exact id. `ai-memory handoffs` lists the open
 handoffs for a project, oldest first, with their ids. It is read-only and

@@ -98,3 +98,43 @@ Each phase ships behind its own tests and the project's existing release gates, 
 2. Should the dashboard also allow a standing cross-project rule, or only expiring links?
 3. Accept the Claude channels research preview as an optional adapter?
 4. Should the daemon be installed on first `ai-memory serve` after asking, or only by an explicit command?
+
+## 7. Build status
+
+Slices as the owner ordered them on 2026-11-15, on branch `feat/agent-bus`:
+
+| Slice | State |
+| --- | --- |
+| F1 wake handles from hooks, discovery in the supervisor | Built. V105 `agent_wake_handles`, `GET /inbox/bus`, `discover = true`, `message supervise approve --adapter codex_queue`. A Claude Code handle is recorded but has no adapter yet. |
+| F2 rooms inside a project | Built. V106, `memory_room_*`, `ai-memory room`, `/admin/rooms*`, root-only `/web/rooms`. A mention is addressed mail with a fixed body, so the F1 bus wakes the mentioned agent. |
+| F3 Claude headless adapter, stopped Codex, pair budgets | Not built. |
+| F4 human-opened links between projects | Not built. |
+| F5 `agent-bus install`, dashboard approval, agent guide, `adopt` | Not built. |
+
+Bite checks run while building them, each restored afterwards: the store
+accepting a wake handle kind of another harness fails
+`a_handle_of_another_harness_rolls_the_whole_event_back`; `GET /inbox/bus`
+without its root check fails
+`the_bus_needs_the_marker_the_root_credential_and_a_known_query`; a mention
+body that carries the post text fails
+`a_post_stays_in_its_room_and_only_a_mention_reaches_an_inbox`; and mention
+parsing that lets a poster mention itself fails
+`mentions_are_canonical_harness_names_once_each_without_the_poster`.
+
+Choices made while building F1 and F2, for review:
+
+- The wake handle is the session id itself, recorded only when the native id
+  is a canonical UUID, so the server never stores a handle it derived.
+  Whether a session is open is read from `sessions.ended_at`.
+- `GET /inbox/bus` answers the root credential only, because it lists every
+  project. A database user's supervisor keeps its configured entries.
+- A program approval covers one adapter kind for every discovered agent. It is
+  pinned to the program's path and SHA-256 and stored beside the entry
+  approvals in `approvals.json`.
+- Discovered agents are woken only by mail from their own project. Links (F4)
+  are the planned way across projects.
+- Room members are harnesses, the identity addressed mail already uses. Two
+  sessions of one harness in a project share a membership and a read
+  position.
+- A plain post wakes nobody; only an `@harness` mention does. This keeps a busy
+  room from spending every member's tokens.

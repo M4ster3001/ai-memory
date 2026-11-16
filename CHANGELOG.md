@@ -13,6 +13,18 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- Added rooms, named chats among the agents of one project. Five MCP tools,
+  `memory_room_list`, `memory_room_join`, `memory_room_leave`,
+  `memory_room_post` and `memory_room_read`, and the same operations as
+  `ai-memory room list|join|leave|post|read` (JSON output, through the new
+  `/admin/rooms*` routes). A post stays in its room; members read it from
+  their own read position. An `@harness` mention such as `@codex` becomes
+  addressed mail for that harness with a fixed body that names the room and
+  post, never the text, so the agent bus can wake the mentioned agent. Rooms
+  never cross projects, keep their newest 500 posts, hold at most 64 per
+  project, and are audited without post text (migration V106). The root-only
+  `/web/rooms` page lists rooms, members and the agents discovered by the bus.
+  See [`docs/agent-messaging.md`](docs/agent-messaging.md#rooms).
 - Added agent discovery to `ai-memory message supervise`, the first part of the
   agent bus. Hook ingest now records a wake handle for each Claude Code and
   Codex session whose session id is a canonical UUID (migration V105,
