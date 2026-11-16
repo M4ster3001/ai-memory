@@ -818,7 +818,8 @@ fn admission_skips(
 /// (synchronous handoff-fetch for session-start hooks), `GET /brief` (the
 /// read-only project brief for a subagent start), `GET /recap` (the
 /// read-only compaction recap for a "reload context" prompt),
-/// `GET /inbox/watch` (the long-poll for new agent mail), and the wake
+/// `GET /inbox/watch` (the long-poll for new agent mail), `GET /inbox/bus`
+/// (the agent bus daemon's long-poll over every inbox), and the wake
 /// supervisor's `POST /inbox/wake-candidates` and `POST /inbox/wake-report`.
 pub fn hook_router(state: HookState) -> Router {
     Router::new()
@@ -834,6 +835,7 @@ pub fn hook_router(state: HookState) -> Router {
         .route("/brief", get(handle_brief))
         .route("/recap", get(crate::recap::handle_recap))
         .route("/inbox/watch", get(crate::inbox_watch::handle_inbox_watch))
+        .route("/inbox/bus", get(crate::agent_bus::handle_inbox_bus))
         .route(
             "/inbox/wake-candidates",
             post(crate::inbox_supervisor::handle_wake_candidates),
@@ -5290,14 +5292,21 @@ async fn process_authorized(
         } else {
             None
         };
+        // The agent bus records how to wake this session only when the
+        // harness has a wake handle and its native id survived unhashed.
+        let wake_handle = env
+            .session_id
+            .as_deref()
+            .and_then(|raw| ai_memory_core::message_wake::reported_wake_handle(env.agent, raw));
         let result = state
             .writer
-            .admit_hook_session_event(
+            .admit_reported_hook_session_event(
                 new_session,
                 sanitized,
                 owner_filter.clone(),
                 ingest_key.clone(),
                 moved_from_cwd.clone(),
+                wake_handle,
             )
             .await;
         match result {
