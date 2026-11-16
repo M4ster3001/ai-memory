@@ -406,6 +406,36 @@ pub(crate) enum WriteCmd {
         message: NewAgentMessage,
         reply: oneshot::Sender<StoreResult<MessageId>>,
     },
+    /// Join a room, creating it when missing.
+    RoomJoin {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        room: ai_memory_core::rooms::RoomName,
+        agent: AgentKind,
+        reply: oneshot::Sender<StoreResult<(bool, bool)>>,
+    },
+    /// Leave a room.
+    RoomLeave {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        room: ai_memory_core::rooms::RoomName,
+        agent: AgentKind,
+        reply: oneshot::Sender<StoreResult<bool>>,
+    },
+    /// Post to a room.
+    RoomPost {
+        post: crate::agent_rooms::NewRoomPost,
+        reply: oneshot::Sender<StoreResult<crate::agent_rooms::RoomPostOutcome>>,
+    },
+    /// Advance a member's read position.
+    RoomMarkRead {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        room: ai_memory_core::rooms::RoomName,
+        agent: AgentKind,
+        seq: i64,
+        reply: oneshot::Sender<StoreResult<bool>>,
+    },
     /// Pop (claim exactly once) a message from a recipient project's inbox.
     PopMessage {
         claim: MessageClaim,
@@ -2228,6 +2258,94 @@ impl WriterHandle {
             workspace_id,
             project_id,
             owner_filter,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Join `agent` to a room of a project, creating the room when missing.
+    /// Returns `(created, joined)`.
+    ///
+    /// # Errors
+    /// [`StoreError::WriterClosed`], the per-project room cap, or SQL errors.
+    pub async fn room_join(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        room: ai_memory_core::rooms::RoomName,
+        agent: AgentKind,
+    ) -> StoreResult<(bool, bool)> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RoomJoin {
+            workspace_id,
+            project_id,
+            room,
+            agent,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Remove `agent` from a room. Returns whether it was a member.
+    ///
+    /// # Errors
+    /// [`StoreError::WriterClosed`] or SQL errors.
+    pub async fn room_leave(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        room: ai_memory_core::rooms::RoomName,
+        agent: AgentKind,
+    ) -> StoreResult<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RoomLeave {
+            workspace_id,
+            project_id,
+            room,
+            agent,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Post to a room; mentions become addressed inbox mail and wake their
+    /// inbox watchers after the commit.
+    ///
+    /// # Errors
+    /// [`StoreError::WriterClosed`], an empty or oversized body, the room
+    /// cap, or SQL errors.
+    pub async fn room_post(
+        &self,
+        post: crate::agent_rooms::NewRoomPost,
+    ) -> StoreResult<crate::agent_rooms::RoomPostOutcome> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RoomPost { post, reply: tx }).await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Advance a member's read position, never backwards. Returns whether
+    /// `agent` is a member.
+    ///
+    /// # Errors
+    /// [`StoreError::WriterClosed`] or SQL errors.
+    pub async fn room_mark_read(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        room: ai_memory_core::rooms::RoomName,
+        agent: AgentKind,
+        seq: i64,
+    ) -> StoreResult<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RoomMarkRead {
+            workspace_id,
+            project_id,
+            room,
+            agent,
+            seq,
             reply: tx,
         })
         .await?;
@@ -4806,6 +4924,55 @@ fn worker_loop(
                     &owner_filter,
                 );
                 send_or_warn(reply, result, "cancel_handoff");
+            }
+            WriteCmd::RoomJoin {
+                workspace_id,
+                project_id,
+                room,
+                agent,
+                reply,
+            } => {
+                let result =
+                    crate::agent_rooms::join(&mut conn, workspace_id, project_id, &room, agent);
+                send_or_warn(reply, result, "room_join");
+            }
+            WriteCmd::RoomLeave {
+                workspace_id,
+                project_id,
+                room,
+                agent,
+                reply,
+            } => {
+                let result =
+                    crate::agent_rooms::leave(&mut conn, workspace_id, project_id, &room, agent);
+                send_or_warn(reply, result, "room_leave");
+            }
+            WriteCmd::RoomPost { post, reply } => {
+                let result = crate::agent_rooms::post(&mut conn, &post, &delivery_policy);
+                if let Ok(outcome) = &result {
+                    for (agent, _) in &outcome.mentioned {
+                        inbox_signals.notify(post.workspace_id, post.project_id, Some(*agent));
+                    }
+                }
+                send_or_warn(reply, result, "room_post");
+            }
+            WriteCmd::RoomMarkRead {
+                workspace_id,
+                project_id,
+                room,
+                agent,
+                seq,
+                reply,
+            } => {
+                let result = crate::agent_rooms::mark_read(
+                    &mut conn,
+                    workspace_id,
+                    project_id,
+                    &room,
+                    agent,
+                    seq,
+                );
+                send_or_warn(reply, result, "room_mark_read");
             }
             WriteCmd::InsertMessage { message, reply } => {
                 let result = ops::insert_message(&mut conn, &message, &delivery_policy);

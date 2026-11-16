@@ -29,6 +29,7 @@ pub mod page;
 pub mod profile;
 pub mod quota;
 pub mod repository_identity;
+pub mod rooms;
 pub use repository_identity::{MARKER_FILENAME, MARKER_FILENAMES};
 pub mod routing_skills;
 pub mod scaffolding;

@@ -16,6 +16,10 @@ use rusqlite::{Connection, TransactionBehavior};
 
 mod agent_bus;
 pub use agent_bus::{BusTarget, WakeHandle};
+mod agent_rooms;
+pub use agent_rooms::{
+    NewRoomPost, RoomMember, RoomOverview, RoomPost, RoomPostOutcome, RoomSummary,
+};
 mod api_credentials;
 mod auto_improve;
 pub mod belief;
