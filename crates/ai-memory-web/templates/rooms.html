@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+
+{% block title %}{{ i18n.text("web-rooms-ai-memory") }}{% endblock %}
+
+{% block content %}
+<h1 class="text-2xl font-bold text-slate-900 dark:text-slate-100 mb-2">{{ i18n.text("web-rooms-heading") }}</h1>
+<p class="text-sm text-slate-500 dark:text-slate-400 mb-6">{{ i18n.text("web-rooms-intro") }}</p>
+
+<section class="mb-8" aria-label="{{ i18n.text("web-rooms-section-rooms") }}">
+  <h2 class="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-3">{{ i18n.text("web-rooms-section-rooms") }}</h2>
+  {% if rooms.is_empty() %}
+  <p class="text-sm text-slate-500 dark:text-slate-400" data-rooms="none">{{ i18n.text("web-rooms-none") }}</p>
+  {% else %}
+  <ul class="space-y-3">
+    {% for room in rooms %}
+    <li class="rounded-md border border-slate-200 dark:border-slate-800 p-3" data-room="{{ room.name }}">
+      <p class="text-sm"><span class="font-mono text-slate-800 dark:text-slate-200">#{{ room.name }}</span> <span class="text-slate-500 dark:text-slate-400">{{ room.scope }}</span></p>
+      <dl class="grid grid-cols-1 sm:grid-cols-[12rem_1fr] gap-x-4 gap-y-1 text-sm mt-1">
+        <dt class="text-slate-500 dark:text-slate-400">{{ i18n.text("web-rooms-members") }}</dt>
+        <dd class="font-mono text-slate-800 dark:text-slate-200 break-words">{{ room.members }}</dd>
+        <dt class="text-slate-500 dark:text-slate-400">{{ i18n.text("web-rooms-posts") }}</dt>
+        <dd class="font-mono text-slate-800 dark:text-slate-200 break-words">{{ room.last_seq }}</dd>
+      </dl>
+    </li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+</section>
+
+<section class="mb-6" aria-label="{{ i18n.text("web-rooms-section-agents") }}">
+  <h2 class="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-2">{{ i18n.text("web-rooms-section-agents") }}</h2>
+  {% if agents.is_empty() %}
+  <p class="text-sm text-slate-500 dark:text-slate-400" data-agents="none">{{ i18n.text("web-rooms-no-agents") }}</p>
+  {% else %}
+  <dl class="grid grid-cols-1 sm:grid-cols-[12rem_1fr] gap-x-4 gap-y-1 text-sm">
+    {% for agent in agents %}
+    <dt class="text-slate-500 dark:text-slate-400">{{ agent.scope }}</dt>
+    <dd class="font-mono text-slate-800 dark:text-slate-200 break-words" data-agent="{{ agent.agent }}">{{ agent.agent }} · {{ agent.kind }} · {% if agent.open %}{{ i18n.text("web-rooms-session-open") }}{% else %}{{ i18n.text("web-rooms-session-ended") }}{% endif %} · {{ agent.last_seen }}</dd>
+    {% endfor %}
+  </dl>
+  {% endif %}
+</section>
+{% endblock %}

@@ -21,6 +21,7 @@ mod notifications;
 mod page;
 mod pending;
 mod project;
+mod rooms;
 pub(crate) mod search;
 mod session;
 pub(crate) mod statics;
@@ -121,6 +122,7 @@ pub(crate) fn build(state: Arc<WebState>) -> Router {
             .route("/docs", get(documentation::index))
             .route("/docs/{slug}", get(documentation::page))
             .route("/inbox", get(inbox::handler))
+            .route("/rooms", get(rooms::handler))
             .route("/inbox/notifications", get(notifications::handler))
             .route("/messages", post(inbox::send))
             .route("/messages/{id}/edit", post(inbox::begin_edit))
