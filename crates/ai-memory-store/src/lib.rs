@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, TransactionBehavior};
 
+mod agent_bus;
+pub use agent_bus::{BusTarget, WakeHandle};
 mod api_credentials;
 mod auto_improve;
 pub mod belief;
@@ -69,7 +71,7 @@ pub use error::{
     AmbiguousMatch, AmbiguousProjectHolder, AmbiguousProjectHolders, StoreError, StoreResult,
 };
 pub use grants::{GrantFilter, GrantListing, GrantOutcome, ProjectGrant};
-pub use inbox_signals::{InboxSignals, InboxWatch, MAX_INBOX_WATCHERS};
+pub use inbox_signals::{InboxBusWatch, InboxSignals, InboxWatch, MAX_INBOX_WATCHERS};
 pub use maintenance::MaintenanceJob;
 pub use ops::{
     AdmittedSession, AdoptedProjectIdentity, BootstrapChunkRecord, CompactSummary, Compaction,

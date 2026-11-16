@@ -294,6 +294,7 @@ pub(crate) enum WriteCmd {
         owner_filter: OwnerFilter,
         ingest_key: Option<String>,
         moved_from_cwd: Option<String>,
+        wake_handle: Option<ai_memory_core::message_wake::WakeHandleKind>,
         reply: oneshot::Sender<StoreResult<HookSessionAdmission>>,
     },
     EndAdmittedSession {
@@ -1838,6 +1839,29 @@ impl WriterHandle {
         ingest_key: Option<String>,
         moved_from_cwd: Option<String>,
     ) -> StoreResult<HookSessionAdmission> {
+        self.admit_reported_hook_session_event(
+            session,
+            obs,
+            owner_filter,
+            ingest_key,
+            moved_from_cwd,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::admit_hook_session_event`] for an event that reports how the
+    /// agent bus can wake its session; see
+    /// `ops::admit_reported_hook_session_event`.
+    pub async fn admit_reported_hook_session_event(
+        &self,
+        session: NewSession,
+        obs: Sanitized<NewObservation>,
+        owner_filter: OwnerFilter,
+        ingest_key: Option<String>,
+        moved_from_cwd: Option<String>,
+        wake_handle: Option<ai_memory_core::message_wake::WakeHandleKind>,
+    ) -> StoreResult<HookSessionAdmission> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::AdmitHookSessionEvent {
             session,
@@ -1845,6 +1869,7 @@ impl WriterHandle {
             owner_filter,
             ingest_key,
             moved_from_cwd,
+            wake_handle,
             reply: tx,
         })
         .await?;
@@ -4590,15 +4615,17 @@ fn worker_loop(
                 owner_filter,
                 ingest_key,
                 moved_from_cwd,
+                wake_handle,
                 reply,
             } => {
-                let result = ops::admit_hook_session_event(
+                let result = ops::admit_reported_hook_session_event(
                     &mut conn,
                     &session,
                     &obs,
                     &owner_filter,
                     ingest_key.as_deref(),
                     moved_from_cwd.as_deref(),
+                    wake_handle,
                 );
                 send_or_warn(reply, result, "admit_hook_session_event");
             }
