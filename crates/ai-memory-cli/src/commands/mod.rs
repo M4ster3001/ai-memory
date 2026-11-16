@@ -108,6 +108,7 @@ pub mod restore;
 pub mod restore_agents;
 pub mod restore_page;
 pub mod resume;
+pub mod room;
 pub mod run;
 pub mod run_autowire;
 pub(crate) mod run_project_split;

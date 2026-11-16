@@ -717,4 +717,104 @@ mod slow {
             f.pop(id);
         }
     }
+
+    /// Rooms through the CLI against the real server: a post with an
+    /// `@codex` mention wakes the discovered Codex session through the bus,
+    /// with the fixed wake text, and codex reads the post from the room.
+    #[tokio::test]
+    async fn a_room_mention_wakes_the_mentioned_agent_through_the_bus() {
+        const DISCOVERED_THREAD: &str = "00000000-0000-4000-8000-000000000303";
+        let f = fixture().await;
+        std::fs::write(
+            f.dd().join("config.toml"),
+            "[messaging.supervisor]\nmax_wakes_per_hour = 20\n",
+        )
+        .unwrap();
+        let state = f.dd().join("supervisor-room");
+        approve_program(&f, &state);
+        let scope = ["--workspace", WORKSPACE, "--project", INBOX];
+
+        // A plain post wakes nobody.
+        let plain: Value = serde_json::from_str(
+            &f.cli(
+                &[
+                    &[
+                        "room",
+                        "post",
+                        "general",
+                        "BODY-CANARY plain",
+                        "--agent",
+                        "claude-code",
+                    ][..],
+                    &scope[..],
+                ]
+                .concat(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(plain["seq"], 1, "{plain}");
+        f.supervise_once(&state);
+        assert_eq!(f.calls(), 0, "a post without a mention woke an agent");
+
+        // A mention does, once, through the session's own thread.
+        let asked: Value = serde_json::from_str(
+            &f.cli(
+                &[
+                    &[
+                        "room",
+                        "post",
+                        "general",
+                        "BODY-CANARY @codex need a hand",
+                        "--agent",
+                        "claude-code",
+                    ][..],
+                    &scope[..],
+                ]
+                .concat(),
+            ),
+        )
+        .unwrap();
+        let mention = asked["mentioned"][0]["message_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        f.supervise_once(&state);
+        assert_eq!(f.calls(), 1);
+        let args = f.last_args();
+        assert_eq!(
+            args[..4],
+            ["queue", "--thread", DISCOVERED_THREAD, "--message"]
+        );
+        assert!(args[4].contains(&mention), "{}", args[4]);
+        assert!(!args[4].contains("CANARY"), "post text reached the adapter");
+        f.supervise_once(&state);
+        assert_eq!(f.calls(), 1, "the mention woke twice");
+
+        // Codex reads the room as a non-member from the start of the history.
+        let read: Value = serde_json::from_str(
+            &f.cli(
+                &[
+                    &[
+                        "room", "read", "general", "--agent", "codex", "--after", "0",
+                    ][..],
+                    &scope[..],
+                ]
+                .concat(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(read["posts"].as_array().unwrap().len(), 2, "{read}");
+        assert_eq!(read["posts"][1]["body"], "BODY-CANARY @codex need a hand");
+        let listed: Value = serde_json::from_str(
+            &f.cli(&[&["room", "list", "--agent", "claude-code"][..], &scope[..]].concat()),
+        )
+        .unwrap();
+        assert_eq!(
+            listed["rooms"][0]["members"],
+            json!(["claude-code"]),
+            "{listed}"
+        );
+        assert_eq!(listed["rooms"][0]["unread"], 0);
+        f.pop(&mention);
+    }
 }

@@ -199,6 +199,8 @@ pub enum Command {
     /// directed, claim-once mailbox between two projects — see
     /// `docs/agent-messaging.md`).
     Message(MessageArgs),
+    /// Rooms: named chats among the agents of one project. Prints JSON.
+    Room(RoomArgs),
     /// List recent managed workstreams selectable from the current checkout.
     Workstreams(WorkstreamsArgs),
     /// Rename a managed workstream in the current checkout. Metadata only:
@@ -824,6 +826,100 @@ pub struct MessageArgs {
     /// Cross-project message action to run.
     #[command(subcommand)]
     pub command: MessageCommand,
+}
+
+/// Arguments for `room`.
+#[derive(Debug, Args)]
+pub struct RoomArgs {
+    /// Room action to run.
+    #[command(subcommand)]
+    pub command: RoomCommand,
+}
+
+/// Subcommands for `room`.
+#[derive(Debug, Subcommand)]
+pub enum RoomCommand {
+    /// List the rooms of the project, with members and unread counts.
+    List(RoomListArgs),
+    /// Join a room as a harness, creating it when missing.
+    Join(RoomMemberArgs),
+    /// Leave a room; the room and its history stay.
+    Leave(RoomMemberArgs),
+    /// Post to a room; `@codex` or `@claude-code` in the text mentions and
+    /// wakes that agent.
+    Post(RoomPostArgs),
+    /// Read a room's posts after your read position, or after `--after`.
+    Read(RoomReadArgs),
+}
+
+/// Arguments for `room list`.
+#[derive(Debug, Args)]
+pub struct RoomListArgs {
+    /// Count unread posts for this harness (for example codex or claude-code).
+    #[arg(long)]
+    pub agent: Option<String>,
+    /// Workspace of the project (defaults to the resolved scope).
+    #[arg(long)]
+    pub workspace: Option<String>,
+    /// Project whose rooms to list (defaults to the resolved scope).
+    #[arg(long)]
+    pub project: Option<String>,
+}
+
+/// Arguments for `room join` and `room leave`.
+#[derive(Debug, Args)]
+pub struct RoomMemberArgs {
+    /// The room: 1 to 40 lowercase letters, digits or '-'.
+    pub room: String,
+    /// The harness that joins or leaves (for example codex or claude-code).
+    #[arg(long)]
+    pub agent: String,
+    /// Workspace of the project (defaults to the resolved scope).
+    #[arg(long)]
+    pub workspace: Option<String>,
+    /// Project of the room (defaults to the resolved scope).
+    #[arg(long)]
+    pub project: Option<String>,
+}
+
+/// Arguments for `room post`.
+#[derive(Debug, Args)]
+pub struct RoomPostArgs {
+    /// The room: 1 to 40 lowercase letters, digits or '-'.
+    pub room: String,
+    /// The post, 1 to 4000 characters; read from stdin when omitted.
+    pub body: Option<String>,
+    /// The harness that posts (for example codex or claude-code).
+    #[arg(long)]
+    pub agent: String,
+    /// Workspace of the project (defaults to the resolved scope).
+    #[arg(long)]
+    pub workspace: Option<String>,
+    /// Project of the room (defaults to the resolved scope).
+    #[arg(long)]
+    pub project: Option<String>,
+}
+
+/// Arguments for `room read`.
+#[derive(Debug, Args)]
+pub struct RoomReadArgs {
+    /// The room: 1 to 40 lowercase letters, digits or '-'.
+    pub room: String,
+    /// The harness that reads (for example codex or claude-code).
+    #[arg(long)]
+    pub agent: String,
+    /// Return posts after this number instead of after the read position.
+    #[arg(long)]
+    pub after: Option<i64>,
+    /// Most posts to return (1 to 200, default 50).
+    #[arg(long)]
+    pub limit: Option<usize>,
+    /// Workspace of the project (defaults to the resolved scope).
+    #[arg(long)]
+    pub workspace: Option<String>,
+    /// Project of the room (defaults to the resolved scope).
+    #[arg(long)]
+    pub project: Option<String>,
 }
 
 /// Subcommands for `message`.
