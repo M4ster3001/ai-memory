@@ -232,6 +232,26 @@ export const TOOL_COVERAGE: Readonly<Record<string, ToolClassification>> = {
     status: "not_exposed",
     reason: "admin-only restore of one page from a git checkpoint; use callTool",
   },
+  memory_room_list: {
+    status: "not_exposed",
+    reason: "agent-to-agent chat inside one project; use callTool",
+  },
+  memory_room_join: {
+    status: "not_exposed",
+    reason: "agent-to-agent chat inside one project; use callTool",
+  },
+  memory_room_leave: {
+    status: "not_exposed",
+    reason: "agent-to-agent chat inside one project; use callTool",
+  },
+  memory_room_post: {
+    status: "not_exposed",
+    reason: "agent-to-agent chat inside one project; use callTool",
+  },
+  memory_room_read: {
+    status: "not_exposed",
+    reason: "agent-to-agent chat inside one project; use callTool",
+  },
 };
 
 /** Convert a wire name to the SDK's camelCase argument name. */

@@ -101,6 +101,8 @@ Cross-project messaging exists: `memory_message_send` is the ONLY way to
 reach another project's inbox (send a report, notify, leave a message for
 that project's agent). A wiki page written into the target project is NOT a
 message and is never surfaced as one.
+Inside one project, agents also talk in named rooms, and an `@harness` mention
+such as `@codex` wakes that agent; the installed messaging skill covers it.
 
 For ranking diagnosis, opt-in query explanations add bounded score provenance
 to project/scopes hits. Cross-project search uses a distinct FTS-only ranker

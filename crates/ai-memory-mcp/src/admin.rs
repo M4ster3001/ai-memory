@@ -782,6 +782,11 @@ pub fn admin_router_with_sweep_tuning(
         .route("/admin/curator", post(handle_curator))
         .route("/admin/handoffs", get(handle_open_handoffs_list))
         .route("/admin/handoffs/expire", post(handle_expire_handoffs))
+        .route("/admin/rooms", get(crate::admin_rooms::handle_list))
+        .route("/admin/rooms/join", post(crate::admin_rooms::handle_join))
+        .route("/admin/rooms/leave", post(crate::admin_rooms::handle_leave))
+        .route("/admin/rooms/post", post(crate::admin_rooms::handle_post))
+        .route("/admin/rooms/read", get(crate::admin_rooms::handle_read))
         .route("/admin/messages", get(handle_list_messages))
         .route("/admin/messages/send", post(handle_send_message))
         .route("/admin/messages/status", get(handle_message_status))
@@ -2469,7 +2474,7 @@ async fn refresh_promoted_scope(
 /// Returns `(WorkspaceId, ProjectId)` on success, or a ready-to-return
 /// 404/500 error response. Used by read, maintenance, and destructive
 /// handlers where auto-creation would silently succeed on a typo.
-async fn lookup_ws_proj_no_create(
+pub(crate) async fn lookup_ws_proj_no_create(
     state: &AdminState,
     workspace: &str,
     project: &str,

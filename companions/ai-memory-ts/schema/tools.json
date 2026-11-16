@@ -986,6 +986,157 @@
       "path"
     ]
   },
+  "memory_room_join": {
+    "properties": {
+      "agent": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "project": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "room": {
+        "type": "string"
+      },
+      "workspace": {
+        "type": [
+          "null",
+          "string"
+        ]
+      }
+    },
+    "required": [
+      "room"
+    ]
+  },
+  "memory_room_leave": {
+    "properties": {
+      "agent": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "project": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "room": {
+        "type": "string"
+      },
+      "workspace": {
+        "type": [
+          "null",
+          "string"
+        ]
+      }
+    },
+    "required": [
+      "room"
+    ]
+  },
+  "memory_room_list": {
+    "properties": {
+      "agent": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "project": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "workspace": {
+        "type": [
+          "null",
+          "string"
+        ]
+      }
+    },
+    "required": []
+  },
+  "memory_room_post": {
+    "properties": {
+      "agent": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "body": {
+        "type": "string"
+      },
+      "project": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "room": {
+        "type": "string"
+      },
+      "workspace": {
+        "type": [
+          "null",
+          "string"
+        ]
+      }
+    },
+    "required": [
+      "body",
+      "room"
+    ]
+  },
+  "memory_room_read": {
+    "properties": {
+      "after": {
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "agent": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "limit": {
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "project": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "room": {
+        "type": "string"
+      },
+      "workspace": {
+        "type": [
+          "null",
+          "string"
+        ]
+      }
+    },
+    "required": [
+      "room"
+    ]
+  },
   "memory_status": {
     "properties": {
       "project": {
