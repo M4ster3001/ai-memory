@@ -465,6 +465,13 @@ Outcomes go back as enums through `POST /inbox/wake-report`, which needs
 `Write` on the inbox; the writer compare-and-sets the pending rows of that
 inbox and harness, records a timeline event (V104 admits the wake events) and
 queues the sender's receipt in the same transaction.
+The agent bus extends it without configuration. Hook ingest records a wake
+handle (`agent_wake_handles`, V105) in the event's own transaction for each
+Claude Code or Codex session whose native id is a canonical UUID, and
+`GET /inbox/bus` (root credential only) long-polls every inbox at once on a
+bus-wide commit signal and lists the agents with addressed pending mail and a
+handle. The supervisor wakes those agents for mail from their own project,
+with a program approved once per adapter kind (`approvals.json` `programs`).
 `GET /recap?session_id=` answers a prompt that starts with `reload context`
 (Claude Code and Codex in the `UserPromptSubmit` envelope, Grok on the next
 `PostToolUse`, OpenCode through its system/context hooks). It is read-only and

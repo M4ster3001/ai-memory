@@ -13,6 +13,22 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- Added agent discovery to `ai-memory message supervise`, the first part of the
+  agent bus. Hook ingest now records a wake handle for each Claude Code and
+  Codex session whose session id is a canonical UUID (migration V105,
+  `agent_wake_handles`), and the new `GET /inbox/bus` long-poll lists, for the
+  root credential, the agents with claimable mail addressed to them and the
+  newest handle of their harness in the project, with message ids only. With
+  `[messaging.supervisor] discover = true`, the default, the supervisor wakes
+  those agents with no `config.toml` entry, for mail from another agent of
+  their own project only. Codex sessions are woken through `codex_queue` on
+  their own thread id; Claude Code sessions are recorded but not woken yet.
+  The program runs only after
+  `ai-memory message supervise approve --adapter codex_queue`, which approves
+  it once for every discovered agent and is pinned to its SHA-256. Configured
+  entries keep working unchanged and take precedence for their inbox. See
+  [`docs/agent-messaging.md`](docs/agent-messaging.md#discovered-agents) and
+  [`docs/design-agent-bus.md`](docs/design-agent-bus.md).
 - Added `ai-memory message supervise`, a host process that wakes the agents
   listed under `[messaging.supervisor]` in `config.toml` when mail arrives for
   them. It runs only a closed set of adapters, today `codex_queue`

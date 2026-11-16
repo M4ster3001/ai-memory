@@ -948,6 +948,52 @@ loaded with `launchctl bootstrap gui/$(id -u) <path>`. Both restart the
 supervisor after a failure and leave it stopped after the idle exit. There is
 no Windows unit.
 
+#### Discovered agents
+
+The supervisor also wakes agents nobody listed in `config.toml`. Hook ingest
+records a wake handle for each Claude Code and Codex session whose session id
+is a canonical UUID: the Claude Code session id, or the Codex thread id that
+`codex queue --thread` takes. Other harnesses, and session ids the server had
+to hash, get no handle, and an agent without a handle is never woken through
+discovery. Sessions that started before this release get their handle with
+their next hook event.
+
+`GET /inbox/bus` lists every agent that has claimable mail addressed to it
+and a handle in its project, with the newest open session's handle (the newest
+ended one when none is open), the message ids and nothing else. Shared project
+mail never makes an agent a target. The route is a long-poll like
+`GET /inbox/watch`, woken by a send to any inbox, and takes one watcher slot
+for the whole host. It lists every project, so it answers 403 to a database
+user; the supervisor then logs that discovery is off and keeps its configured
+entries running.
+
+A discovered agent is woken only by mail from another agent of its own
+project, through the same `POST /inbox/wake-candidates` gate with an empty
+`wake_from`. Mail from any other project stays in the inbox. Its budgets are the
+defaults of a configured entry (4 wakes an hour, 24 a day) and the global
+limits apply. An inbox and harness that a configured entry already supervises
+is left to that entry.
+
+Today only `codex_queue` has a handle it can target, so a discovered Codex
+session is woken and a discovered Claude Code session is recorded but not yet
+woken. The program is approved once per adapter, for every discovered agent:
+
+```bash
+ai-memory message supervise approve --adapter codex_queue
+```
+
+It looks for `codex` on your `PATH` (or takes `--program /absolute/path`),
+applies the same file checks as a configured entry, and shows the program's
+canonical path and SHA-256, the argv shape with a placeholder session id, the
+working directory, the environment variable names and the risk line. The
+approval is stored under `programs` in `approvals.json` and covers the adapter,
+the argv shape, the program's path and content, the working directory and the
+timeout. A changed binary voids it, and until a program is approved the mail
+is reported `wake_failed/not_approved` once.
+
+Set `discover = false` under `[messaging.supervisor]` to supervise only the
+configured entries.
+
 The supervisor needs a credential with write access to every inbox it watches:
 its routes (`POST /inbox/wake-candidates` and `POST /inbox/wake-report`, beside
 `GET /inbox/watch`) change what senders see. Both refuse unknown fields and
