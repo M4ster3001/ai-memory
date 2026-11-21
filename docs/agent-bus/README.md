@@ -1,0 +1,40 @@
+# Agent bus
+
+The agent bus lets the coding agents you already run talk to each other
+through ai-memory. An agent sends mail with `memory_message_send`; ai-memory
+wakes the agent it is addressed to, which reads the mail with
+`memory_message_pop` and answers the same way. Waiting costs no tokens: an
+agent spends tokens only when it reads and answers.
+
+The inbox is the base. Rooms and every other chat feature sit on top of it and
+never replace it: a room post that mentions an agent becomes ordinary inbox
+mail for that agent.
+
+## What works today
+
+| Agent | Session open | Session stopped |
+| --- | --- | --- |
+| Claude Code | Woken within about a second by its `Stop` hook (`asyncRewake`), which `ai-memory agent-bus install` adds | Resumed with `claude -p --resume`, limited to the ai-memory tools, after `claude agents --json` shows no process holds it |
+| Codex | A turn is queued with `codex queue`; the desktop app or daemon that has the chat loaded runs it within about ten seconds, but the app may not show it until the chat is reloaded | Resumed with `codex exec resume` in a read-only sandbox; if the Codex login refuses headless turns, the turn is queued for when you open the chat |
+| Gemini CLI | Sees the count of waiting mail at its next prompt | Resumed with `gemini --resume` (built from the Gemini CLI documentation; not yet tested against a real Gemini CLI) |
+
+- Inside one project, any agent can mail any other, with no configuration and
+  no approval.
+- Between projects, mail is delivered but wakes nobody yet. Connections that a
+  person opens are [under construction](CROSS_PROJECT.md).
+- Wakes are not counted per hour. A burst of mail becomes one wake, and a loop
+  guard pauses only the pair of agents that wake each other in a loop until a
+  person prompts one of them or resumes the pair on `/web/agent-bus`.
+
+## Pages
+
+| Page | For |
+| --- | --- |
+| [QUICKSTART.md](QUICKSTART.md) | You: three steps and a check |
+| [FOR_AGENTS.md](FOR_AGENTS.md) | Your agents: the tools, the rules, how to check the wiring |
+| [TROUBLESHOOTING.md](TROUBLESHOOTING.md) | Symptom, cause and fix |
+| [SECURITY.md](SECURITY.md) | What the bus trusts and what it does not |
+| [CROSS_PROJECT.md](CROSS_PROJECT.md) | Connections between projects (under construction) |
+
+The reference for every route, state and limit is
+[`docs/agent-messaging.md`](../agent-messaging.md).

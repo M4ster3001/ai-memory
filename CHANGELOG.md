@@ -13,6 +13,50 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- Added `ai-memory agent-bus install`, `status` and `doctor`. `install` shows
+  what it will do and asks once, then writes the per-user service that runs
+  the wake supervisor (systemd on Linux, a LaunchAgent on macOS), adds the
+  Claude Code wake hook to `~/.claude/settings.json` (with a backup, and no
+  token in the hook), and starts the service; `--dry-run` and `--yes` are
+  available. `status` shows the service, the hook, the discovered agents with
+  their last wake and the paused pairs; `doctor` checks each piece and prints
+  a fix for each failure. They read the new root-only `GET /inbox/bus/status`.
+  The supervisor reports every program it trusts to the new root-only
+  `POST /inbox/bus/program`, which audits it. The new root-only
+  `/web/agent-bus` page lists the discovered agents, their last wake, the
+  paused pairs with a button that resumes one (`POST /web/agent-bus/resume`),
+  and the trusted programs. A guide for people and agents is in
+  [`docs/agent-bus/`](docs/agent-bus/README.md).
+- Added wakes for every state of a discovered agent to the agent bus
+  (`ai-memory message supervise`). A stopped Claude Code session is resumed
+  with `claude -p --resume` (adapter `claude_resume`) in its own directory,
+  with the fixed wake text, only the ai-memory MCP tools and at most 12 turns,
+  and only after `claude agents --json` shows no process holding it. A stopped
+  Codex conversation is resumed with `codex exec resume` in a read-only sandbox
+  (`codex_exec_resume`); when the Codex login refuses headless turns
+  (`codex_byok_restricted_by_api_credit_promo`) it is reported
+  `agent_unavailable/auth_failed`, not retried for six hours, and the turn is
+  queued with `codex_queue` instead. A stopped Gemini CLI session is resumed
+  with `gemini --resume` (`gemini_resume`, from the Gemini CLI documentation,
+  not yet run against a real Gemini CLI); Gemini CLI sessions now get a wake
+  handle. The bus answer gains the session's `cwd`. See
+  [`docs/agent-messaging.md`](docs/agent-messaging.md#adapters).
+- Added `ai-memory message watch --rewake`, a Claude Code `Stop` hook with
+  `asyncRewake` that wakes an open, idle Claude Code session within about a
+  second of new mail from another agent of its project, by exiting 2 with the
+  fixed wake text. `install-hooks` adds it to native Claude Code installs. See
+  [`docs/agent-messaging.md`](docs/agent-messaging.md#waking-an-open-claude-code-session).
+- Added the agent bus loop guard: the server pauses wakes between two agents
+  whose mail ping-pongs 20 times, repeats one body three times in 30 minutes,
+  or ends a chain deeper than 40 mail-woken turns, without a human prompt in
+  between. The mail is still delivered; wakes for it are reported
+  `wake_failed/loop_suspected` (new delivery reason) and `POST
+  /inbox/wake-candidates` labels it `paused`. A human prompt in either agent's
+  session resumes the pair. Pauses and resumes are audited without text
+  (migration V107, `agent_pair_pauses`, `agent_human_anchors`,
+  `agent_messages.hop`). See
+  [`docs/agent-messaging.md`](docs/agent-messaging.md#the-loop-guard).
+
 - Added rooms, named chats among the agents of one project. Five MCP tools,
   `memory_room_list`, `memory_room_join`, `memory_room_leave`,
   `memory_room_post` and `memory_room_read`, and the same operations as
@@ -137,6 +181,21 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Changed
 
+- Changed the wake supervisor to count no wakes per hour. The per-agent and
+  global budgets are gone; `max_wakes_per_hour`, `wakes_per_hour` and
+  `wakes_per_day` are still accepted and ignored. New mail that arrives while
+  the agent has not read the mail it was woken for joins that batch instead of
+  waking it again (for up to 10 minutes), and the loop guard stops loops.
+- Changed discovered agents' programs to be trusted on first use: the
+  supervisor finds `codex`, `claude` or `gemini`, checks the file as before and
+  records its path and SHA-256; a changed binary at that path is trusted again,
+  logged and audited (`agent_bus_program_trusted`) instead of asking on a
+  terminal. Set `[messaging.supervisor] trust_on_first_use = false` to keep the
+  explicit `message supervise approve --adapter` step.
+- Changed `GET /inbox/bus` to list first the agents whose newest mail is
+  newest, so an agent with new mail is never crowded out by more than 64 agents
+  holding old unread mail, and to read its answer in one snapshot.
+
 - `memory_message_send` and the web composer no longer refuse `to_agent`
   for a harness that has never started a session in the recipient project.
   The message is queued with delivery state `awaiting_agent`, becomes
@@ -148,6 +207,10 @@ version in [`docs/changelog/`](docs/changelog/):
   It used to show only an empty prompt.
 
 ### Fixed
+
+- Fixed `memory_room_read` and `ai-memory room read` moving a member's read
+  position when it read ahead with `after`, which made the next plain read
+  skip the posts in between.
 
 - Fixed `[[llm_fallbacks]]` chains stopping when a provider reported that the
   account was out of credit, quota or billing. Only a `429`, a `5xx` or a

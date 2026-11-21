@@ -11,6 +11,8 @@ Status: proposal, written 2026-11-15 after the first real run of the wake superv
 5. A project talks to another project only when the human user asks for it. When they do, the system opens a connection between exactly the projects they named.
 6. Any agent can adopt it by reading the documentation: Claude Code, Codex, Gemini and others. No external services.
 
+Principle added 2026-11-16 (owner): rooms and every other chat feature are one more resource on top of the inbox, never a replacement. The inbox stays the base: one-to-one mail, delivery states and receipts, `memory_message_*`, the watcher and the wake supervisor keep working exactly as they do today, with or without rooms. A room post that mentions an agent becomes ordinary inbox mail for that agent, so anything that reads the inbox sees it. Removing the rooms must leave the inbox untouched, and no room feature may be required to use the inbox.
+
 ## 2. What exists today (slices 1 to 3a, PRs #25 to #28)
 
 | Piece | What it does | Limit found in use |
@@ -107,9 +109,9 @@ Slices as the owner ordered them on 2026-11-15, on branch `feat/agent-bus`:
 | --- | --- |
 | F1 wake handles from hooks, discovery in the supervisor | Built. V105 `agent_wake_handles`, `GET /inbox/bus`, `discover = true`, `message supervise approve --adapter codex_queue`. A Claude Code handle is recorded but has no adapter yet. |
 | F2 rooms inside a project | Built. V106, `memory_room_*`, `ai-memory room`, `/admin/rooms*`, root-only `/web/rooms`. A mention is addressed mail with a fixed body, so the F1 bus wakes the mentioned agent. |
-| F3 Claude headless adapter, stopped Codex, pair budgets | Not built. |
-| F4 human-opened links between projects | Not built. |
-| F5 `agent-bus install`, dashboard approval, agent guide, `adopt` | Not built. |
+| F3 adapters and wakes, no hourly budget | Built (2026-11-21). `message watch --rewake` as Claude Code's `Stop` hook with `asyncRewake` (added by `install-hooks` on native installs and by `agent-bus install`); adapters `claude_resume`, `codex_exec_resume` (falls back to `codex_queue` on a busy chat or a refused login) and `gemini_resume` (documentation only, untested); V107 loop guard (ping-pong, repeated content, thread depth, per-pair breaker, human prompt resumes) and coalescing instead of budgets; programs trusted on first use; second-opinion fixes 1, 3, 4 and 5 (2 is the loop guard). |
+| F4 human-opened links between projects | Not built. Next round. |
+| F5 `agent-bus install`, status, doctor, dashboard, agent guide | Built (2026-11-21). `ai-memory agent-bus install|status|doctor`, `GET /inbox/bus/status`, `POST /inbox/bus/program`, root-only `/web/agent-bus` with a resume button, `docs/agent-bus/`. No `adopt` and no `memory_bus_whoami`: `doctor` covers the checks. |
 
 Bite checks run while building them, each restored afterwards: the store
 accepting a wake handle kind of another harness fails
@@ -138,3 +140,33 @@ Choices made while building F1 and F2, for review:
   position.
 - A plain post wakes nobody; only an `@harness` mention does. This keeps a busy
   room from spending every member's tokens.
+
+Choices made while building F3 and F5, for review:
+
+- An open Claude Code session is woken only by its `Stop` hook; the
+  supervisor resumes a Claude Code session only when the server recorded it as
+  ended and `claude agents --json` lists no process for it. A session that is
+  open but whose process died without `SessionEnd` waits for the idle
+  auto-end.
+- The rewake hook waits 12 hours per turn (`timeout` 43200). Claude Code's
+  upper bound for a hook timeout was not tested; a session idle for longer
+  hears of its mail at its next prompt.
+- The loop guard reads at most the last two hours of a pair when no human
+  prompt was recorded, so a project without prompt capture is not paused by
+  old traffic. Its thresholds (20 turns, 3 copies in 30 minutes, depth 40) are
+  constants, not settings.
+- A paused pair stays paused until a human prompt or the dashboard; there is
+  no timed half-open state.
+- Trust on first use is the default; `trust_on_first_use = false` keeps the
+  terminal approval. Configured entries keep their terminal approval either
+  way.
+- The Claude Code hook that `agent-bus install` writes carries no token: it
+  passes `--data-dir` and `--config`, and the binary reads the server and token
+  from that configuration. `install-hooks` puts the URL and token in the
+  command's environment, as its other hooks do.
+- Bite checks run while building F3 (each restored): dropping the `paused`
+  label from `wake-candidates` fails `candidates_label_mail_of_a_paused_pair`;
+  dropping the world-writable check from `check_session_dir` fails
+  `a_resumed_session_runs_only_in_a_checked_directory_of_the_operator`; letting
+  the rewake hook wake on `paused` mail fails
+  `only_new_mail_from_another_agent_or_a_receipt_wakes`.
