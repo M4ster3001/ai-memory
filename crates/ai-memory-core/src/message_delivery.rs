@@ -130,9 +130,9 @@ wire_enum! {
     ///
     /// The server records `agent_not_registered`, `no_pop_timeout`, `ttl` and
     /// `sender_cancelled` itself. The wake supervisor reports the adapter,
-    /// budget and approval reasons. `session_not_found`, `rate_limited`,
-    /// `auth_failed` and `sender_unverified` are the design's vocabulary for
-    /// later adapters and are not produced yet.
+    /// approval, session and loop reasons. `budget_exhausted` is no longer
+    /// produced (wakes have no hourly budget) and stays readable on old rows;
+    /// `rate_limited` and `sender_unverified` are not produced yet.
     DeliveryReason, "delivery reason" {
         /// Addressed to a harness not registered in the recipient project.
         AgentNotRegistered => "agent_not_registered",
@@ -150,20 +150,26 @@ wire_enum! {
         BinaryMissing => "binary_missing",
         /// The wake adapter has no valid operator approval.
         NotApproved => "not_approved",
-        /// The recipient's wake budget is spent for now.
+        /// The recipient's hourly wake budget was spent. Older supervisors
+        /// only.
         BudgetExhausted => "budget_exhausted",
-        /// The recipient's session refused the wake as busy.
+        /// The recipient's session refused the wake as busy, or is open in
+        /// a process the adapter must not resume.
         SessionBusy => "session_busy",
-        /// Reserved.
+        /// The harness has no session with the recorded handle.
         SessionNotFound => "session_not_found",
         /// [`crate::quota::quota_signal`] matched the wake adapter's output.
         QuotaMarker => "quota_marker",
         /// Reserved.
         RateLimited => "rate_limited",
-        /// Reserved.
+        /// The harness refused its own login for this kind of run.
         AuthFailed => "auth_failed",
         /// Reserved.
         SenderUnverified => "sender_unverified",
+        /// The sender and recipient look like agents waking each other in a
+        /// loop, so wakes between them are paused until a human prompt or
+        /// the dashboard resumes them. The mail itself is still delivered.
+        LoopSuspected => "loop_suspected",
     }
 }
 

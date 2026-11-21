@@ -17,8 +17,13 @@ use rusqlite::{Connection, TransactionBehavior};
 mod agent_bus;
 pub use agent_bus::{BusTarget, WakeHandle};
 mod agent_rooms;
+mod agent_wake_guard;
 pub use agent_rooms::{
     NewRoomPost, RoomMember, RoomOverview, RoomPost, RoomPostOutcome, RoomSummary,
+};
+pub use agent_wake_guard::{
+    AgentSide, GUARD_WINDOW_MICROS, LastWake, MAX_THREAD_DEPTH, PING_PONG_TURNS, PairPause,
+    PauseReason, REPEATED_CONTENT, normalized_body,
 };
 mod api_credentials;
 mod auto_improve;

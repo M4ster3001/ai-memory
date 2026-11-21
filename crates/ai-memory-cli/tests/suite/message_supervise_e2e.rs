@@ -2,15 +2,16 @@
 //! `ai-memory serve` and a fake `codex` that records how it was run
 //! (`docs/agent-messaging.md`, "The wake supervisor").
 //!
-//! Phase one (budget of two wakes an hour):
+//! Phase one (the deprecated `wakes_per_hour = 2` is ignored):
 //! 1. A message from a listed project with a recorded sender session wakes
 //!    the agent once, through the fixed argv, with no sender text.
 //! 2. Running again does not wake again for the same message.
 //! 3. Mail from an unlisted project, or from the listed one without a
 //!    recorded session, wakes nobody.
 //! 4. Mail the agent popped before the supervisor looked wakes nobody.
-//! 5. The second wake spends the hourly budget; the next message is reported
-//!    `wake_failed/budget_exhausted` and its sender gets a receipt.
+//! 5. New mail that arrives while the woken mail is unread joins it instead
+//!    of waking again; once it is read, the next mail wakes at once, and a
+//!    third wake within the hour runs too (no hourly budget).
 //!
 //! Phase two (a fresh state directory):
 //! 6. A changed binary voids the approval: `wake_failed/not_approved`.
@@ -86,14 +87,38 @@ mod slow {
         fn cli(&self, args: &[&str]) -> String {
             run_cli(args, self.dd(), self.home.path(), None, &self.base)
         }
+        /// One supervisor pass. `HOME` and `PATH` point at the fixture, so
+        /// a program trusted on first use can only be one of its fakes.
         fn supervise_once(&self, state: &Path) {
-            self.cli(&[
-                "message",
-                "supervise",
-                "--once",
-                "--state-dir",
-                state.to_str().unwrap(),
-            ]);
+            let path = format!("{}:/usr/bin:/bin", self.bin.path().display());
+            let out = hermetic(BIN)
+                .args([
+                    "message",
+                    "supervise",
+                    "--once",
+                    "--state-dir",
+                    state.to_str().unwrap(),
+                ])
+                .env("AI_MEMORY_DATA_DIR", self.dd())
+                .env("AI_MEMORY_HOME", self.home.path())
+                .env("AI_MEMORY_SERVER_URL", &self.base)
+                .env("AI_MEMORY_EMBEDDING_PROVIDER", "none")
+                .env("RUST_LOG", "off")
+                .env("HOME", self.home.path())
+                .env("PATH", path)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "supervise failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            std::fs::write(state.with_extension("log"), &out.stderr).unwrap();
+        }
+
+        /// What the last pass over `state` logged.
+        fn supervise_log(state: &Path) -> String {
+            std::fs::read_to_string(state.with_extension("log")).unwrap_or_default()
         }
         fn status(&self, id: &str) -> Value {
             serde_json::from_str(&self.cli(&[
@@ -289,6 +314,9 @@ mod slow {
              if [ \"$(cat {mode})\" = quota ]; then \
              echo '{{\"error\":{{\"type\":\"usage_limit_reached\",\"resets_in_seconds\":1800}}}}' >&2; \
              exit 1; fi\n\
+             if [ \"$(cat {mode})\" = byok ] && [ \"$1\" = exec ]; then \
+             echo '{{\"type\":\"error\",\"code\":\"codex_byok_restricted_by_api_credit_promo\"}}' >&2; \
+             exit 1; fi\n\
              exit 0\n",
             record = dir.join("record").display(),
             mode = dir.join("mode").display(),
@@ -378,7 +406,7 @@ mod slow {
     }
 
     #[tokio::test]
-    async fn the_supervisor_wakes_once_within_budget_and_reports_every_refusal() {
+    async fn the_supervisor_wakes_once_coalesces_and_reports_every_refusal() {
         let f = fixture().await;
         let state = f.dd().join("supervisor-1");
         f.approve(&state, false);
@@ -439,28 +467,22 @@ mod slow {
         f.supervise_once(&state);
         assert_eq!(f.calls(), 1);
 
-        // 5. The second wake spends the budget; the third is refused.
+        // 5. Mail that arrives while the woken mail is unread joins it.
         let second = f.send(SENDER, Some(SENDER_SESSION), "second").await;
         f.supervise_once(&state);
+        assert_eq!(f.calls(), 1, "a burst woke the agent twice");
+        assert_eq!(f.status(&second)["delivery"]["state"], "queued");
+        // Once the agent read what it was woken for, new mail wakes at once,
+        // and wakes are not counted per hour.
+        f.pop(&first);
+        f.supervise_once(&state);
         assert_eq!(f.calls(), 2);
+        f.pop(&second);
         let third = f.send(SENDER, Some(SENDER_SESSION), "third").await;
         f.supervise_once(&state);
-        assert_eq!(f.calls(), 2, "the hourly budget was ignored");
-        let report = f.status(&third);
-        assert_eq!(report["delivery"]["state"], "wake_failed", "{report}");
-        assert_eq!(report["delivery"]["reason"], "budget_exhausted", "{report}");
-        let receipts = f.receipts();
-        assert!(
-            receipts
-                .iter()
-                .any(|r| r["receipt"]["receipt_for"] == third.as_str()
-                    && r["receipt"]["outcome"] == "wake_failed"
-                    && r["receipt"]["reason"] == "budget_exhausted"),
-            "{receipts:?}"
-        );
-        for id in [&first, &second, &third] {
-            f.pop(id);
-        }
+        assert_eq!(f.calls(), 3, "a third wake in the hour was refused");
+        assert_eq!(f.status(&third)["delivery"]["state"], "wake_attempted");
+        f.pop(&third);
 
         // 6. Phase two: a changed binary is no longer approved.
         let state = f.dd().join("supervisor-2");
@@ -469,7 +491,7 @@ mod slow {
         std::fs::write(f.program(), format!("{script}# changed\n")).unwrap();
         let fourth = f.send(SENDER, Some(SENDER_SESSION), "fourth").await;
         f.supervise_once(&state);
-        assert_eq!(f.calls(), 2, "a changed binary ran without a new approval");
+        assert_eq!(f.calls(), 3, "a changed binary ran without a new approval");
         let report = f.status(&fourth);
         assert_eq!(report["delivery"]["reason"], "not_approved", "{report}");
 
@@ -477,7 +499,7 @@ mod slow {
         f.approve(&state, false);
         f.set_mode("quota");
         f.supervise_once(&state);
-        assert_eq!(f.calls(), 3);
+        assert_eq!(f.calls(), 4);
         let report = f.status(&fourth);
         assert_eq!(report["delivery"]["state"], "quota_exhausted", "{report}");
         assert_eq!(report["delivery"]["reason"], "quota_marker", "{report}");
@@ -498,7 +520,7 @@ mod slow {
 
         let fifth = f.send(SENDER, Some(SENDER_SESSION), "fifth").await;
         f.supervise_once(&state);
-        assert_eq!(f.calls(), 3, "the quota circuit did not hold");
+        assert_eq!(f.calls(), 4, "the quota circuit did not hold");
         let report = f.status(&fifth);
         assert_eq!(report["delivery"]["state"], "quota_exhausted", "{report}");
         assert!(report["delivery"]["retry_after"].is_string(), "{report}");
@@ -513,7 +535,7 @@ mod slow {
         f.supervise_once(&state);
         assert_eq!(
             f.calls(),
-            3,
+            4,
             "an unverified sender woke with the option off"
         );
         assert_eq!(f.status(&unverified)["delivery"]["state"], "queued");
@@ -521,14 +543,14 @@ mod slow {
         // 9. Turning the option on needs a new approval.
         f.write_config(true);
         f.supervise_once(&state);
-        assert_eq!(f.calls(), 3, "wake_unverified ran without a new approval");
+        assert_eq!(f.calls(), 4, "wake_unverified ran without a new approval");
         let report = f.status(&unverified);
         assert_eq!(report["delivery"]["reason"], "not_approved", "{report}");
 
         // 10. Approved with the option on, the unverified message wakes once.
         f.approve(&state, true);
         f.supervise_once(&state);
-        assert_eq!(f.calls(), 4);
+        assert_eq!(f.calls(), 5);
         let args = f.last_args();
         assert_eq!(args.len(), 5, "{args:?}");
         assert!(args[4].contains(&unverified), "{}", args[4]);
@@ -539,12 +561,12 @@ mod slow {
         let report = f.status(&unverified);
         assert_eq!(report["delivery"]["state"], "wake_attempted", "{report}");
         f.supervise_once(&state);
-        assert_eq!(f.calls(), 4, "the same message woke twice");
+        assert_eq!(f.calls(), 5, "the same message woke twice");
 
         // 11. An unlisted sender never wakes, even with the option on.
         let unlisted = f.send(OTHER, Some(OTHER_SESSION), "unlisted again").await;
         f.supervise_once(&state);
-        assert_eq!(f.calls(), 4, "an unlisted sender woke the agent");
+        assert_eq!(f.calls(), 5, "an unlisted sender woke the agent");
         f.pop(&unlisted);
         f.pop(&unverified);
 
@@ -554,7 +576,7 @@ mod slow {
         f.approve(&state, false);
         let itself = f.send_as(INBOX, None, Some("codex"), "to myself").await;
         f.supervise_once(&state);
-        assert_eq!(f.calls(), 4, "the agent's mail to itself woke it");
+        assert_eq!(f.calls(), 5, "the agent's mail to itself woke it");
 
         // 13. Another agent of the project wakes it, unverified mail from the
         //     listed project does not join the wake.
@@ -565,7 +587,7 @@ mod slow {
         f.supervise_once(&state);
         assert_eq!(
             f.calls(),
-            5,
+            6,
             "same-project mail did not wake the agent once"
         );
         let args = f.last_args();
@@ -595,7 +617,7 @@ mod slow {
         );
         assert_eq!(f.status(&outside)["delivery"]["state"], "queued");
         f.supervise_once(&state);
-        assert_eq!(f.calls(), 5, "the same message woke twice");
+        assert_eq!(f.calls(), 6, "the same message woke twice");
         for id in [&itself, &outside, &colleague] {
             f.pop(id);
         }
@@ -655,9 +677,10 @@ mod slow {
     async fn the_bus_wakes_a_discovered_session_from_its_own_project_only() {
         const DISCOVERED_THREAD: &str = "00000000-0000-4000-8000-000000000303";
         let f = fixture().await;
+        // The explicit approval path: no trust on first use.
         std::fs::write(
             f.dd().join("config.toml"),
-            "[messaging.supervisor]\nmax_wakes_per_hour = 20\n",
+            "[messaging.supervisor]\nmax_wakes_per_hour = 20\ntrust_on_first_use = false\n",
         )
         .unwrap();
         let state = f.dd().join("supervisor-bus");
@@ -703,7 +726,9 @@ mod slow {
         assert_eq!(f.calls(), 1, "mail from outside the project woke the agent");
         assert_eq!(f.status(&outside)["delivery"]["state"], "queued");
 
-        // 4. A changed binary voids the program approval.
+        // 4. A changed binary voids the program approval. The woken mail is
+        //    read first, so the next one is not coalesced into it.
+        pop_as(&f, "codex", &first);
         let colleague = f.send_as(INBOX, None, Some("claude-code"), "second").await;
         let script = std::fs::read_to_string(f.program()).unwrap();
         std::fs::write(f.program(), format!("{script}\n# upgraded\n")).unwrap();
@@ -713,7 +738,7 @@ mod slow {
             inbox_status(&f, &colleague)["delivery"]["reason"],
             "not_approved"
         );
-        for id in [&first, &outside, &itself, &colleague] {
+        for id in [&outside, &itself, &colleague] {
             f.pop(id);
         }
     }
@@ -816,5 +841,520 @@ mod slow {
         );
         assert_eq!(listed["rooms"][0]["unread"], 0);
         f.pop(&mention);
+    }
+
+    const CLAUDE_SESSION: &str = "00000000-0000-4000-8000-000000000304";
+    const CODEX_SESSION: &str = "00000000-0000-4000-8000-000000000303";
+    const STOPPED_THREAD: &str = "00000000-0000-4000-8000-000000000305";
+
+    /// Post one hook event for a session of `agent` in `project`.
+    async fn hook(f: &Fixture, project: &str, agent: &str, body: Value) {
+        let event = body["event"].as_str().unwrap().to_owned();
+        let resp = f
+            .client
+            .post(format!("{}/hook", f.base))
+            .query(&[
+                ("event", event.as_str()),
+                ("agent", agent),
+                ("workspace", WORKSPACE),
+                ("project", project),
+            ])
+            .header("content-type", "application/json")
+            .body(body.to_string())
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success(), "{}", resp.status());
+    }
+
+    /// Mail inside the inbox project from one harness to another.
+    async fn send_to(f: &Fixture, from_agent: &str, to_agent: &str, body: &str) -> String {
+        let text = f
+            .client
+            .post(format!("{}/mcp", f.base))
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .body(
+                json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": {"name": "memory_message_send", "arguments": {
+                        "from_workspace": WORKSPACE, "from_project": INBOX,
+                        "from_agent": from_agent,
+                        "to_workspace": WORKSPACE, "to_project": INBOX,
+                        "to_agent": to_agent, "body": body,
+                    }},
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let reply: Value = serde_json::from_str(&text).unwrap();
+        let inner = reply
+            .pointer("/result/content/0/text")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("no tool result: {text}"));
+        let sent: Value = serde_json::from_str(inner).unwrap();
+        sent["message_id"].as_str().unwrap().to_owned()
+    }
+
+    /// Wait until the server shows `agent`'s newest session in the inbox
+    /// project as open or ended (hook events are ingested asynchronously).
+    async fn wait_for_session(f: &Fixture, agent: &str, open: bool) {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let status: Value = f
+                .client
+                .get(format!("{}/inbox/bus/status", f.base))
+                .header("x-ai-memory-client", "e2e")
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let seen = status["agents"].as_array().is_some_and(|agents| {
+                agents.iter().any(|row| {
+                    row["project"] == INBOX && row["agent"] == agent && row["open"] == open
+                })
+            });
+            if seen {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{agent}: never open={open}: {status}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Run supervisor passes until `done` holds: hook events are ingested
+    /// asynchronously, so the session a test just ended may still read open
+    /// for a moment.
+    async fn supervise_until(f: &Fixture, state: &Path, done: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            f.supervise_once(state);
+            if done() {
+                return;
+            }
+            assert!(Instant::now() < deadline, "the supervisor never got there");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    fn pop_as(f: &Fixture, agent: &str, id: &str) {
+        f.cli(&[
+            "message",
+            "pop",
+            "--workspace",
+            WORKSPACE,
+            "--project",
+            INBOX,
+            "--agent",
+            agent,
+            "--id",
+            id,
+            "--json",
+        ]);
+    }
+
+    fn approvals(state: &Path) -> Value {
+        serde_json::from_str(&std::fs::read_to_string(state.join("approvals.json")).unwrap())
+            .unwrap()
+    }
+
+    /// The default path: the supervisor trusts the `codex` it finds the
+    /// first time, records path and hash, and trusts a changed binary again
+    /// with a log line instead of asking.
+    #[tokio::test]
+    async fn a_known_adapter_is_trusted_on_first_use_and_a_changed_binary_is_logged() {
+        let f = fixture().await;
+        std::fs::write(f.dd().join("config.toml"), "[messaging.supervisor]\n").unwrap();
+        let state = f.dd().join("supervisor-tofu");
+        let first = send_to(&f, "claude-code", "codex", "first").await;
+        f.supervise_once(&state);
+        assert_eq!(f.calls(), 1);
+        let trusted = &approvals(&state)["programs"]["codex_queue"];
+        assert_eq!(trusted["trusted"], "first_use", "{trusted}");
+        let program = std::fs::canonicalize(f.program()).unwrap();
+        assert_eq!(trusted["program"], program.to_str().unwrap());
+        assert!(Fixture::supervise_log(&state).contains("trusting on first use"));
+        pop_as(&f, "codex", &first);
+
+        let script = std::fs::read_to_string(f.program()).unwrap();
+        std::fs::write(f.program(), format!("{script}\n# upgraded\n")).unwrap();
+        let second = send_to(&f, "claude-code", "codex", "second").await;
+        f.supervise_once(&state);
+        assert_eq!(
+            f.calls(),
+            2,
+            "a changed binary of a known adapter was refused"
+        );
+        let trusted = &approvals(&state)["programs"]["codex_queue"];
+        assert_eq!(trusted["trusted"], "changed", "{trusted}");
+        assert!(trusted["previous_sha256"].is_string(), "{trusted}");
+        assert!(Fixture::supervise_log(&state).contains("the program changed"));
+        pop_as(&f, "codex", &second);
+    }
+
+    /// A Codex conversation nobody has open is resumed headless. When the
+    /// Codex login refuses headless turns, the supervisor reports nothing
+    /// lost: it queues the turn for when the conversation is opened, and does
+    /// not retry the refused adapter.
+    #[tokio::test]
+    async fn a_stopped_codex_conversation_is_resumed_and_a_refused_login_falls_back_to_the_queue() {
+        let f = fixture().await;
+        std::fs::write(f.dd().join("config.toml"), "[messaging.supervisor]\n").unwrap();
+        // A Codex conversation that ran in a real project directory, then
+        // ended; the fixture's own session ends too.
+        let project = tempfile::Builder::new()
+            .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+            .unwrap();
+        for (event, id) in [
+            ("session-start", STOPPED_THREAD),
+            ("session-end", STOPPED_THREAD),
+            ("session-end", CODEX_SESSION),
+        ] {
+            hook(
+                &f,
+                INBOX,
+                "codex",
+                json!({"event": event, "session_id": id, "cwd": project.path()}),
+            )
+            .await;
+        }
+        wait_for_session(&f, "codex", false).await;
+        let state = f.dd().join("supervisor-exec");
+        f.set_mode("byok");
+        let first = send_to(&f, "claude-code", "codex", "first").await;
+        supervise_until(&f, &state, || f.calls() >= 2).await;
+        assert_eq!(f.calls(), 2, "exec resume, then the queue");
+        let record = std::fs::read_to_string(f.record()).unwrap();
+        let exec: Vec<&str> = record
+            .split("CALL\n")
+            .nth(1)
+            .unwrap()
+            .lines()
+            .filter_map(|line| line.strip_prefix("ARG "))
+            .collect();
+        assert_eq!(
+            exec[..6],
+            [
+                "exec",
+                "resume",
+                "--skip-git-repo-check",
+                "-c",
+                "sandbox_mode=\"read-only\"",
+                STOPPED_THREAD
+            ]
+        );
+        assert!(exec[6].contains(&first), "{exec:?}");
+        let cwd = std::fs::canonicalize(project.path()).unwrap();
+        assert!(
+            record.contains(&format!("CWD {}", cwd.display())),
+            "{record}"
+        );
+        assert_eq!(f.last_args()[..3], ["queue", "--thread", STOPPED_THREAD]);
+        assert_eq!(
+            inbox_status(&f, &first)["delivery"]["state"],
+            "wake_attempted"
+        );
+        assert!(Fixture::supervise_log(&state).contains("auth_failed; trying codex_queue"));
+        pop_as(&f, "codex", &first);
+
+        // The refused adapter is not run again while its block lasts.
+        let second = send_to(&f, "claude-code", "codex", "second").await;
+        f.supervise_once(&state);
+        assert_eq!(f.calls(), 3);
+        assert_eq!(f.last_args()[0], "queue");
+        pop_as(&f, "codex", &second);
+
+        // With a login that allows it, the resume itself runs.
+        f.set_mode("ok");
+        let state = f.dd().join("supervisor-exec-ok");
+        let third = send_to(&f, "claude-code", "codex", "third").await;
+        f.supervise_once(&state);
+        assert_eq!(f.calls(), 4);
+        assert_eq!(f.last_args()[..2], ["exec", "resume"]);
+        pop_as(&f, "codex", &third);
+    }
+
+    /// A fake `claude`: `agents --json` lists the session as live in mode
+    /// `live`, and `-p` prints a successful JSON result.
+    fn fake_claude(dir: &Path) {
+        let script = format!(
+            "#!/bin/sh\n\
+             {{ echo CALL; for a in \"$@\"; do printf 'ARG %s\\n' \"$a\"; done; \
+             printf 'CWD %s\\n' \"$(pwd)\"; env | sed 's/^/ENV /'; }} >> {record}\n\
+             if [ \"$1\" = agents ]; then \
+             if [ \"$(cat {mode})\" = live ]; then \
+             echo '[{{\"sessionId\":\"{CLAUDE_SESSION}\",\"pid\":4242,\"status\":\"idle\"}}]'; \
+             else echo '[]'; fi; exit 0; fi\n\
+             echo '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"ok\"}}'\n",
+            record = dir.join("claude-record").display(),
+            mode = dir.join("claude-mode").display(),
+        );
+        let path = dir.join("claude");
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(dir.join("claude-mode"), "ok").unwrap();
+    }
+
+    fn claude_calls(f: &Fixture) -> Vec<Vec<String>> {
+        std::fs::read_to_string(f.bin.path().join("claude-record"))
+            .unwrap_or_default()
+            .split("CALL\n")
+            .skip(1)
+            .map(|call| call.lines().map(str::to_owned).collect())
+            .collect()
+    }
+
+    /// A stopped Claude Code session is resumed with the fixed text, the
+    /// ai-memory tools only and in its own directory, after
+    /// `claude agents --json` shows no process holding it; a live one and a
+    /// directory anyone can write are never resumed.
+    #[tokio::test]
+    async fn a_stopped_claude_session_is_resumed_in_its_directory_only_when_no_process_holds_it() {
+        let f = fixture().await;
+        std::fs::write(f.dd().join("config.toml"), "[messaging.supervisor]\n").unwrap();
+        fake_claude(f.bin.path());
+        let project = tempfile::Builder::new()
+            .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+            .unwrap();
+        hook(
+            &f,
+            INBOX,
+            "claude-code",
+            json!({"event": "session-start", "session_id": CLAUDE_SESSION,
+                   "cwd": project.path()}),
+        )
+        .await;
+        hook(
+            &f,
+            INBOX,
+            "claude-code",
+            json!({"event": "session-end", "session_id": CLAUDE_SESSION,
+                   "cwd": project.path()}),
+        )
+        .await;
+        wait_for_session(&f, "claude-code", false).await;
+        let state = f.dd().join("supervisor-claude");
+
+        // A process still holds the session: nothing is resumed.
+        std::fs::write(f.bin.path().join("claude-mode"), "live").unwrap();
+        let first = send_to(&f, "codex", "claude-code", "BODY-CANARY claude").await;
+        supervise_until(&f, &state, || !claude_calls(&f).is_empty()).await;
+        let calls = claude_calls(&f);
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert!(calls[0].iter().any(|line| line == "ARG agents"));
+        assert_eq!(inbox_status(&f, &first)["delivery"]["state"], "queued");
+
+        // Stopped: resumed in its directory with the fixed text.
+        std::fs::write(f.bin.path().join("claude-mode"), "ok").unwrap();
+        f.supervise_once(&state);
+        let calls = claude_calls(&f);
+        assert_eq!(calls.len(), 3, "probe, then the resume: {calls:?}");
+        let args: Vec<&str> = calls[2]
+            .iter()
+            .filter_map(|line| line.strip_prefix("ARG "))
+            .collect();
+        assert_eq!(args[0], "-p");
+        assert!(args[1].contains(&first), "{}", args[1]);
+        assert!(
+            !calls[2].concat().contains("CANARY"),
+            "sender text reached claude"
+        );
+        assert_eq!(args[2..4], ["--resume", CLAUDE_SESSION]);
+        assert_eq!(args[args.len() - 2..], ["--allowedTools", "mcp__ai-memory"]);
+        let cwd = std::fs::canonicalize(project.path()).unwrap();
+        assert!(
+            calls[2].contains(&format!("CWD {}", cwd.display())),
+            "{:?}",
+            calls[2]
+        );
+        assert!(
+            !calls[2]
+                .iter()
+                .any(|line| line.starts_with("ENV AI_MEMORY"))
+        );
+        assert!(
+            !calls[2]
+                .iter()
+                .any(|line| line.starts_with("ENV CLAUDE_CODE_"))
+        );
+        assert_eq!(
+            inbox_status(&f, &first)["delivery"]["state"],
+            "wake_attempted"
+        );
+        pop_as(&f, "claude-code", &first);
+
+        // A directory every user can write is not trusted to run a resume.
+        std::fs::set_permissions(project.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        let second = send_to(&f, "codex", "claude-code", "second").await;
+        f.supervise_once(&state);
+        assert_eq!(claude_calls(&f).len(), 4, "only the probe ran");
+        let status = inbox_status(&f, &second);
+        assert_eq!(
+            status["delivery"]["reason"], "session_not_found",
+            "{status}"
+        );
+        std::fs::set_permissions(project.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        pop_as(&f, "claude-code", &second);
+    }
+
+    /// The loop guard through the real server and supervisor: three copies
+    /// of one body pause the pair, the mail stays readable but wakes nobody
+    /// and is reported `loop_suspected`, and a human prompt resumes it.
+    #[tokio::test]
+    async fn a_pair_that_repeats_itself_is_paused_until_a_human_prompt() {
+        let f = fixture().await;
+        std::fs::write(f.dd().join("config.toml"), "[messaging.supervisor]\n").unwrap();
+        let state = f.dd().join("supervisor-loop");
+        let mut ids = Vec::new();
+        for n in 1..=3 {
+            ids.push(
+                send_to(
+                    &f,
+                    "claude-code",
+                    "codex",
+                    &format!("Ping {n}: still waiting"),
+                )
+                .await,
+            );
+        }
+        f.supervise_once(&state);
+        assert_eq!(f.calls(), 0, "a paused pair woke the agent");
+        for id in &ids {
+            let status = inbox_status(&f, id);
+            assert_eq!(status["delivery"]["reason"], "loop_suspected", "{status}");
+        }
+        assert!(Fixture::supervise_log(&state).contains("loop suspected"));
+
+        hook(
+            &f,
+            INBOX,
+            "codex",
+            json!({"event": "user-prompt-submit", "session_id": CODEX_SESSION,
+                   "prompt": "carry on with the review"}),
+        )
+        .await;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            f.supervise_once(&state);
+            if f.calls() == 1 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the human prompt did not resume the pair"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        for id in &ids {
+            pop_as(&f, "codex", id);
+        }
+    }
+
+    /// The Claude Code `Stop` hook: `message watch --rewake` blocks until
+    /// mail from another agent of the project arrives, then exits 2 with
+    /// the fixed wake text on stderr; mail it already announced, or the
+    /// agent's own mail, does not wake the session again.
+    #[tokio::test]
+    async fn the_rewake_hook_exits_2_once_for_new_mail_from_another_agent() {
+        use std::io::Write as _;
+        let f = fixture().await;
+        hook(
+            &f,
+            INBOX,
+            "claude-code",
+            json!({"event": "session-start", "session_id": CLAUDE_SESSION}),
+        )
+        .await;
+        wait_for_session(&f, "claude-code", true).await;
+        let spawn = || {
+            let mut child = hermetic(BIN)
+                .args([
+                    "message",
+                    "watch",
+                    "--rewake",
+                    "--agent",
+                    "claude-code",
+                    "--workspace",
+                    WORKSPACE,
+                    "--project",
+                    INBOX,
+                ])
+                .env("AI_MEMORY_DATA_DIR", f.dd())
+                .env("AI_MEMORY_HOME", f.home.path())
+                .env("AI_MEMORY_SERVER_URL", &f.base)
+                .env("AI_MEMORY_EMBEDDING_PROVIDER", "none")
+                .env("RUST_LOG", "off")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut stdin = child.stdin.take().unwrap();
+            write!(
+                stdin,
+                r#"{{"session_id":"{CLAUDE_SESSION}","hook_event_name":"Stop","stop_hook_active":false}}"#
+            )
+            .unwrap();
+            drop(stdin);
+            child
+        };
+        let wait = |child: &mut std::process::Child, secs: u64| {
+            let deadline = Instant::now() + Duration::from_secs(secs);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    return Some(status);
+                }
+                if Instant::now() > deadline {
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        };
+
+        let mut hook_process = spawn();
+        std::thread::sleep(Duration::from_millis(1_500));
+        assert!(
+            hook_process.try_wait().unwrap().is_none(),
+            "it exited with no mail"
+        );
+        // The agent's own mail does not wake it.
+        let own = send_to(&f, "claude-code", "claude-code", "a note to myself").await;
+        assert!(wait(&mut hook_process, 2).is_none(), "its own mail woke it");
+        let id = send_to(&f, "codex", "claude-code", "BODY-CANARY review done").await;
+        let status = wait(&mut hook_process, 15).expect("new mail did not wake the session");
+        assert_eq!(status.code(), Some(2));
+        let out = hook_process.wait_with_output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.starts_with("ai-memory: 1 new message(s) for claude-code"),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains(&id) && !stderr.contains("CANARY"),
+            "{stderr}"
+        );
+        assert!(out.stdout.is_empty());
+        assert_eq!(inbox_status(&f, &id)["delivery"]["state"], "wake_attempted");
+
+        // The next turn's hook does not announce the same mail again.
+        let mut again = spawn();
+        assert!(
+            wait(&mut again, 3).is_none(),
+            "announced mail woke the session twice"
+        );
+        let _ = again.kill();
+        let _ = again.wait();
+        pop_as(&f, "claude-code", &id);
+        pop_as(&f, "claude-code", &own);
     }
 }

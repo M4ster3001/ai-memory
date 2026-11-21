@@ -41,8 +41,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ai_memory_core::message_wake::{
-    AdapterKind, AdapterRun, WakeAdapter, WakeBudget, WakeGate, WakeHandleKind, WakeLedger,
-    WakeOutcome, wake_text,
+    AdapterKind, AdapterRun, ClaudeSessionPresence, WakeAdapter, WakeGate, WakeHandleKind,
+    WakeLedger, WakeOutcome, adapter_for_session, claude_session_presence, wake_text,
 };
 use ai_memory_core::{AgentKind, DeliveryReason, DeliveryState, MessageId};
 use anyhow::{Context as _, Result};
@@ -159,8 +159,19 @@ struct Entry {
     wake_unverified: bool,
     adapter: WakeAdapter,
     program: PathBuf,
-    budget: WakeBudget,
     timeout: Duration,
+    /// The session a discovered entry reaches, as the bus reported it.
+    session: Option<DiscoveredSession>,
+}
+
+/// What the bus reported about a discovered agent's newest session.
+#[derive(Debug, Clone)]
+struct DiscoveredSession {
+    kind: WakeHandleKind,
+    handle: String,
+    /// The directory the session ran in, for an adapter that resumes it
+    /// there. Checked again before every run.
+    cwd: Option<PathBuf>,
 }
 
 impl Entry {
@@ -176,16 +187,15 @@ impl Entry {
             wake_unverified: raw.wake_unverified,
             adapter: raw.adapter.adapter()?,
             program: raw.adapter.program().to_path_buf(),
-            budget: WakeBudget {
-                per_hour: raw.wakes_per_hour,
-                per_day: raw.wakes_per_day,
-            },
             timeout: Duration::from_secs(u64::from(raw.timeout_secs)),
+            session: None,
         })
     }
 
     /// The entry for an agent the bus reported, or `None` when this build
-    /// has no adapter for its handle kind or the handle is not valid for it.
+    /// has no adapter for its handle kind in the session's state (an open
+    /// Claude Code session is woken by its own `Stop` hook) or the handle is
+    /// not valid for it.
     fn discovered(target: &BusAgent) -> Option<Self> {
         let agent = AgentKind::from_wire(&target.agent);
         if agent.as_str() != target.agent {
@@ -195,7 +205,8 @@ impl Entry {
         if WakeHandleKind::for_agent(agent) != Some(kind) {
             return None;
         }
-        let adapter = AdapterKind::for_handle(kind, &target.handle.id)?;
+        let adapter_kind = adapter_for_session(kind, target.handle.open)?;
+        let adapter = adapter_kind.for_handle(kind, &target.handle.id)?;
         Some(Self {
             name: format!("{}/{}/{}", target.workspace, target.project, agent.as_str()),
             origin: Origin::Discovered,
@@ -207,11 +218,23 @@ impl Entry {
             wake_unverified: false,
             adapter,
             program: PathBuf::new(),
-            budget: WakeBudget {
-                per_hour: crate::config::DEFAULT_WAKES_PER_HOUR,
-                per_day: crate::config::DEFAULT_WAKES_PER_DAY,
-            },
-            timeout: Duration::from_secs(u64::from(crate::config::DEFAULT_WAKE_TIMEOUT_SECS)),
+            timeout: Duration::from_secs(u64::from(adapter_kind.timeout_secs())),
+            session: Some(DiscoveredSession {
+                kind,
+                handle: target.handle.id.clone(),
+                cwd: target.handle.cwd.as_deref().map(PathBuf::from),
+            }),
+        })
+    }
+
+    /// The same agent reached through `kind` instead (a fallback adapter).
+    fn with_adapter(&self, kind: AdapterKind) -> Option<Self> {
+        let session = self.session.as_ref()?;
+        let adapter = kind.for_handle(session.kind, &session.handle)?;
+        Some(Self {
+            adapter,
+            timeout: Duration::from_secs(u64::from(kind.timeout_secs())),
+            ..self.clone()
         })
     }
 }
@@ -403,7 +426,7 @@ fn program_digest(kind: AdapterKind, program: &CheckedProgram, cwd: &Path) -> St
         program.path.to_string_lossy().into_owned(),
         program.sha256.clone(),
         cwd.to_string_lossy().into_owned(),
-        crate::config::DEFAULT_WAKE_TIMEOUT_SECS.to_string(),
+        kind.timeout_secs().to_string(),
     ];
     let mut hasher = Sha256::new();
     for part in &parts {
@@ -429,6 +452,14 @@ struct Approval {
     program: PathBuf,
     sha256: String,
     approved_at: String,
+    /// How a program record was made: `terminal` for an explicit approval,
+    /// `first_use` when the supervisor trusted it on first use, `changed`
+    /// when it trusted a new binary at the recorded path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    trusted: Option<String>,
+    /// The SHA-256 the record had before a `changed` trust.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    previous_sha256: Option<String>,
 }
 
 impl Approvals {
@@ -537,7 +568,7 @@ fn prepare_state_dir(state_dir: &Path) -> Result<Option<u32>> {
     Ok(None)
 }
 
-fn temp_roots() -> Vec<PathBuf> {
+pub(super) fn temp_roots() -> Vec<PathBuf> {
     TEMP_ROOTS
         .iter()
         .filter_map(|root| std::fs::canonicalize(root).ok())
@@ -688,35 +719,38 @@ struct WatchedMessage {
 }
 
 #[derive(Debug, Serialize)]
-struct CandidatesRequest<'a> {
-    workspace: &'a str,
-    project: &'a str,
-    agent: &'a str,
-    include_shared: bool,
-    wake_from: &'a [WakeFrom],
+pub(super) struct CandidatesRequest<'a> {
+    pub(super) workspace: &'a str,
+    pub(super) project: &'a str,
+    pub(super) agent: &'a str,
+    pub(super) include_shared: bool,
+    pub(super) wake_from: &'a [WakeFrom],
 }
 
 #[derive(Debug, Deserialize)]
-struct CandidatesReply {
-    messages: Vec<Candidate>,
+pub(super) struct CandidatesReply {
+    pub(super) messages: Vec<Candidate>,
     unresolved_wake_from: usize,
 }
 
 #[derive(Debug, Deserialize)]
-struct Candidate {
-    id: String,
-    sender: CandidateSender,
+pub(super) struct Candidate {
+    pub(super) id: String,
+    pub(super) sender: CandidateSender,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum CandidateSender {
+pub(super) enum CandidateSender {
     SameProject,
     SameAgent,
     Listed,
     Unverified,
     Unlisted,
     System,
+    /// The server's loop guard paused wakes between the sender and this
+    /// agent. Never wakes; reported as `wake_failed/loop_suspected`.
+    Paused,
     /// A label a newer server sends that this supervisor does not know.
     /// It never wakes.
     #[serde(other)]
@@ -724,20 +758,20 @@ enum CandidateSender {
 }
 
 #[derive(Debug, Serialize)]
-struct ReportRequest<'a> {
-    workspace: &'a str,
-    project: &'a str,
-    agent: &'a str,
-    message_ids: &'a [String],
-    state: DeliveryState,
+pub(super) struct ReportRequest<'a> {
+    pub(super) workspace: &'a str,
+    pub(super) project: &'a str,
+    pub(super) agent: &'a str,
+    pub(super) message_ids: &'a [String],
+    pub(super) state: DeliveryState,
     #[serde(skip_serializing_if = "Option::is_none")]
-    reason: Option<DeliveryReason>,
+    pub(super) reason: Option<DeliveryReason>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    retry_after_secs: Option<u64>,
+    pub(super) retry_after_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
-struct ReportReply {
+pub(super) struct ReportReply {
     updated: usize,
     receipts: usize,
 }
@@ -764,6 +798,16 @@ struct BusAgent {
 struct BusHandle {
     kind: String,
     id: String,
+    /// Whether the session is still open. A server that predates the field
+    /// is read as open, which never resumes a session.
+    #[serde(default = "open_by_default")]
+    open: bool,
+    #[serde(default)]
+    cwd: Option<String>,
+}
+
+const fn open_by_default() -> bool {
+    true
 }
 
 /// The messages of `candidates` that may wake `entry`, in server order:
@@ -781,13 +825,119 @@ fn wakeable(entry: &Entry, candidates: &[Candidate], fresh: &[String]) -> Vec<St
             CandidateSender::SameProject | CandidateSender::Listed => true,
             CandidateSender::Unverified => entry.wake_unverified,
             CandidateSender::System => entry.adapter.wakes_live_session(),
-            CandidateSender::SameAgent | CandidateSender::Unlisted | CandidateSender::Unknown => {
-                false
-            }
+            CandidateSender::SameAgent
+            | CandidateSender::Unlisted
+            | CandidateSender::Paused
+            | CandidateSender::Unknown => false,
         })
         .filter_map(|candidate| canonical_message_id(&candidate.id))
         .filter(|id| fresh.contains(id.as_str()))
         .collect()
+}
+
+/// The fresh messages the server labelled `paused`: mail between two agents
+/// its loop guard stopped waking.
+fn paused_ids(candidates: &[Candidate], fresh: &[String]) -> Vec<String> {
+    let fresh: HashSet<&str> = fresh.iter().map(String::as_str).collect();
+    candidates
+        .iter()
+        .filter(|candidate| candidate.sender == CandidateSender::Paused)
+        .filter_map(|candidate| canonical_message_id(&candidate.id))
+        .filter(|id| fresh.contains(id.as_str()))
+        .collect()
+}
+
+/// Largest `claude agents --json` answer read.
+const PROBE_KEEP_BYTES: usize = 256 * 1024;
+/// How long `claude agents --json` may take.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Ask `claude agents --json` whether a live process holds `session`, with
+/// the same program, environment and protections as a wake. Anything but a
+/// clean answer is [`ClaudeSessionPresence::Unknown`].
+async fn claude_presence(
+    program: &CheckedProgram,
+    cwd: &Path,
+    env: &[(OsString, OsString)],
+    session: &str,
+) -> ClaudeSessionPresence {
+    let mut command = tokio::process::Command::new(&program.path);
+    command
+        .args(["agents", "--json"])
+        .env_clear()
+        .envs(env.iter().map(|(key, value)| (key, value)))
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
+    let Ok(mut child) = command.spawn() else {
+        return ClaudeSessionPresence::Unknown;
+    };
+    let pid = child.id();
+    let Some(mut stdout) = child.stdout.take() else {
+        return ClaudeSessionPresence::Unknown;
+    };
+    let read = async {
+        let mut kept = Vec::new();
+        let mut buf = [0_u8; 8_192];
+        while let Ok(n) = stdout.read(&mut buf).await {
+            if n == 0 {
+                break;
+            }
+            let room = PROBE_KEEP_BYTES.saturating_sub(kept.len());
+            kept.extend_from_slice(&buf[..n.min(room)]);
+        }
+        let status = child.wait().await;
+        (kept, status)
+    };
+    match tokio::time::timeout(PROBE_TIMEOUT, read).await {
+        Ok((kept, Ok(status))) if status.success() && kept.len() < PROBE_KEEP_BYTES => {
+            claude_session_presence(&String::from_utf8_lossy(&kept), session)
+        }
+        Ok(_) => ClaudeSessionPresence::Unknown,
+        Err(_) => {
+            kill_group(pid).await;
+            ClaudeSessionPresence::Unknown
+        }
+    }
+}
+
+/// Check the directory a resumed session runs in: an existing absolute
+/// directory owned by the operator, not writable by every user and not
+/// under a temporary directory. A session's directory comes from its hook
+/// events, so it is checked like a program before anything runs there.
+fn check_session_dir(
+    dir: &Path,
+    owner: Option<u32>,
+    temp_roots: &[PathBuf],
+) -> Result<PathBuf, &'static str> {
+    if !dir.is_absolute() {
+        return Err("the session directory is not absolute");
+    }
+    let path = std::fs::canonicalize(dir).map_err(|_| "the session directory no longer exists")?;
+    let meta = std::fs::metadata(&path).map_err(|_| "the session directory no longer exists")?;
+    if !meta.is_dir() {
+        return Err("the session directory is not a directory");
+    }
+    if temp_roots.iter().any(|root| path.starts_with(root)) {
+        return Err("the session directory is under a temporary directory");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        if meta.permissions().mode() & 0o002 != 0 {
+            return Err("the session directory is world-writable");
+        }
+        if owner.is_some_and(|uid| meta.uid() != uid) {
+            return Err("the session directory is owned by another user");
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = owner;
+    Ok(path)
 }
 
 /// The server answered 404: it predates the route.
@@ -822,7 +972,7 @@ impl LedgerFile {
     fn save(&self) {
         if let Err(error) = save_json(&self.path, &self.ledger) {
             log(&format!(
-                "could not save the wake ledger ({}); budgets may reset on restart",
+                "could not save the wake ledger ({}); circuits may reset on restart",
                 error.root_cause()
             ));
         }
@@ -837,13 +987,21 @@ struct Supervisor {
     approvals_path: PathBuf,
     owner: Option<u32>,
     temp_roots: Vec<PathBuf>,
-    global_per_hour: u32,
+    trust_on_first_use: bool,
     ledger: tokio::sync::Mutex<LedgerFile>,
     permits: tokio::sync::Semaphore,
     activity: std::sync::Mutex<Instant>,
     /// Discovered agents with a wake running or queued, so one agent never
     /// has two.
     in_flight: std::sync::Mutex<HashSet<String>>,
+    /// Serializes changes to `approvals.json`.
+    trust: tokio::sync::Mutex<()>,
+}
+
+/// Why a wake was not launched, already reported or logged.
+enum Skip {
+    /// Reported to the server (or a gate that reports nothing).
+    Done,
 }
 
 impl Supervisor {
@@ -951,6 +1109,19 @@ impl Supervisor {
                 entry.name, candidates.unresolved_wake_from
             ));
         }
+        let paused = paused_ids(&candidates.messages, &fresh);
+        if !paused.is_empty() {
+            let outcome = WakeOutcome::Failed(DeliveryReason::LoopSuspected);
+            if self.report_once(entry, &paused, outcome).await {
+                log(&format!(
+                    "{}: not woken for {} message(s): the server paused wakes between this agent \
+                     and their sender (loop suspected); a human prompt in either session or the \
+                     dashboard resumes them",
+                    entry.name,
+                    paused.len()
+                ));
+            }
+        }
         let ids = wakeable(entry, &candidates.messages, &fresh);
         if ids.is_empty() {
             return Ok(());
@@ -958,68 +1129,16 @@ impl Supervisor {
         // One agent's wakes run one at a time in its own task; the permit
         // bounds how many agents are woken at once.
         let _permit = self.permits.acquire().await?;
-        let approvals: Approvals = load_json(&self.config, &self.approvals_path);
-        let Some(configured) = approvals.program_for(entry) else {
-            let outcome = WakeOutcome::Failed(DeliveryReason::NotApproved);
-            if self.report_once(entry, &ids, outcome).await {
-                log(&format!(
-                    "{}: not woken: no program is approved for the {} adapter; run \
-                     `ai-memory message supervise approve --adapter {}` in a terminal",
-                    entry.name,
-                    entry.adapter.id(),
-                    entry.adapter.id()
-                ));
-            }
-            return Ok(());
-        };
-        let (owner, roots) = (self.owner, self.temp_roots.clone());
-        let program =
-            tokio::task::spawn_blocking(move || check_program(&configured, owner, &roots))
-                .await
-                .unwrap_or(Err(ProgramProblem::Missing));
-        let program = match program {
-            Ok(program) => program,
-            Err(problem) => {
-                if self.report_once(entry, &ids, problem.outcome()).await {
-                    log(&format!(
-                        "{}: not woken: {}",
-                        entry.name,
-                        problem.describe()
-                    ));
-                }
-                return Ok(());
-            }
-        };
-        if !approvals.approves_entry(entry, &program, &self.cwd) {
-            let outcome = WakeOutcome::Failed(DeliveryReason::NotApproved);
-            if self.report_once(entry, &ids, outcome).await {
-                let command = match entry.origin {
-                    Origin::Configured => format!("approve {}", entry.name),
-                    Origin::Discovered => format!("approve --adapter {}", entry.adapter.id()),
-                };
-                log(&format!(
-                    "{}: not woken: the adapter is not approved, or its program or entry changed \
-                     since; run `ai-memory message supervise {command}` in a terminal",
-                    entry.name
-                ));
-            }
-            return Ok(());
-        }
         let now = now_secs();
-        let gate = {
-            let mut file = self.ledger.lock().await;
-            let gate = file
-                .ledger
-                .gate(&entry.name, entry.budget, self.global_per_hour, now);
-            if gate == WakeGate::Open {
-                file.ledger.reserve_launch(&entry.name, now);
-                file.save();
-            }
-            gate
-        };
+        let gate = self
+            .ledger
+            .lock()
+            .await
+            .ledger
+            .gate(&entry.name, pending, now);
         match gate {
             WakeGate::Open => {}
-            WakeGate::Backoff { .. } => return Ok(()),
+            WakeGate::Backoff { .. } | WakeGate::Coalescing { .. } => return Ok(()),
             WakeGate::Quota { until, stated } => {
                 let retry_after_secs = stated
                     .then(|| u64::try_from(until.saturating_sub(now)).ok())
@@ -1033,16 +1152,113 @@ impl Supervisor {
                 .await;
                 return Ok(());
             }
-            WakeGate::BudgetExhausted => {
-                let outcome = WakeOutcome::Failed(DeliveryReason::BudgetExhausted);
-                if self.report_once(entry, &ids, outcome).await {
-                    log(&format!("{}: not woken: wake budget spent", entry.name));
+        }
+        let mut attempt = entry.clone();
+        loop {
+            let kind = attempt.adapter.kind();
+            let blocked = self
+                .ledger
+                .lock()
+                .await
+                .ledger
+                .auth_blocked_until(kind, now);
+            let outcome = if blocked.is_some() {
+                WakeOutcome::Unavailable(DeliveryReason::AuthFailed)
+            } else {
+                match self.launch(&attempt, &ids).await {
+                    Ok(outcome) => outcome,
+                    Err(Skip::Done) => return Ok(()),
                 }
-                return Ok(());
+            };
+            let next = matches!(
+                outcome,
+                WakeOutcome::Failed(DeliveryReason::SessionBusy)
+                    | WakeOutcome::Unavailable(DeliveryReason::AuthFailed)
+            )
+            .then(|| kind.fallback())
+            .flatten()
+            .and_then(|fallback| attempt.with_adapter(fallback));
+            if let Some(next) = next {
+                log(&format!(
+                    "{}: {} {}; trying {}",
+                    entry.name,
+                    kind.id(),
+                    outcome
+                        .reason()
+                        .map_or(outcome.state().as_str(), DeliveryReason::as_str),
+                    next.adapter.id()
+                ));
+                attempt = next;
+                continue;
+            }
+            if blocked.is_some() {
+                self.report_once(&attempt, &ids, outcome).await;
+            } else {
+                self.report(&attempt, &ids, outcome).await;
+            }
+            return Ok(());
+        }
+    }
+
+    /// Run `entry`'s adapter once for `ids`, after its program is trusted
+    /// and, for a Claude Code resume, after `claude agents --json` shows no
+    /// live process for the session. Records the outcome in the ledger.
+    async fn launch(&self, entry: &Entry, ids: &[String]) -> Result<WakeOutcome, Skip> {
+        let program = self.trusted_program(entry, ids).await?;
+        let kind = entry.adapter.kind();
+        let env = wake_env(&entry.adapter, &program, &self.config.runtime_env);
+        if kind == AdapterKind::ClaudeResume {
+            let presence = claude_presence(&program, &self.cwd, &env, entry.adapter.target()).await;
+            match presence {
+                ClaudeSessionPresence::Absent => {}
+                ClaudeSessionPresence::Live => {
+                    log(&format!(
+                        "{}: not resumed: a Claude Code process holds the session; its Stop hook \
+                         wakes it",
+                        entry.name
+                    ));
+                    return Err(Skip::Done);
+                }
+                ClaudeSessionPresence::Unknown => {
+                    let outcome = WakeOutcome::Failed(DeliveryReason::SessionBusy);
+                    if self.report_once(entry, ids, outcome).await {
+                        log(&format!(
+                            "{}: not resumed: `claude agents --json` did not answer, so the \
+                             session may be live",
+                            entry.name
+                        ));
+                    }
+                    return Err(Skip::Done);
+                }
             }
         }
+        let run_dir = if kind.runs_in_session_dir() {
+            let dir = entry
+                .session
+                .as_ref()
+                .and_then(|session| session.cwd.clone());
+            let (owner, roots) = (self.owner, self.temp_roots.clone());
+            let checked = tokio::task::spawn_blocking(move || {
+                dir.ok_or("the session has no recorded directory")
+                    .and_then(|dir| check_session_dir(&dir, owner, &roots))
+            })
+            .await
+            .unwrap_or(Err("the session directory could not be checked"));
+            match checked {
+                Ok(dir) => dir,
+                Err(why) => {
+                    let outcome = WakeOutcome::Failed(DeliveryReason::SessionNotFound);
+                    if self.report_once(entry, ids, outcome).await {
+                        log(&format!("{}: not resumed: {why}", entry.name));
+                    }
+                    return Err(Skip::Done);
+                }
+            }
+        } else {
+            self.cwd.clone()
+        };
         let Some(newest) = ids.last().and_then(|id| id.parse::<MessageId>().ok()) else {
-            return Ok(());
+            return Err(Skip::Done);
         };
         let text = wake_text(
             entry.agent,
@@ -1051,11 +1267,10 @@ impl Supervisor {
             ids.len(),
             newest,
         );
-        let env = wake_env(&entry.adapter, &program, &self.config.runtime_env);
         let outcome = execute(
             &entry.adapter,
             &program,
-            &self.cwd,
+            &run_dir,
             &env,
             &text,
             entry.timeout,
@@ -1064,7 +1279,7 @@ impl Supervisor {
         {
             let mut file = self.ledger.lock().await;
             file.ledger
-                .record_outcome(&entry.name, &ids, outcome, now_secs());
+                .record_outcome(&entry.name, kind, ids, outcome, now_secs());
             file.save();
         }
         log(&format!(
@@ -1076,8 +1291,159 @@ impl Supervisor {
                 .reason()
                 .map_or(outcome.state().as_str(), DeliveryReason::as_str),
         ));
-        self.report(entry, &ids, outcome).await;
-        Ok(())
+        Ok(outcome)
+    }
+
+    /// Tell the server which program the supervisor now trusts, so the audit
+    /// log and the dashboard show it. Best effort: an older server without
+    /// the route, or one that is down, only costs the record.
+    async fn report_program(
+        &self,
+        kind: AdapterKind,
+        program: &CheckedProgram,
+        previous_sha256: Option<&str>,
+    ) {
+        let body = serde_json::json!({
+            "adapter": kind.id(),
+            "program": program.path.to_string_lossy(),
+            "sha256": program.sha256,
+            "previous_sha256": previous_sha256,
+            "trusted": if previous_sha256.is_some() { "changed" } else { "first_use" },
+        });
+        let sent: Result<serde_json::Value> = post_json_bounded(
+            &self.endpoint,
+            "/inbox/bus/program",
+            &body,
+            REQUEST_TIMEOUT,
+            MAX_REPLY_BYTES,
+        )
+        .await;
+        if let Err(error) = sent {
+            // A 204 has no JSON body to read; only a refusal matters.
+            if refused_credential(&error).is_some() || not_found(&error) {
+                log(&format!(
+                    "{} adapter: the server did not record the program ({})",
+                    kind.id(),
+                    error.root_cause()
+                ));
+            }
+        }
+    }
+
+    /// The checked program `entry` runs. A configured entry needs its
+    /// terminal approval. A discovered entry's adapter program is trusted on
+    /// first use (or after a change of its binary) when the settings allow
+    /// it, after the same file checks; otherwise it needs
+    /// `message supervise approve --adapter`.
+    async fn trusted_program(&self, entry: &Entry, ids: &[String]) -> Result<CheckedProgram, Skip> {
+        let _trust = self.trust.lock().await;
+        let mut approvals: Approvals = load_json(&self.config, &self.approvals_path);
+        let kind = entry.adapter.kind();
+        let recorded = approvals.program_for(entry);
+        let configured = match (&recorded, entry.origin) {
+            (Some(path), _) => Some(path.clone()),
+            (None, Origin::Discovered) if self.trust_on_first_use => {
+                locate_program(&self.config.runtime_env, kind, None)
+            }
+            (None, _) => None,
+        };
+        let Some(configured) = configured else {
+            let outcome = if entry.origin == Origin::Discovered && self.trust_on_first_use {
+                WakeOutcome::Unavailable(DeliveryReason::BinaryMissing)
+            } else {
+                WakeOutcome::Failed(DeliveryReason::NotApproved)
+            };
+            if self.report_once(entry, ids, outcome).await {
+                log(&format!(
+                    "{}: not woken: no {} program was found for the {} adapter{}",
+                    entry.name,
+                    kind.program_name(),
+                    kind.id(),
+                    if self.trust_on_first_use {
+                        " on PATH"
+                    } else {
+                        "; run `ai-memory message supervise approve --adapter` in a terminal"
+                    }
+                ));
+            }
+            return Err(Skip::Done);
+        };
+        let (owner, roots) = (self.owner, self.temp_roots.clone());
+        let program =
+            tokio::task::spawn_blocking(move || check_program(&configured, owner, &roots))
+                .await
+                .unwrap_or(Err(ProgramProblem::Missing));
+        let program = match program {
+            Ok(program) => program,
+            Err(problem) => {
+                if self.report_once(entry, ids, problem.outcome()).await {
+                    log(&format!(
+                        "{}: not woken: {}",
+                        entry.name,
+                        problem.describe()
+                    ));
+                }
+                return Err(Skip::Done);
+            }
+        };
+        if approvals.approves_entry(entry, &program, &self.cwd) {
+            return Ok(program);
+        }
+        if entry.origin == Origin::Discovered && self.trust_on_first_use {
+            let previous = approvals.programs.get(kind.id()).cloned();
+            let changed = previous.is_some();
+            let previous_sha = previous.as_ref().map(|approval| approval.sha256.clone());
+            approvals.programs.insert(
+                kind.id().to_owned(),
+                Approval {
+                    digest: program_digest(kind, &program, &self.cwd),
+                    program: program.path.clone(),
+                    sha256: program.sha256.clone(),
+                    approved_at: jiff::Timestamp::now().to_string(),
+                    trusted: Some(if changed { "changed" } else { "first_use" }.to_owned()),
+                    previous_sha256: previous.map(|approval| approval.sha256),
+                },
+            );
+            if let Err(error) = save_json(&self.approvals_path, &approvals) {
+                log(&format!(
+                    "{}: could not record trust in {} ({})",
+                    entry.name,
+                    kind.program_name(),
+                    error.root_cause()
+                ));
+            }
+            self.report_program(
+                kind,
+                &program,
+                changed.then_some(previous_sha.as_deref()).flatten(),
+            )
+            .await;
+            log(&format!(
+                "{} adapter: {} {} (sha256 {})",
+                kind.id(),
+                if changed {
+                    "the program changed; trusting the new binary at"
+                } else {
+                    "trusting on first use"
+                },
+                program.path.display(),
+                program.sha256
+            ));
+            return Ok(program);
+        }
+        let outcome = WakeOutcome::Failed(DeliveryReason::NotApproved);
+        if self.report_once(entry, ids, outcome).await {
+            let command = match entry.origin {
+                Origin::Configured => format!("approve {}", entry.name),
+                Origin::Discovered => format!("approve --adapter {}", kind.id()),
+            };
+            log(&format!(
+                "{}: not woken: the adapter is not approved, or its program or entry changed \
+                 since; run `ai-memory message supervise {command}` in a terminal",
+                entry.name
+            ));
+        }
+        Err(Skip::Done)
     }
 
     /// Whether a configured entry already supervises this inbox and harness;
@@ -1338,7 +1704,7 @@ async fn supervise(config: &Config, state_dir: &Path, once: bool) -> Result<i32>
         approvals_path,
         owner,
         temp_roots: roots,
-        global_per_hour: settings.max_wakes_per_hour,
+        trust_on_first_use: settings.trust_on_first_use,
         ledger: tokio::sync::Mutex::new(LedgerFile {
             ledger: load_json(config, &ledger_path),
             path: ledger_path,
@@ -1348,6 +1714,7 @@ async fn supervise(config: &Config, state_dir: &Path, once: bool) -> Result<i32>
         ),
         activity: std::sync::Mutex::new(Instant::now()),
         in_flight: std::sync::Mutex::new(HashSet::new()),
+        trust: tokio::sync::Mutex::new(()),
         entries,
     });
     log(&format!(
@@ -1532,6 +1899,8 @@ fn approve_interactive(
             program: program.path.clone(),
             sha256: program.sha256.clone(),
             approved_at: jiff::Timestamp::now().to_string(),
+            trusted: Some("terminal".to_owned()),
+            previous_sha256: None,
         },
     );
     save_json(approvals_path, &approvals)
@@ -1589,12 +1958,35 @@ fn approve_command(config: &Config, state_dir: &Path, name: &str) -> Result<i32>
 
 /// The program to approve for `kind`: the one named, or the first executable
 /// file called [`AdapterKind::program_name`] on `PATH`.
+/// The program a discovered agent's adapter would be trusted with, as the
+/// supervisor looks for it.
+pub(super) fn find_program(env: &RuntimeEnv, kind: AdapterKind) -> Option<PathBuf> {
+    locate_program(env, kind, None)
+}
+
+/// Where a harness installs its command line besides `PATH`, under the
+/// operator's home: a user service starts with a short `PATH`.
+const HOME_BIN_DIRS: &[&str] = &[".local/bin", "bin", ".npm-global/bin", ".bun/bin"];
+/// System directories searched after `PATH`.
+const EXTRA_BIN_DIRS: &[&str] = &["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"];
+
 fn locate_program(env: &RuntimeEnv, kind: AdapterKind, named: Option<&Path>) -> Option<PathBuf> {
     if let Some(named) = named {
         return Some(named.to_path_buf());
     }
-    let path = env.var_os("PATH")?;
-    std::env::split_paths(&path)
+    let path_dirs = env
+        .var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let home_dirs = env
+        .var_os("HOME")
+        .map(PathBuf::from)
+        .into_iter()
+        .flat_map(|home| HOME_BIN_DIRS.iter().map(move |dir| home.join(dir)));
+    path_dirs
+        .into_iter()
+        .chain(home_dirs)
+        .chain(EXTRA_BIN_DIRS.iter().map(PathBuf::from))
         .filter(|dir| dir.is_absolute())
         .map(|dir| dir.join(kind.program_name()))
         .find(|candidate| candidate.is_file())
@@ -1706,6 +2098,8 @@ fn approve_program_interactive(
             program: program.path.clone(),
             sha256: program.sha256.clone(),
             approved_at: jiff::Timestamp::now().to_string(),
+            trusted: Some("terminal".to_owned()),
+            previous_sha256: None,
         },
     );
     save_json(approvals_path, &approvals)
@@ -1836,10 +2230,7 @@ mod tests {
                 conversation: ai_memory_core::message_wake::ConversationRef::parse(ID).unwrap(),
             },
             program: program.to_path_buf(),
-            budget: WakeBudget {
-                per_hour: 4,
-                per_day: 24,
-            },
+            session: None,
             timeout: Duration::from_secs(60),
         }
     }
@@ -1919,8 +2310,11 @@ mod tests {
         ));
     }
 
-    #[cfg(unix)]
     fn bus_agent(agent: &str, kind: &str, id: &str) -> BusAgent {
+        bus_session(agent, kind, id, true)
+    }
+
+    fn bus_session(agent: &str, kind: &str, id: &str, open: bool) -> BusAgent {
         BusAgent {
             workspace: "default".into(),
             project: "linha".into(),
@@ -1928,6 +2322,8 @@ mod tests {
             handle: BusHandle {
                 kind: kind.into(),
                 id: id.into(),
+                open,
+                cwd: Some("/home/someone/linha".into()),
             },
             pending: Vec::new(),
         }
@@ -1944,9 +2340,29 @@ mod tests {
             entry.adapter.args("T"),
             ["queue", "--thread", ID, "--message", "T"]
         );
+        // A stopped Codex conversation is resumed headless, with the queue
+        // as its fallback.
+        let stopped = Entry::discovered(&bus_session("codex", "codex_thread", ID, false)).unwrap();
+        assert_eq!(stopped.adapter.kind(), AdapterKind::CodexExecResume);
+        let queued = stopped.with_adapter(AdapterKind::CodexQueue).unwrap();
+        assert_eq!(queued.adapter.args("T")[0], "queue");
+        assert_eq!(queued.timeout, Duration::from_secs(60));
+        // A stopped Claude Code session is resumed in its own directory.
+        let claude =
+            Entry::discovered(&bus_session("claude-code", "claude_session", ID, false)).unwrap();
+        assert_eq!(claude.adapter.kind(), AdapterKind::ClaudeResume);
+        assert_eq!(
+            claude.session.as_ref().and_then(|s| s.cwd.clone()),
+            Some(PathBuf::from("/home/someone/linha"))
+        );
+        let gemini =
+            Entry::discovered(&bus_session("gemini-cli", "gemini_session", ID, false)).unwrap();
+        assert_eq!(gemini.adapter.kind(), AdapterKind::GeminiResume);
         for refused in [
-            // Claude Code has no adapter yet.
+            // An open Claude Code or Gemini CLI session is woken by its own
+            // hook, never by a resume.
             bus_agent("claude-code", "claude_session", ID),
+            bus_agent("gemini-cli", "gemini_session", ID),
             // A handle kind that does not belong to the harness.
             bus_agent("codex", "claude_session", ID),
             bus_agent("claude-code", "codex_thread", ID),
@@ -1958,6 +2374,62 @@ mod tests {
         ] {
             assert!(Entry::discovered(&refused).is_none(), "{refused:?}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_resumed_session_runs_only_in_a_checked_directory_of_the_operator() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("linha");
+        std::fs::create_dir(&project).unwrap();
+        let uid = std::fs::metadata(&project).unwrap().uid();
+        assert_eq!(
+            check_session_dir(&project, Some(uid), &[]).unwrap(),
+            std::fs::canonicalize(&project).unwrap()
+        );
+        assert!(check_session_dir(Path::new("linha"), Some(uid), &[]).is_err());
+        assert!(check_session_dir(&tmp.path().join("gone"), Some(uid), &[]).is_err());
+        assert!(check_session_dir(&project, Some(uid.wrapping_add(1)), &[]).is_err());
+        let temp = vec![std::fs::canonicalize(tmp.path()).unwrap()];
+        assert!(check_session_dir(&project, Some(uid), &temp).is_err());
+        std::fs::set_permissions(&project, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(check_session_dir(&project, Some(uid), &[]).is_err());
+    }
+
+    #[test]
+    fn a_service_finds_a_harness_in_the_home_bin_dirs_its_path_lacks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join(".local/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("claude"), b"").unwrap();
+        let env = RuntimeEnv::with_process_env_for_tests(&[
+            ("PATH", "/nonexistent-dir"),
+            ("HOME", tmp.path().to_str().unwrap()),
+        ]);
+        assert_eq!(
+            locate_program(&env, AdapterKind::ClaudeResume, None),
+            Some(bin.join("claude"))
+        );
+    }
+
+    #[test]
+    fn paused_mail_is_reported_and_never_wakes() {
+        let entry = Entry::discovered(&bus_agent("codex", "codex_thread", ID)).unwrap();
+        let other = "0190f0a4-5c1e-7a2b-9c3d-4e5f60718294".to_owned();
+        let candidates = vec![
+            Candidate {
+                id: ID.into(),
+                sender: CandidateSender::Paused,
+            },
+            Candidate {
+                id: other.clone(),
+                sender: CandidateSender::SameProject,
+            },
+        ];
+        let fresh = vec![ID.to_owned(), other.clone()];
+        assert_eq!(paused_ids(&candidates, &fresh), [ID]);
+        assert_eq!(wakeable(&entry, &candidates, &fresh), [other]);
     }
 
     #[test]
@@ -1975,6 +2447,8 @@ mod tests {
                 program: checked.path.clone(),
                 sha256: checked.sha256.clone(),
                 approved_at: String::new(),
+                trusted: None,
+                previous_sha256: None,
             },
         );
         let discovered = Entry::discovered(&bus_agent("codex", "codex_thread", ID)).unwrap();
@@ -1995,6 +2469,8 @@ mod tests {
                 program: checked.path.clone(),
                 sha256: checked.sha256.clone(),
                 approved_at: String::new(),
+                trusted: None,
+                previous_sha256: None,
             },
         );
         assert!(by_name.approves_entry(&configured, &checked, &cwd));
@@ -2037,13 +2513,6 @@ mod tests {
             conversation: ai_memory_core::message_wake::ConversationRef::parse("other").unwrap(),
         };
         assert_ne!(digest, approval_digest(&other, &checked, &cwd));
-        let mut other = base.clone();
-        other.budget.per_hour = 1;
-        assert_eq!(
-            digest,
-            approval_digest(&other, &checked, &cwd),
-            "budgets are not part of what runs"
-        );
     }
 
     #[cfg(unix)]
@@ -2111,10 +2580,7 @@ mod tests {
                 .unwrap(),
             },
             program: PathBuf::from("/opt/codex/bin/codex"),
-            budget: WakeBudget {
-                per_hour: 4,
-                per_day: 24,
-            },
+            session: None,
             timeout: Duration::from_secs(60),
         };
         let program = CheckedProgram {

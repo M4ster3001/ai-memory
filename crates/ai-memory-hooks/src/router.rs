@@ -837,6 +837,14 @@ pub fn hook_router(state: HookState) -> Router {
         .route("/inbox/watch", get(crate::inbox_watch::handle_inbox_watch))
         .route("/inbox/bus", get(crate::agent_bus::handle_inbox_bus))
         .route(
+            "/inbox/bus/status",
+            get(crate::agent_bus::handle_bus_status),
+        )
+        .route(
+            "/inbox/bus/program",
+            axum::routing::post(crate::agent_bus::handle_bus_program),
+        )
+        .route(
             "/inbox/wake-candidates",
             post(crate::inbox_supervisor::handle_wake_candidates),
         )

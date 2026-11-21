@@ -427,6 +427,17 @@ pub(crate) enum WriteCmd {
         post: crate::agent_rooms::NewRoomPost,
         reply: oneshot::Sender<StoreResult<crate::agent_rooms::RoomPostOutcome>>,
     },
+    /// Audit a program the host supervisor trusted.
+    RecordBusProgram {
+        detail: String,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
+    /// Resume a pair of agents the loop guard paused.
+    ResumeAgentPair {
+        a: crate::agent_wake_guard::AgentSide,
+        b: crate::agent_wake_guard::AgentSide,
+        reply: oneshot::Sender<StoreResult<bool>>,
+    },
     /// Advance a member's read position.
     RoomMarkRead {
         workspace_id: WorkspaceId,
@@ -2323,6 +2334,34 @@ impl WriterHandle {
     ) -> StoreResult<crate::agent_rooms::RoomPostOutcome> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::RoomPost { post, reply: tx }).await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Audit that the host supervisor trusted an adapter's program, on first
+    /// use or after its binary changed. `detail` is bounded JSON.
+    ///
+    /// # Errors
+    /// [`StoreError::WriterClosed`] or SQL errors.
+    pub async fn record_bus_program(&self, detail: String) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RecordBusProgram { detail, reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Resume wakes between two agents the loop guard paused, as the
+    /// dashboard's resume button does. Returns whether the pair was paused.
+    ///
+    /// # Errors
+    /// [`StoreError::WriterClosed`] or SQL errors.
+    pub async fn resume_agent_pair(
+        &self,
+        a: crate::agent_wake_guard::AgentSide,
+        b: crate::agent_wake_guard::AgentSide,
+    ) -> StoreResult<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::ResumeAgentPair { a, b, reply: tx })
+            .await?;
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
@@ -4955,6 +4994,14 @@ fn worker_loop(
                     }
                 }
                 send_or_warn(reply, result, "room_post");
+            }
+            WriteCmd::RecordBusProgram { detail, reply } => {
+                let result = crate::agent_wake_guard::record_bus_program(&mut conn, &detail);
+                send_or_warn(reply, result, "record_bus_program");
+            }
+            WriteCmd::ResumeAgentPair { a, b, reply } => {
+                let result = crate::agent_wake_guard::resume_pair(&mut conn, a, b);
+                send_or_warn(reply, result, "resume_agent_pair");
             }
             WriteCmd::RoomMarkRead {
                 workspace_id,

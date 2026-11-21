@@ -201,6 +201,9 @@ pub enum Command {
     Message(MessageArgs),
     /// Rooms: named chats among the agents of one project. Prints JSON.
     Room(RoomArgs),
+    /// The agent bus: install the host service that wakes agents when mail
+    /// arrives, and check it.
+    AgentBus(AgentBusArgs),
     /// List recent managed workstreams selectable from the current checkout.
     Workstreams(WorkstreamsArgs),
     /// Rename a managed workstream in the current checkout. Metadata only:
@@ -828,6 +831,46 @@ pub struct MessageArgs {
     pub command: MessageCommand,
 }
 
+/// Arguments for `agent-bus`.
+#[derive(Debug, Args)]
+pub struct AgentBusArgs {
+    /// Agent bus action to run.
+    #[command(subcommand)]
+    pub command: AgentBusCommand,
+}
+
+/// Subcommands for `agent-bus`.
+#[derive(Debug, Subcommand)]
+pub enum AgentBusCommand {
+    /// Install the per-user service that wakes agents and the Claude Code
+    /// wake hook. Shows what it will do and asks once.
+    Install(AgentBusInstallArgs),
+    /// Show the service, the wake hook, the discovered agents, their last
+    /// wake and paused pairs.
+    Status(AgentBusStatusArgs),
+    /// Check every piece the agent bus needs and say how to fix what fails.
+    Doctor,
+}
+
+/// Arguments for `agent-bus install`.
+#[derive(Debug, Args)]
+pub struct AgentBusInstallArgs {
+    /// Install without asking.
+    #[arg(long)]
+    pub yes: bool,
+    /// Print what would be installed and change nothing.
+    #[arg(long, conflicts_with = "yes")]
+    pub dry_run: bool,
+}
+
+/// Arguments for `agent-bus status`.
+#[derive(Debug, Args)]
+pub struct AgentBusStatusArgs {
+    /// Print JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
 /// Arguments for `room`.
 #[derive(Debug, Args)]
 pub struct RoomArgs {
@@ -1149,6 +1192,16 @@ pub struct MessageWatchArgs {
     /// (default: `inbox-watch` under the data directory).
     #[arg(long)]
     pub state_dir: Option<PathBuf>,
+    /// Run as Claude Code's `Stop` hook with `asyncRewake`: read the
+    /// session from the hook's stdin, wait for mail from another agent of
+    /// this project that the session was not told about, and exit 2 with a
+    /// fixed notice (which wakes the session), or 0 when the wait ends.
+    /// `install-hooks` and `agent-bus install` add this hook.
+    #[arg(
+        long,
+        conflicts_with_all = ["once", "exit_on_first", "silence_existing", "include_shared", "exec"]
+    )]
+    pub rewake: bool,
     /// Command run without a shell for each announced message; `{id}` in its
     /// arguments becomes the message id. Takes every remaining argument, so
     /// put it last.

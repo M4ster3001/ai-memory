@@ -7,6 +7,7 @@ mod access_mode;
 mod agent_bus;
 mod agent_messages;
 mod agent_rooms;
+mod agent_wake_guard;
 mod audit_contamination;
 mod audit_log;
 mod auto_improve_staging;

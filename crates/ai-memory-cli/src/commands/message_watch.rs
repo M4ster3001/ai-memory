@@ -86,11 +86,14 @@ pub(crate) async fn run(config: &Config, args: MessageWatchArgs) -> Result<i32> 
     }
     let (workspace, project) =
         super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
-    let endpoint = ServerEndpoint::for_checkout(config).await?;
     let state_dir = args
         .state_dir
         .clone()
         .unwrap_or_else(|| config.data_dir.join("inbox-watch"));
+    if args.rewake {
+        return super::message_rewake::run(config, agent, workspace, project, state_dir).await;
+    }
+    let endpoint = ServerEndpoint::for_checkout(config).await?;
     std::fs::create_dir_all(&state_dir)
         .with_context(|| format!("creating the watch state directory {}", state_dir.display()))?;
     let key = state_key(&workspace, &project, agent);

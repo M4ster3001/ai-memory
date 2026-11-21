@@ -963,7 +963,7 @@ fn build_claude_code_payload_with_data_dir_for_platform(
     capture_assistant: bool,
     platform: HookCommandPlatform,
 ) -> serde_json::Value {
-    with_claude_session_end_timeout(build_hook_payload_for_platform(
+    let payload = with_claude_session_end_timeout(build_hook_payload_for_platform(
         &CLAUDE_CODE_EVENTS,
         emit_root,
         server_url,
@@ -972,7 +972,68 @@ fn build_claude_code_payload_with_data_dir_for_platform(
         HookCommandContext::new(platform, "claude-code", data_dir, project_strategy)
             .allow_claude_windows_exec()
             .with_capture_assistant(capture_assistant),
-    ))
+    ));
+    if platform == HookCommandPlatform::PosixNative {
+        let exe = hook_embedded_exe_path();
+        with_claude_rewake(payload, &exe, server_url, auth_token, data_dir)
+    } else {
+        payload
+    }
+}
+
+/// The agent bus's wake hook for an open, idle Claude Code session: a second
+/// `Stop` handler, `asyncRewake`, that runs `ai-memory message watch
+/// --rewake` and exits 2 when mail arrives (`docs/design-agent-bus.md`).
+/// The server URL and token go in the environment of the command, never its
+/// argv. Only a native POSIX install has the binary it runs.
+pub(crate) fn claude_rewake_handler(
+    exe: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: Option<&Path>,
+) -> Value {
+    let mut command = format!("AI_MEMORY_SERVER_URL={} ", shell_quote(server_url));
+    if let Some(token) = auth_token {
+        command.push_str(&format!("AI_MEMORY_AUTH_TOKEN={} ", shell_quote(token)));
+    }
+    command.push_str(&format!(
+        "{}{} message watch --rewake --agent claude-code",
+        shell_quote(&exe.to_string_lossy()),
+        native_data_dir_arg(data_dir, NativeQuote::Posix),
+    ));
+    json!({
+        "type": "command",
+        "command": command,
+        "asyncRewake": true,
+        "timeout": crate::commands::message_rewake::REWAKE_HOOK_TIMEOUT_SECS,
+    })
+}
+
+/// Whether a hook handler is the agent bus's Claude Code wake hook.
+pub(crate) fn is_claude_rewake_handler(handler: &Value) -> bool {
+    handler.get("asyncRewake").and_then(Value::as_bool) == Some(true)
+        && handler
+            .get("command")
+            .and_then(Value::as_str)
+            .is_some_and(|command| command.contains(" message watch --rewake "))
+}
+
+/// `payload` with the wake hook added to its first `Stop` entry.
+pub(crate) fn with_claude_rewake(
+    mut payload: Value,
+    exe: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: Option<&Path>,
+) -> Value {
+    if let Some(handlers) = payload
+        .pointer_mut("/hooks/Stop/0/hooks")
+        .and_then(Value::as_array_mut)
+    {
+        handlers.retain(|handler| !is_claude_rewake_handler(handler));
+        handlers.push(claude_rewake_handler(exe, server_url, auth_token, data_dir));
+    }
+    payload
 }
 
 fn with_claude_session_end_timeout(mut payload: Value) -> Value {
@@ -6070,6 +6131,82 @@ $payload = [Console]::In.ReadToEnd()
                 "{platform:?}: no strategy flag when None: {inspect}"
             );
         }
+    }
+
+    #[test]
+    fn a_native_claude_install_adds_one_rewake_stop_hook_with_its_token_out_of_argv() {
+        let exe = Path::new("/opt/ai memory/ai-memory");
+        let native = build_claude_code_payload_with_data_dir_for_platform(
+            Path::new("/h/hooks/claude-code"),
+            "http://127.0.0.1:49374",
+            Some("tok'en"),
+            None,
+            None,
+            false,
+            HookCommandPlatform::PosixNative,
+        );
+        let handlers = native
+            .pointer("/hooks/Stop/0/hooks")
+            .and_then(Value::as_array)
+            .unwrap();
+        assert_eq!(handlers.len(), 2, "{handlers:?}");
+        assert!(!is_claude_rewake_handler(&handlers[0]));
+        let rewake = &handlers[1];
+        assert!(is_claude_rewake_handler(rewake));
+        assert_eq!(
+            rewake["timeout"],
+            crate::commands::message_rewake::REWAKE_HOOK_TIMEOUT_SECS
+        );
+        let built = with_claude_rewake(
+            json!({"hooks": {"Stop": [{"matcher": "", "hooks": [{"type": "command", "command": "x"}]}]}}),
+            exe,
+            "http://127.0.0.1:49374",
+            Some("tok'en"),
+            None,
+        );
+        let command = built["hooks"]["Stop"][0]["hooks"][1]["command"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(
+            command.starts_with(
+                "AI_MEMORY_SERVER_URL=http://127.0.0.1:49374 AI_MEMORY_AUTH_TOKEN='tok'\\''en' "
+            ),
+            "{command}"
+        );
+        assert!(
+            command
+                .ends_with("'/opt/ai memory/ai-memory' message watch --rewake --agent claude-code"),
+            "{command}"
+        );
+        assert!(!command.contains("--auth-token"), "{command}");
+        let twice = with_claude_rewake(built, exe, "http://127.0.0.1:49374", None, None);
+        let handlers = twice["hooks"]["Stop"][0]["hooks"].as_array().unwrap();
+        assert_eq!(handlers.len(), 2, "a reinstall replaces the wake hook");
+        assert!(
+            !handlers[1]["command"]
+                .as_str()
+                .unwrap()
+                .contains("AI_MEMORY_AUTH_TOKEN")
+        );
+
+        let scripts = build_claude_code_payload_with_data_dir_for_platform(
+            Path::new("/h/hooks/claude-code"),
+            "http://127.0.0.1:49374",
+            None,
+            None,
+            None,
+            false,
+            HookCommandPlatform::Posix,
+        );
+        assert_eq!(
+            scripts["hooks"]["Stop"][0]["hooks"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1,
+            "a script install has no native binary to run"
+        );
     }
 
     #[test]

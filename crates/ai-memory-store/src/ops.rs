@@ -3751,6 +3751,20 @@ pub fn admit_reported_hook_session_event(
             ],
         )?;
     }
+    if obs.kind == ObservationKind::UserPrompt
+        && matches!(ingest, IngestObservationOutcome::Inserted(_))
+        && !ai_memory_core::message_wake::is_wake_text(&obs.body)
+    {
+        crate::agent_wake_guard::record_human_prompt_in_tx(
+            &tx,
+            crate::agent_wake_guard::AgentSide {
+                workspace_id,
+                project_id,
+                agent: guard.agent_kind,
+            },
+            obs.occurred_at.unwrap_or(now).min(now),
+        )?;
+    }
     if let Some(kind) = wake_handle.filter(|_| !session_end) {
         crate::agent_bus::record_wake_handle_in_tx(
             &tx,
@@ -6377,6 +6391,21 @@ pub(crate) fn insert_message_in_tx(
         )?,
         None => false,
     };
+    let hop = crate::agent_wake_guard::assess_message_in_tx(
+        tx,
+        crate::agent_wake_guard::AgentSide {
+            workspace_id: m.from_workspace_id,
+            project_id: m.from_project_id,
+            agent: m.from_agent,
+        },
+        m.to_agent.map(|agent| crate::agent_wake_guard::AgentSide {
+            workspace_id: m.to_workspace_id,
+            project_id: m.to_project_id,
+            agent,
+        }),
+        &body,
+        now,
+    )?;
     let (delivery_state, delivery_reason) = if awaiting {
         (
             ai_memory_core::DeliveryState::AwaitingAgent,
@@ -6390,9 +6419,9 @@ pub(crate) fn insert_message_in_tx(
              id, from_workspace_id, from_project_id, from_agent, from_session_id, \
              from_owner_user, to_workspace_id, to_project_id, subject, body, state, created_at, \
              nature, evidence, to_agent, kind, priority, notify, expires_at, no_pop_alert_at, \
-             delivery_state, delivery_reason \
+             delivery_state, delivery_reason, hop \
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', ?11, ?12, ?13, ?14, \
-             'message', ?15, ?16, ?17, ?18, ?19, ?20)",
+             'message', ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
         params![
             id.as_bytes(),
             m.from_workspace_id.as_bytes(),
@@ -6414,6 +6443,7 @@ pub(crate) fn insert_message_in_tx(
             deadlines.no_pop_alert_at_us,
             delivery_state.as_str(),
             delivery_reason.map(|r| r.as_str()),
+            hop,
         ],
     )?;
     // Audit records the lifecycle event under the recipient scope (the crossing

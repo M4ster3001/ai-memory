@@ -470,7 +470,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 106, "update the pin when adding a migration");
+        assert_eq!(version, 107, "update the pin when adding a migration");
         let cols: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('users') \
@@ -748,13 +748,13 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            cols, 31,
+            cols, 32,
             "id, from_workspace_id, from_project_id, from_agent, from_session_id, \
              from_owner_user, to_workspace_id, to_project_id, subject, body, state, \
              created_at, claimed_at, claimed_by_session, claimed_by_agent, claimed_by_user, \
              nature, evidence, to_agent, edited_at, kind, priority, notify, expires_at, \
              no_pop_alert_at, delivery_state, delivery_reason, retry_after, receipt_for, \
-             receipt_outcome, receipt_reason"
+             receipt_outcome, receipt_reason, hop"
         );
     }
 

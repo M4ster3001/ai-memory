@@ -8,8 +8,8 @@
 //!   answer says, per pending message, only whether the sender is another
 //!   agent of the watched project, the watched agent itself, one of the
 //!   listed projects with a recorded session, one of them without one,
-//!   someone else, or the server (a receipt). Sender names and ids never
-//!   leave the server.
+//!   someone else, the server (a receipt), or a sender the loop guard paused
+//!   with this agent. Sender names and ids never leave the server.
 //! - `POST /inbox/wake-report` records what a wake did, from enumerated values
 //!   only (`state`, `reason`, a bounded `retry_after_secs`), so the server can
 //!   set the delivery state, write the timeline and send the sender its
@@ -92,6 +92,11 @@ enum WakeSender {
     Unlisted,
     /// The server itself: a delivery receipt.
     System,
+    /// The loop guard paused wakes between this sender and the watched
+    /// agent (`agent_pair_pauses`): the mail stays in the inbox, but it must
+    /// not wake. A supervisor that predates the label treats it as unknown,
+    /// which never wakes either.
+    Paused,
 }
 
 #[derive(Debug, Serialize)]
@@ -302,6 +307,7 @@ pub(crate) async fn handle_wake_candidates(
                 MessageKind::Message if own_project && candidate.from_agent == agent => {
                     WakeSender::SameAgent
                 }
+                MessageKind::Message if candidate.pair_paused => WakeSender::Paused,
                 MessageKind::Message if own_project => WakeSender::SameProject,
                 MessageKind::Message
                     if listed
