@@ -132,6 +132,31 @@ pub(crate) async fn handler(
     }
 }
 
+/// Handler for `GET /agent-bus/summary`: the counts the sidebar shows beside
+/// "Agent chat" (mail between agents not yet popped by its recipient) and
+/// "Agent bus" (paused pairs). Root only; anyone else gets the refusal and
+/// the sidebar keeps both items hidden.
+pub(crate) async fn summary(
+    axum::Extension(i18n): axum::Extension<ai_memory_core::i18n::Localizer>,
+    State(state): State<Arc<WebState>>,
+    level: Option<Extension<AuthLevel>>,
+) -> Response {
+    if let Err(response) = super::require_admin(&i18n, &state, level).await {
+        return response;
+    }
+    match (
+        state.reader.pending_agent_mail_count().await,
+        state.reader.paused_agent_pairs(PAGE_LIMIT).await,
+    ) {
+        (Ok(unread), Ok(pairs)) => Json(serde_json::json!({
+            "chat_unread": unread,
+            "paused_pairs": pairs.len(),
+        }))
+        .into_response(),
+        _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
 /// Body of `POST /agent-bus/resume`: the two sides of a paused pair, as the
 /// page lists them.
 #[derive(Debug, Deserialize)]

@@ -126,6 +126,7 @@ pub(crate) fn build(state: Arc<WebState>) -> Router {
             .route("/rooms", get(rooms::handler))
             .route("/agent-bus", get(agent_bus::handler))
             .route("/agent-bus/resume", post(agent_bus::resume))
+            .route("/agent-bus/summary", get(agent_bus::summary))
             .route("/inbox/notifications", get(notifications::handler))
             .route("/messages", post(inbox::send))
             .route("/messages/{id}/edit", post(inbox::begin_edit))

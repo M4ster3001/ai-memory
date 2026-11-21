@@ -157,4 +157,49 @@ async fn paused_pairs_are_listed_without_text_and_resumed_only_by_root_from_the_
     );
     let (_, body) = send(app(&store, &wiki, AuthLevel::Root), page()).await;
     assert!(body.contains("data-pairs=\"none\""), "{body}");
+
+    // The sidebar's root-only summary: mail between agents not yet popped,
+    // and paused pairs. A database user is refused, so the menu stays hidden.
+    let summary = || {
+        Request::builder()
+            .uri("/web/agent-bus/summary")
+            .body(Body::empty())
+            .unwrap()
+    };
+    let (status, body) = send(app(&store, &wiki, AuthLevel::Root), summary()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["chat_unread"], 3);
+    assert_eq!(json["paused_pairs"], 0);
+    let (status, _) = send(app(&store, &wiki, AuthLevel::User), summary()).await;
+    assert_ne!(status, StatusCode::OK);
+}
+
+/// Every page carries the hidden "Agents" menu (shown by the summary), and
+/// every dashboard select gets the design-system look except the
+/// management pages', which have their own.
+#[tokio::test]
+async fn the_agents_menu_is_in_every_page_and_selects_follow_the_design_system() {
+    let tmp = TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+    let (status, body) = send(
+        app(&store, &wiki, AuthLevel::Root),
+        Request::builder().uri("/web/inbox").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    for needle in [
+        "href=\"rooms\" data-nav=\"rooms\" data-nav-agents hidden",
+        "href=\"agent-bus\" data-nav=\"agent-bus\" data-nav-agents hidden",
+        "agent-bus/summary",
+    ] {
+        assert!(body.contains(needle), "{needle} missing");
+    }
+    let css = include_str!("../../static/tailwind.css");
+    assert!(
+        css.contains(".dashboard-shell select:not([multiple]):not(.management *){-webkit-appearance:none;"),
+        "the shared select rule is missing from tailwind.css"
+    );
+    assert!(css.contains(".app-nav [data-nav-agents][hidden]{display:none}"));
 }

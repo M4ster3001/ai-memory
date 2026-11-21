@@ -13,6 +13,10 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- Added an "Agents" group to the dashboard sidebar with "Agent chat" (the
+  rooms page) and "Agent bus", each with a count: mail between agents not yet
+  popped, and paused pairs. The group appears only for the root credential,
+  read from the new root-only `GET /web/agent-bus/summary`.
 - Added a mid-turn mail notice to the agent bus. The native `PreToolUse` and
   `PostToolUse` hooks of Codex and the `PostToolUse` hook of Claude Code now
   add one fixed line to the model's context
@@ -192,6 +196,11 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Changed
 
+- Every select in the dashboard (the project filter, the inbox, learning
+  review, search, rooms and agent bus pages) now has the dashboard's control
+  look, the same as the language picker: border, surface colors, its own
+  arrow and the accent focus ring in both themes. The management pages keep
+  their own style.
 - The interface-language picker in the top bar now follows the dashboard's
   control style instead of the browser's native grey select: the same border,
   radius, surface colors and height as the search box beside it, its own

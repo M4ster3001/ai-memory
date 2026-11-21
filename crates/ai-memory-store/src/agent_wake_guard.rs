@@ -575,6 +575,24 @@ impl ReaderPool {
         .await
     }
 
+    /// Mail addressed from one agent to another that its recipient has not
+    /// popped yet, across every project.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn pending_agent_mail_count(&self) -> StoreResult<u64> {
+        self.with_conn(|conn| {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM agent_messages \
+                 WHERE state = 'pending' AND kind = 'message' AND to_agent IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )?;
+            Ok(u64::try_from(count).unwrap_or(0))
+        })
+        .await
+    }
+
     /// The sides `side` is paused with.
     ///
     /// # Errors
