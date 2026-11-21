@@ -105,7 +105,7 @@ pub struct ChatPost {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChatItem {
     /// Addressed mail.
-    Mail(ChatMail),
+    Mail(Box<ChatMail>),
     /// A room post.
     Post(ChatPost),
 }
@@ -179,7 +179,7 @@ fn timeline(conn: &Connection, project: ProjectKey, limit: i64) -> StoreResult<V
         };
         let scope = scope_of(project, other, at, &windows);
         let shown = scope != ChatScope::Hidden;
-        items.push(ChatItem::Mail(ChatMail {
+        items.push(ChatItem::Mail(Box::new(ChatMail {
             id: MessageId::from_slice(&row.get::<_, Vec<u8>>(0)?)?,
             at,
             from_agent: AgentKind::from_wire(&row.get::<_, String>(2)?),
@@ -195,7 +195,7 @@ fn timeline(conn: &Connection, project: ProjectKey, limit: i64) -> StoreResult<V
             delivery_state: row.get(15)?,
             delivery_reason: row.get(16)?,
             receipts: Vec::new(),
-        }));
+        })));
     }
     drop(rows);
     drop(stmt);

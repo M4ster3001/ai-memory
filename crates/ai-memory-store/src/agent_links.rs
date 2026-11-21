@@ -261,7 +261,8 @@ fn load(tx: &Transaction<'_>, id: AgentLinkId) -> StoreResult<Option<Row>> {
 
 /// End every live link whose clock ran out at `at`. Returns how many.
 pub(crate) fn expire_due_in_tx(tx: &Transaction<'_>, at: i64) -> StoreResult<usize> {
-    let due: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, i64)> = {
+    type Due = (Vec<u8>, Vec<u8>, Vec<u8>, i64);
+    let due: Vec<Due> = {
         let mut stmt = tx.prepare(
             "SELECT id, from_project_id, from_workspace_id, expires_at FROM agent_links \
              WHERE state IN ('requested','active') AND expires_at <= ?1",

@@ -294,7 +294,7 @@ async fn build_feed(
     let items = items
         .into_iter()
         .map(|item| match item {
-            ChatItem::Mail(mail) => mail_bubble(mail, project, i18n),
+            ChatItem::Mail(mail) => mail_bubble(*mail, project, i18n),
             ChatItem::Post(post) => post_bubble(post, i18n),
         })
         .collect();
@@ -823,9 +823,8 @@ pub(crate) async fn create_link(
     }
 }
 
-fn link_id(raw: &str) -> Result<AgentLinkId, Response> {
-    raw.parse::<AgentLinkId>()
-        .map_err(|_| error(StatusCode::BAD_REQUEST, "That is not a link id."))
+fn link_id(raw: &str) -> Option<AgentLinkId> {
+    raw.parse::<AgentLinkId>().ok()
 }
 
 /// Body of `POST /chat/links/{id}/confirm`: the project whose page the root
@@ -850,9 +849,8 @@ pub(crate) async fn confirm_link(
     if let Err(response) = authorize_post(&i18n, &state, level, &headers).await {
         return response;
     }
-    let id = match link_id(&id) {
-        Ok(id) => id,
-        Err(response) => return response,
+    let Some(id) = link_id(&id) else {
+        return error(StatusCode::BAD_REQUEST, "That is not a link id.");
     };
     let viewing = match scope(
         &state,
@@ -896,9 +894,8 @@ pub(crate) async fn close_link(
     if let Err(response) = authorize_post(&i18n, &state, level, &headers).await {
         return response;
     }
-    let id = match link_id(&id) {
-        Ok(id) => id,
-        Err(response) => return response,
+    let Some(id) = link_id(&id) else {
+        return error(StatusCode::BAD_REQUEST, "That is not a link id.");
     };
     match state.wiki.close_project_link(id).await {
         Ok(ai_memory_store::LinkCloseOutcome::Closed(_)) => {
