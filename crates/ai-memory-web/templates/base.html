@@ -26,7 +26,7 @@
       <a href="pending" data-nav="pending" {% block nav_pending_current %}{% endblock %}><span aria-hidden="true">☷</span>{{ i18n.text("web-learning-review") }}</a>
       <a href="health" data-nav="health" {% block nav_health_current %}{% endblock %}><span aria-hidden="true">⌁</span>{{ i18n.text("web-server-health") }}</a>
       <p class="nav-label" data-nav-agents hidden>{{ i18n.text("web-nav-agents") }}</p>
-      <a href="rooms" data-nav="rooms" data-nav-agents hidden><span aria-hidden="true">✦</span>{{ i18n.text("web-nav-agent-chat") }} <span id="agents-chat-count" class="nav-message-count" hidden></span></a>
+      <a href="chat" data-nav="chat" data-nav-also="rooms" data-nav-agents hidden><span aria-hidden="true">✦</span>{{ i18n.text("web-nav-agent-chat") }} <span id="agents-chat-count" class="nav-message-count" hidden></span></a>
       <a href="agent-bus" data-nav="agent-bus" data-nav-agents hidden><span aria-hidden="true">⇄</span>{{ i18n.text("web-nav-agent-bus") }} <span id="agents-bus-count" class="nav-message-count" hidden></span></a>
       <script>
       (async function(){
@@ -82,7 +82,7 @@
     toggle.addEventListener("click",function(){var open=toggle.getAttribute("aria-expanded")!=="true";document.body.classList.toggle("nav-open",open);toggle.setAttribute("aria-expanded",String(open));backdrop.hidden=!open;if(open)nav.querySelector("a").focus();});
     backdrop.addEventListener("click",close);
     document.addEventListener("keydown",function(e){if(e.key==="Escape"&&document.body.classList.contains("nav-open")){close();toggle.focus();}});
-    nav.querySelectorAll("a[data-nav]").forEach(function(a){var path=new URL(a.href).pathname.replace(/\/$/,"");var current=location.pathname.replace(/\/$/,"");if(path===current||(a.dataset.nav==="projects"&&current.indexOf(path+"/w/")===0))a.setAttribute("aria-current","page");a.addEventListener("click",close);});
+    nav.querySelectorAll("a[data-nav]").forEach(function(a){var path=new URL(a.href).pathname.replace(/\/$/,"");var current=location.pathname.replace(/\/$/,"");if(path===current||(a.dataset.nav==="projects"&&current.indexOf(path+"/w/")===0)||(a.dataset.navAlso&&current===path.replace(/\/chat$/,"/"+a.dataset.navAlso)))a.setAttribute("aria-current","page");a.addEventListener("click",close);});
     document.getElementById("interface-language").addEventListener("change",function(event){
       var base=document.querySelector('meta[name="ai-memory-base-path"]')?.content||"";
       document.cookie="ai_memory_language="+encodeURIComponent(event.target.value)+"; Path="+(base||"")+"/; Max-Age=31536000; SameSite=Lax"+(location.protocol==="https:"?"; Secure":"");

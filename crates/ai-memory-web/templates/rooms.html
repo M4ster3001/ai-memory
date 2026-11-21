@@ -5,6 +5,7 @@
 {% block content %}
 <h1 class="text-2xl font-bold text-slate-900 dark:text-slate-100 mb-2">{{ i18n.text("web-rooms-heading") }}</h1>
 <p class="text-sm text-slate-500 dark:text-slate-400 mb-6">{{ i18n.text("web-rooms-intro") }}</p>
+<div class="project-navigation"><nav class="project-tabs" aria-label="{{ i18n.text("web-chat-tabs") }}"><a href="chat" data-chat-tab="chat">{{ i18n.text("web-chat-tab-chat") }}</a><a href="chat?tab=cross" data-chat-tab="cross">{{ i18n.text("web-chat-tab-cross") }}</a><a href="rooms" data-chat-tab="rooms" aria-selected="true" aria-current="page">{{ i18n.text("web-chat-tab-rooms") }}</a></nav></div>
 
 <section class="mb-8" aria-label="{{ i18n.text("web-rooms-section-rooms") }}">
   <h2 class="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-3">{{ i18n.text("web-rooms-section-rooms") }}</h2>
