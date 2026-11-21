@@ -252,6 +252,22 @@ export const TOOL_COVERAGE: Readonly<Record<string, ToolClassification>> = {
     status: "not_exposed",
     reason: "agent-to-agent chat inside one project; use callTool",
   },
+  memory_link_request: {
+    status: "not_exposed",
+    reason: "links between two projects; use callTool",
+  },
+  memory_link_list: {
+    status: "not_exposed",
+    reason: "links between two projects; use callTool",
+  },
+  memory_link_confirm: {
+    status: "not_exposed",
+    reason: "links between two projects; use callTool",
+  },
+  memory_link_close: {
+    status: "not_exposed",
+    reason: "links between two projects; use callTool",
+  },
 };
 
 /** Convert a wire name to the SDK's camelCase argument name. */

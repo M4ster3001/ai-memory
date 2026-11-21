@@ -414,6 +414,133 @@
     },
     "required": []
   },
+  "memory_link_close": {
+    "properties": {
+      "agent": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "link_id": {
+        "type": "string"
+      },
+      "project": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "workspace": {
+        "type": [
+          "null",
+          "string"
+        ]
+      }
+    },
+    "required": [
+      "link_id"
+    ]
+  },
+  "memory_link_confirm": {
+    "properties": {
+      "agent": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "link_id": {
+        "type": "string"
+      },
+      "project": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "workspace": {
+        "type": [
+          "null",
+          "string"
+        ]
+      }
+    },
+    "required": [
+      "link_id"
+    ]
+  },
+  "memory_link_list": {
+    "properties": {
+      "agent": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "include_ended": {
+        "type": [
+          "boolean",
+          "null"
+        ]
+      },
+      "project": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "workspace": {
+        "type": [
+          "null",
+          "string"
+        ]
+      }
+    },
+    "required": []
+  },
+  "memory_link_request": {
+    "properties": {
+      "agent": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "hours": {
+        "type": [
+          "null",
+          "number"
+        ]
+      },
+      "project": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "reason": {
+        "type": "string"
+      },
+      "to_project": {
+        "type": "string"
+      },
+      "to_workspace": {
+        "type": "string"
+      },
+      "workspace": {
+        "type": [
+          "null",
+          "string"
+        ]
+      }
+    },
+    "required": [
+      "reason",
+      "to_project",
+      "to_workspace"
+    ]
+  },
   "memory_lint": {
     "properties": {
       "dry_run": {

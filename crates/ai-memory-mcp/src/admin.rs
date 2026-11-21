@@ -782,6 +782,16 @@ pub fn admin_router_with_sweep_tuning(
         .route("/admin/curator", post(handle_curator))
         .route("/admin/handoffs", get(handle_open_handoffs_list))
         .route("/admin/handoffs/expire", post(handle_expire_handoffs))
+        .route("/admin/links", get(crate::admin_links::handle_list))
+        .route(
+            "/admin/links/request",
+            post(crate::admin_links::handle_request),
+        )
+        .route(
+            "/admin/links/confirm",
+            post(crate::admin_links::handle_confirm),
+        )
+        .route("/admin/links/close", post(crate::admin_links::handle_close))
         .route("/admin/rooms", get(crate::admin_rooms::handle_list))
         .route("/admin/rooms/join", post(crate::admin_rooms::handle_join))
         .route("/admin/rooms/leave", post(crate::admin_rooms::handle_leave))

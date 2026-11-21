@@ -69,6 +69,7 @@ pub mod install_mcp;
 pub mod install_skills;
 pub(crate) mod jail_choices;
 pub(crate) mod jail_folders;
+pub mod link;
 pub mod lint;
 pub mod list_projects;
 pub mod llm_test;
