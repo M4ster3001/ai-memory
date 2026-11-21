@@ -1,6 +1,24 @@
 # Agent bus quickstart
 
-Three steps on the machine where your agents run, then one check.
+On the machine where your agents run, with the server already up and the
+native `ai-memory` binary on your `PATH` (steps 1 to 3 below explain each):
+
+```bash
+ai-memory agent-bus install --yes
+ai-memory agent-bus doctor
+```
+
+That is the whole setup: two commands and no file to edit. Then restart the
+agents you had open. A new project needs nothing: open the agent in it and
+its hooks report the session.
+
+To let an agent wire itself instead, paste this into it:
+
+```text
+Run `ai-memory agent-bus doctor`; if any line says FAIL, run the fix it prints (usually `ai-memory agent-bus install --yes`), run doctor again, and tell me what is still failing.
+```
+
+The steps, in detail:
 
 ## 1. Run a server with the agent bus
 
@@ -21,14 +39,15 @@ start; the agent bus needs nothing else from it.
 ## 2. Wire your agents
 
 Each agent needs the ai-memory MCP entry and hooks. The hooks are how
-ai-memory learns which sessions exist and how to wake them:
+ai-memory learns which sessions exist, their thread or session id and their
+directory, and how a busy Codex or Claude Code hears of mail between tool
+calls. `ai-memory agent-bus install` (step 3) writes the native hooks for
+every agent it finds (`~/.claude`, `~/.codex`, `~/.gemini`), so this step is
+only the MCP entry, if the agents do not have it yet:
 
 ```bash
-ai-memory setup
+ai-memory install-mcp
 ```
-
-or, per agent, `ai-memory install-mcp` and `ai-memory install-hooks`. Restart
-the agents afterwards.
 
 ## 3. Install the agent bus on this machine
 
@@ -42,8 +61,13 @@ On a Docker install, copy the binary out of the image first:
 ```bash
 docker create --name aim-copy docker.io/akitaonrails/ai-memory:latest
 docker cp aim-copy:/usr/local/bin/ai-memory ~/.local/bin/ai-memory
+mkdir -p ~/.local/share/ai-memory
+docker cp aim-copy:/usr/local/share/ai-memory/hooks ~/.local/share/ai-memory/hooks
 docker rm aim-copy
 ```
+
+The hook bundle beside it (`~/.local/share/ai-memory/hooks`) is where
+`install` finds the hook files; pass `--hooks-dir` if you keep it elsewhere.
 
 Then:
 
@@ -55,9 +79,13 @@ It prints what it will do and asks once:
 
 1. write the user service (systemd on Linux, a LaunchAgent on macOS) that runs
    `ai-memory message supervise`;
-2. add the Claude Code wake hook to `~/.claude/settings.json` (a backup is
-   kept beside it);
+2. write the native hooks of each agent it finds, as
+   `ai-memory install-hooks --agent <agent> --apply` would (Claude Code with
+   its wake hook, Codex, Gemini CLI); each file gets a backup;
 3. start the service.
+
+Run it again at any time: it rewrites the same hooks and unit and changes
+nothing else.
 
 No configuration file is written. Agents are discovered from their hook
 sessions, and the `claude`, `codex` and `gemini` programs are trusted the

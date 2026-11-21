@@ -185,7 +185,10 @@ async fn the_agents_menu_is_in_every_page_and_selects_follow_the_design_system()
     let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
     let (status, body) = send(
         app(&store, &wiki, AuthLevel::Root),
-        Request::builder().uri("/web/inbox").body(Body::empty()).unwrap(),
+        Request::builder()
+            .uri("/web/inbox")
+            .body(Body::empty())
+            .unwrap(),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -198,7 +201,9 @@ async fn the_agents_menu_is_in_every_page_and_selects_follow_the_design_system()
     }
     let css = include_str!("../../static/tailwind.css");
     assert!(
-        css.contains(".dashboard-shell select:not([multiple]):not(.management *){-webkit-appearance:none;"),
+        css.contains(
+            ".dashboard-shell select:not([multiple]):not(.management *){-webkit-appearance:none;"
+        ),
         "the shared select rule is missing from tailwind.css"
     );
     assert!(css.contains(".app-nav [data-nav-agents][hidden]{display:none}"));

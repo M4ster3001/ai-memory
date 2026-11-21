@@ -861,6 +861,10 @@ pub struct AgentBusInstallArgs {
     /// Print what would be installed and change nothing.
     #[arg(long, conflicts_with = "yes")]
     pub dry_run: bool,
+    /// Directory that holds the hook bundle (`claude-code/`, `codex/`, ...),
+    /// when it is not beside the binary or under `<prefix>/share/ai-memory/hooks`.
+    #[arg(long)]
+    pub hooks_dir: Option<PathBuf>,
 }
 
 /// Arguments for `agent-bus status`.

@@ -1027,6 +1027,9 @@ mod slow {
                 json!({"event": event, "session_id": id, "cwd": project.path()}),
             )
             .await;
+            // The server acknowledges a hook before storing it; keep the
+            // start ahead of the end, as a real session does.
+            tokio::time::sleep(Duration::from_millis(400)).await;
         }
         wait_for_session(&f, "codex", false).await;
         let state = f.dd().join("supervisor-exec");
@@ -1483,5 +1486,101 @@ mod slow {
         assert_eq!(context_of(&out), None);
         assert!(took < Duration::from_secs(3), "the hook waited {took:?}");
         drop(silent);
+    }
+
+    /// Plug and play in a throwaway home: one `agent-bus install --yes`
+    /// writes the native hooks of every agent it finds, the Claude Code wake
+    /// hook and the user service, and starts it; a second run changes
+    /// nothing. A fake `systemctl` records what it was asked.
+    #[tokio::test]
+    async fn one_install_wires_every_agent_found_and_is_idempotent() {
+        let f = fixture().await;
+        let home = tempfile::tempdir().unwrap();
+        for dir in [".claude", ".codex", ".gemini"] {
+            std::fs::create_dir(home.path().join(dir)).unwrap();
+        }
+        let tools = tempfile::Builder::new()
+            .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+            .unwrap();
+        let record = tools.path().join("systemctl.log");
+        std::fs::write(
+            tools.path().join("systemctl"),
+            format!("#!/bin/sh\necho \"$@\" >> {}\n", record.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            tools.path().join("systemctl"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let install = || {
+            let out = hermetic(BIN)
+                .args(["agent-bus", "install", "--yes", "--hooks-dir"])
+                .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/../../hooks"))
+                .env_clear()
+                .env("HOME", home.path())
+                .env("PATH", format!("{}:/usr/bin:/bin", tools.path().display()))
+                .env("AI_MEMORY_DATA_DIR", data.path())
+                .env("AI_MEMORY_HOME", home.path())
+                .env("AI_MEMORY_SERVER_URL", &f.base)
+                .env("AI_MEMORY_EMBEDDING_PROVIDER", "none")
+                .env("RUST_LOG", "off")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "install failed: {}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        let read = |path: &str| std::fs::read_to_string(home.path().join(path)).unwrap_or_default();
+        let printed = install();
+        for agent in ["claude-code", "codex", "gemini-cli"] {
+            assert!(
+                printed.contains(&format!("Wrote the {agent} hooks")),
+                "{printed}"
+            );
+        }
+        let codex = read(".codex/hooks.json");
+        assert!(
+            codex.contains("hook --event post-tool-use") && codex.contains("--agent codex"),
+            "{codex}"
+        );
+        let claude = read(".claude/settings.json");
+        assert!(claude.contains("hook --event post-tool-use"), "{claude}");
+        assert!(
+            claude.contains("message watch --rewake --agent claude-code"),
+            "{claude}"
+        );
+        assert_eq!(
+            claude.matches("message watch --rewake").count(),
+            1,
+            "{claude}"
+        );
+        assert!(!read(".gemini/settings.json").is_empty());
+        let unit = read(".config/systemd/user/ai-memory-supervisor.service");
+        assert!(unit.contains("message supervise"), "{unit}");
+        let calls = std::fs::read_to_string(&record).unwrap();
+        assert!(
+            calls.contains("--user enable --now ai-memory-supervisor.service"),
+            "{calls}"
+        );
+
+        // Running it again rewrites the same files.
+        let before = (
+            read(".codex/hooks.json"),
+            read(".claude/settings.json"),
+            unit,
+        );
+        install();
+        let after = (
+            read(".codex/hooks.json"),
+            read(".claude/settings.json"),
+            read(".config/systemd/user/ai-memory-supervisor.service"),
+        );
+        assert_eq!(before, after, "a second install changed the files");
     }
 }

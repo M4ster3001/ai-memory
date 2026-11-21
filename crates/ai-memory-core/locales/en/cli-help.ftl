@@ -159,6 +159,7 @@ cli-help-root-agent-bus-about = { "The agent bus: install the host service that 
 cli-help-root-agent-bus-install-about = { "Install the per-user service that wakes agents and the Claude Code wake hook. Shows what it will do and asks once" }
 cli-help-root-agent-bus-install-yes-help = { "Install without asking" }
 cli-help-root-agent-bus-install-dry-run-help = { "Print what would be installed and change nothing" }
+cli-help-root-agent-bus-install-hooks-dir-help = { "Directory that holds the hook bundle (`claude-code/`, `codex/`, ...), when it is not beside the binary or under `<prefix>/share/ai-memory/hooks`" }
 cli-help-root-agent-bus-status-about = { "Show the service, the wake hook, the discovered agents, their last wake and paused pairs" }
 cli-help-root-agent-bus-status-json-help = { "Print JSON" }
 cli-help-root-agent-bus-doctor-about = { "Check every piece the agent bus needs and say how to fix what fails" }

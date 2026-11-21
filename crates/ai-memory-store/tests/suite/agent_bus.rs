@@ -232,3 +232,62 @@ async fn targets_need_addressed_mail_and_a_handle_and_prefer_an_open_session() {
     assert_eq!(targets[0].handle.handle, THREAD_A, "the open session wins");
     assert!(targets[0].handle.open);
 }
+
+/// The bus answers the directory a session reported last (V108), so a Codex
+/// conversation whose first directory was deleted is repaired by its next
+/// hook event instead of failing every resume.
+#[tokio::test]
+async fn the_bus_follows_the_directory_a_session_reported_last() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let at = project(&store, "moved").await;
+    let id = SessionId::from_native(THREAD_A);
+    for (kind, cwd) in [
+        (ObservationKind::SessionStart, "/work/old"),
+        (ObservationKind::UserPrompt, "/work/new"),
+    ] {
+        store
+            .writer
+            .admit_reported_hook_session_event(
+                NewSession {
+                    id,
+                    workspace_id: at.0,
+                    project_id: at.1,
+                    agent_kind: AgentKind::Codex,
+                    cwd: Some(cwd.into()),
+                    actor_user: None,
+                    occurred_at: None,
+                },
+                Sanitized::new(
+                    NewObservation {
+                        occurred_at: None,
+                        session_id: id,
+                        workspace_id: at.0,
+                        project_id: at.1,
+                        kind,
+                        extension: None,
+                        source_event: None,
+                        title: "event".into(),
+                        body: "event".into(),
+                        importance: 1,
+                        file_path: None,
+                    },
+                    &Sanitizer::builtin(),
+                ),
+                OwnerFilter::Any,
+                None,
+                None,
+                Some(WakeHandleKind::CodexThread),
+            )
+            .await
+            .unwrap();
+    }
+    store
+        .writer
+        .insert_message(to(at, Some(AgentKind::Codex)))
+        .await
+        .unwrap();
+    let targets = store.reader.bus_targets(10, 10).await.unwrap();
+    assert_eq!(targets.len(), 1);
+    assert_eq!(targets[0].handle.cwd.as_deref(), Some("/work/new"));
+}

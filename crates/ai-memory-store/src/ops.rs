@@ -3773,6 +3773,11 @@ pub fn admit_reported_hook_session_event(
             project_id,
             guard.agent_kind,
             kind,
+            session
+                .cwd
+                .as_ref()
+                .map(|cwd| cwd.to_string_lossy().into_owned())
+                .as_deref(),
             now,
         )?;
     }

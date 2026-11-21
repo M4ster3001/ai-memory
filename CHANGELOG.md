@@ -13,6 +13,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- `ai-memory agent-bus install` now writes the native hooks of every agent it
+  finds (`~/.claude`, `~/.codex` or `$CODEX_HOME`, `~/.gemini`) by running
+  `install-hooks --agent <agent> --apply` for each, so one command wires
+  session discovery, the Claude Code wake hook and the mid-turn notice;
+  running it again rewrites the same files. The `doctor` fixes now name that
+  one command.
 - Added an "Agents" group to the dashboard sidebar with "Agent chat" (the
   rooms page) and "Agent bus", each with a count: mail between agents not yet
   popped, and paused pairs. The group appears only for the root credential,
@@ -234,6 +240,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Fixed the agent bus resuming a Codex or Claude Code session in the
+  directory it was first admitted in. Each hook event now records the
+  directory it reports on the wake handle (migration V108), so a session
+  whose folder moved or was deleted is repaired by its next prompt; until
+  then a stopped Codex conversation that fails the directory check gets its
+  turn queued with `codex queue` instead of `session_not_found`.
 - Fixed `memory_room_read` and `ai-memory room read` moving a member's read
   position when it read ahead with `after`, which made the next plain read
   skip the posts in between.

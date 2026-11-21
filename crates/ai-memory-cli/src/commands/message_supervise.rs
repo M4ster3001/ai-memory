@@ -1172,7 +1172,7 @@ impl Supervisor {
             };
             let next = matches!(
                 outcome,
-                WakeOutcome::Failed(DeliveryReason::SessionBusy)
+                WakeOutcome::Failed(DeliveryReason::SessionBusy | DeliveryReason::SessionNotFound)
                     | WakeOutcome::Unavailable(DeliveryReason::AuthFailed)
             )
             .then(|| kind.fallback())
@@ -1248,6 +1248,13 @@ impl Supervisor {
                 Ok(dir) => dir,
                 Err(why) => {
                     let outcome = WakeOutcome::Failed(DeliveryReason::SessionNotFound);
+                    // An adapter with a fallback that needs no directory (a
+                    // stopped Codex conversation can still be queued) hands
+                    // over instead of leaving the mail unannounced.
+                    if kind.fallback().is_some() {
+                        log(&format!("{}: not resumed: {why}", entry.name));
+                        return Ok(outcome);
+                    }
                     if self.report_once(entry, ids, outcome).await {
                         log(&format!("{}: not resumed: {why}", entry.name));
                     }

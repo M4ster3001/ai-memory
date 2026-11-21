@@ -159,6 +159,7 @@ cli-help-root-agent-bus-about = { "O barramento de agentes: instalar o serviço 
 cli-help-root-agent-bus-install-about = { "Instalar o serviço de usuário que acorda agentes e o hook de despertar do Claude Code. Mostra o que fará e pergunta uma vez" }
 cli-help-root-agent-bus-install-yes-help = { "Instalar sem perguntar" }
 cli-help-root-agent-bus-install-dry-run-help = { "Mostrar o que seria instalado sem mudar nada" }
+cli-help-root-agent-bus-install-hooks-dir-help = { "Diretório com o pacote de hooks (`claude-code/`, `codex/`, ...), quando ele não está ao lado do binário nem em `<prefix>/share/ai-memory/hooks`" }
 cli-help-root-agent-bus-status-about = { "Mostrar o serviço, o hook de despertar, os agentes descobertos, o último despertar de cada um e os pares pausados" }
 cli-help-root-agent-bus-status-json-help = { "Imprimir JSON" }
 cli-help-root-agent-bus-doctor-about = { "Conferir cada peça de que o barramento precisa e dizer como corrigir o que falha" }

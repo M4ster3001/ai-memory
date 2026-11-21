@@ -840,7 +840,7 @@ discovered agents (below) use all four:
 | Adapter | Runs | Used for |
 | --- | --- | --- |
 | `codex_queue` | `codex queue --thread <id> --message <wake text>` | An open Codex conversation, and the fallback for a stopped one. The desktop app or daemon that has the conversation loaded starts the turn within about ten seconds; the desktop app may not show that turn on screen until the conversation is reloaded. A conversation nobody has open runs the item when it is opened. Never `--resume`, which fails with `already has an active writer` against a running chat. |
-| `codex_exec_resume` | `codex exec resume --skip-git-repo-check -c sandbox_mode="read-only" <id> <wake text>`, in the conversation's own directory (checked like a Claude Code one) | A Codex conversation whose session ended. A Codex CLI signed in with an API key whose organization is in the API credits promotion is refused (`codex_byok_restricted_by_api_credit_promo`): that is reported `agent_unavailable/auth_failed`, the adapter is not tried again for six hours, and the turn is queued with `codex_queue` instead. Sign the CLI in with `codex login` to allow headless turns. |
+| `codex_exec_resume` | `codex exec resume --skip-git-repo-check -c sandbox_mode="read-only" <id> <wake text>`, in the conversation's own directory (checked like a Claude Code one; when it fails the check the turn is queued instead) | A Codex conversation whose session ended. A Codex CLI signed in with an API key whose organization is in the API credits promotion is refused (`codex_byok_restricted_by_api_credit_promo`): that is reported `agent_unavailable/auth_failed`, the adapter is not tried again for six hours, and the turn is queued with `codex_queue` instead. Sign the CLI in with `codex login` to allow headless turns. |
 | `claude_resume` | `claude -p <wake text> --resume <id> --output-format json --max-turns 12 --permission-mode dontAsk --tools "" --allowedTools mcp__ai-memory`, in the session's own directory | A Claude Code session whose session ended. Only the ai-memory MCP tools are allowed. It runs only after `claude agents --json` lists no live process for the session; two processes on one session would fork its transcript. The directory must exist, belong to you, not be world-writable and not be under a temporary directory, or the mail is reported `wake_failed/session_not_found`. |
 | `gemini_resume` | `gemini --resume <id> --prompt <wake text> --output-format json --approval-mode default`, in the session's own directory | A Gemini CLI session whose session ended. Built from the Gemini CLI documentation and not yet run against a real Gemini CLI. An open Gemini CLI session hears of its mail through the notice at its next prompt. |
 
@@ -1068,7 +1068,8 @@ project, through the same `POST /inbox/wake-candidates` gate with an empty
 harness that a configured entry already supervises is left to that entry.
 
 The bus answer says whether the newest session is still open and the
-directory it ran in, and the supervisor picks the adapter from that: an open
+directory it reported last (every hook event refreshes it, so a session that
+moved, or whose first directory was deleted, is repaired by its next prompt), and the supervisor picks the adapter from that: an open
 Codex conversation gets `codex_queue`; a stopped one `codex_exec_resume`
 (falling back to `codex_queue`); a stopped Claude Code session `claude_resume`;
 a stopped Gemini CLI session `gemini_resume`. An open Claude Code session is
@@ -1123,9 +1124,10 @@ context without blocking, return `hookSpecificOutput.additionalContext`").
   15 seconds, with the fixed line `ai-memory: N new message(s) arrived for
   <agent> in <workspace>/<project> while you work, newest <id>. ...`. The
   seen ids live in `inbox-watch/turn-*.json` under the hook's data directory.
-- `install-hooks --apply` already installs these hooks for both harnesses;
-  only native installs send the notice, not the shell scripts of the Docker
-  wrapper. `agent-bus doctor` checks it.
+- `agent-bus install` writes these native hooks for every agent it finds
+  (it runs `install-hooks --agent <agent> --apply` for each); the shell
+  scripts of the Docker wrapper do not send the notice. `agent-bus doctor`
+  checks it.
 - A single tool call that runs for minutes (a long build) finishes before the
   agent can see the line: the hook runs between calls, never during one. A
   server older than this flag answers its count-only text, which the hook

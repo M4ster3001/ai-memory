@@ -57,6 +57,65 @@ struct Host {
     manager: Option<ServiceManager>,
     unit: Option<user_service::ServiceUnit>,
     claude_settings: Option<PathBuf>,
+    /// The agents found on this machine, by their `install-hooks --agent`
+    /// name, with the hooks file that install writes.
+    agents: Vec<(&'static str, PathBuf)>,
+}
+
+/// The agents `install` wires, found by their configuration directory:
+/// `~/.claude`, `$CODEX_HOME` or `~/.codex`, `~/.gemini`.
+fn detected_agents(config: &Config) -> Vec<(&'static str, PathBuf)> {
+    let candidates = [
+        (
+            "claude-code",
+            super::install_hooks::claude_settings_path().ok(),
+        ),
+        (
+            "codex",
+            super::install_hooks::codex_hooks_path(&config.runtime_env).ok(),
+        ),
+        (
+            "gemini-cli",
+            super::install_hooks::gemini_settings_path().ok(),
+        ),
+    ];
+    candidates
+        .into_iter()
+        .filter_map(|(agent, path)| {
+            let path = path?;
+            path.parent()
+                .is_some_and(Path::is_dir)
+                .then_some((agent, path))
+        })
+        .collect()
+}
+
+/// The command that writes `agent`'s native hooks: this binary's own
+/// `install-hooks --apply`, with this installation's data directory and
+/// configuration, so the hooks reach the same server with the same token.
+fn install_hooks_argv(
+    exe: &Path,
+    data_dir: &Path,
+    config_path: &Path,
+    agent: &str,
+    hooks_dir: Option<&Path>,
+) -> Vec<String> {
+    let mut argv = vec![
+        exe.to_string_lossy().into_owned(),
+        "--data-dir".to_owned(),
+        data_dir.to_string_lossy().into_owned(),
+        "--config".to_owned(),
+        config_path.to_string_lossy().into_owned(),
+        "install-hooks".to_owned(),
+        "--agent".to_owned(),
+        agent.to_owned(),
+        "--apply".to_owned(),
+    ];
+    if let Some(dir) = hooks_dir {
+        argv.push("--hooks-dir".to_owned());
+        argv.push(dir.to_string_lossy().into_owned());
+    }
+    argv
 }
 
 fn host(config: &Config, config_path: Option<&Path>) -> Result<Host> {
@@ -93,6 +152,7 @@ fn host(config: &Config, config_path: Option<&Path>) -> Result<Host> {
         manager,
         unit,
         claude_settings,
+        agents: detected_agents(config),
     })
 }
 
@@ -329,13 +389,33 @@ async fn install_command(
         config.data_dir.display(),
         host.config_path.display()
     );
-    match &host.claude_settings {
-        Some(path) => println!(
-            "  2. add a Stop hook (asyncRewake) to {} that wakes an open Claude Code session: {}",
+    if host.agents.is_empty() {
+        println!("  2. write no agent hooks: no ~/.claude, ~/.codex or ~/.gemini directory");
+    } else {
+        println!(
+            "  2. write the native hooks of each agent found (session discovery, and the mail notice between tool calls):"
+        );
+        for (agent, path) in &host.agents {
+            println!(
+                "     {agent}: {} (backup kept), as `{}`",
+                path.display(),
+                install_hooks_argv(
+                    &host.exe,
+                    &config.data_dir,
+                    &host.config_path,
+                    agent,
+                    args.hooks_dir.as_deref()
+                )[5..]
+                    .join(" ")
+            );
+        }
+    }
+    if let Some(path) = &host.claude_settings {
+        println!(
+            "     and the Claude Code wake hook (Stop, asyncRewake) in {}: {}",
             path.display(),
             handler["command"].as_str().unwrap_or_default()
-        ),
-        None => println!("  2. skip the Claude Code wake hook: no ~/.claude directory"),
+        );
     }
     println!(
         "  3. start the service: {}",
@@ -389,6 +469,34 @@ async fn install_command(
     ai_memory_wiki::write_atomic(&unit.path, unit.contents.as_bytes())
         .with_context(|| format!("writing {}", unit.path.display()))?;
     println!("Wrote {}", unit.path.display());
+    let mut hooks_ok = true;
+    for (agent, _) in &host.agents {
+        let argv = install_hooks_argv(
+            &host.exe,
+            &config.data_dir,
+            &host.config_path,
+            agent,
+            args.hooks_dir.as_deref(),
+        );
+        let ran = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            // The Docker wrapper forces the shell scripts through this
+            // variable; the bus needs the native hook command.
+            .env_remove("AI_MEMORY_HOOK_PLATFORM")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        if ran.is_ok_and(|status| status.success()) {
+            println!("Wrote the {agent} hooks");
+        } else {
+            hooks_ok = false;
+            println!(
+                "Could not write the {agent} hooks; run `{}` to see why",
+                argv[5..].join(" ")
+            );
+        }
+    }
     if let Some(path) = &host.claude_settings {
         let settings = read_settings(path)?;
         if path.exists() {
@@ -421,7 +529,7 @@ async fn install_command(
     if started {
         println!("Started the service. Check it with `ai-memory agent-bus status`.");
     }
-    Ok(i32::from(!started))
+    Ok(i32::from(!started || !hooks_ok))
 }
 
 /// The service's state, as the service manager says it.
@@ -587,7 +695,7 @@ async fn doctor_command(config: &Config, config_path: Option<&Path>) -> Result<i
     check(
         host.unit.as_ref().is_some_and(|unit| unit.path.exists()),
         format!("service installed ({service})"),
-        "run `ai-memory agent-bus install`",
+        "run `ai-memory agent-bus install --yes`",
     );
     check(
         matches!(service.as_str(), "active" | "loaded"),
@@ -598,7 +706,7 @@ async fn doctor_command(config: &Config, config_path: Option<&Path>) -> Result<i
         check(
             has_rewake_hook(path),
             format!("Claude Code wake hook in {}", path.display()),
-            "run `ai-memory agent-bus install`, then restart open Claude Code sessions",
+            "run `ai-memory agent-bus install --yes`, then restart open Claude Code sessions",
         );
     }
     if let Some(path) = &host.claude_settings {
@@ -608,7 +716,7 @@ async fn doctor_command(config: &Config, config_path: Option<&Path>) -> Result<i
                 "Claude Code mid-turn mail notice (native PostToolUse hook) in {}",
                 path.display()
             ),
-            "run `ai-memory install-hooks --agent claude-code --apply` with the native binary; the Docker hook scripts do not send the notice",
+            "run `ai-memory agent-bus install --yes` (it writes the native hooks; the Docker hook scripts do not send the notice)",
         );
     }
     if let Ok(path) = super::install_hooks::codex_hooks_path(&config.runtime_env)
@@ -620,7 +728,7 @@ async fn doctor_command(config: &Config, config_path: Option<&Path>) -> Result<i
                 "Codex mid-turn mail notice (native PostToolUse hook) in {}",
                 path.display()
             ),
-            "run `ai-memory install-hooks --agent codex --apply` with the native binary; the Docker hook scripts do not send the notice",
+            "run `ai-memory agent-bus install --yes` (it writes the native hooks; the Docker hook scripts do not send the notice)",
         );
     }
     if let Ok(status) = &status {
@@ -628,7 +736,7 @@ async fn doctor_command(config: &Config, config_path: Option<&Path>) -> Result<i
         check(
             !agents.is_empty(),
             format!("hook sessions reported {} agent(s)", agents.len()),
-            "run `ai-memory install-hooks` for each agent and start a session",
+            "run `ai-memory agent-bus install --yes`, then open an agent in any project",
         );
         for agent in &agents {
             let kind = agent["handle_kind"].as_str().unwrap_or_default();
@@ -682,6 +790,7 @@ mod tests {
             manager: None,
             unit: None,
             claude_settings: Some(dir.join("settings.json")),
+            agents: Vec::new(),
         };
         (host, config)
     }
@@ -761,6 +870,31 @@ mod tests {
             &tmp.path().join("missing.json"),
             "codex"
         ));
+    }
+
+    #[test]
+    fn install_writes_each_agent_through_its_own_install_hooks() {
+        let argv = install_hooks_argv(
+            Path::new("/b/ai-memory"),
+            Path::new("/d"),
+            Path::new("/d/config.toml"),
+            "codex",
+            None,
+        );
+        assert_eq!(
+            argv,
+            [
+                "/b/ai-memory",
+                "--data-dir",
+                "/d",
+                "--config",
+                "/d/config.toml",
+                "install-hooks",
+                "--agent",
+                "codex",
+                "--apply"
+            ]
+        );
     }
 
     #[test]

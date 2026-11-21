@@ -28,6 +28,7 @@ pub(crate) fn record_wake_handle_in_tx(
     project_id: ProjectId,
     agent: AgentKind,
     kind: WakeHandleKind,
+    cwd: Option<&str>,
     now: i64,
 ) -> StoreResult<()> {
     if WakeHandleKind::for_agent(agent) != Some(kind) {
@@ -38,14 +39,16 @@ pub(crate) fn record_wake_handle_in_tx(
     tx.execute(
         "INSERT INTO agent_wake_handles \
              (session_id, workspace_id, project_id, agent_kind, handle_kind, handle, \
-              first_seen_at, last_seen_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7) \
+              first_seen_at, last_seen_at, cwd) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?9) \
          ON CONFLICT(session_id) DO UPDATE SET \
              workspace_id = excluded.workspace_id, \
              project_id = excluded.project_id, \
-             last_seen_at = excluded.last_seen_at \
+             last_seen_at = excluded.last_seen_at, \
+             cwd = COALESCE(excluded.cwd, agent_wake_handles.cwd) \
          WHERE agent_wake_handles.workspace_id IS NOT excluded.workspace_id \
             OR agent_wake_handles.project_id IS NOT excluded.project_id \
+            OR (excluded.cwd IS NOT NULL AND agent_wake_handles.cwd IS NOT excluded.cwd) \
             OR agent_wake_handles.last_seen_at < excluded.last_seen_at - ?8",
         params![
             session.as_bytes(),
@@ -56,6 +59,7 @@ pub(crate) fn record_wake_handle_in_tx(
             session.to_string(),
             now,
             LAST_SEEN_REFRESH_MICROS,
+            cwd.filter(|cwd| cwd.len() <= 4_096),
         ],
     )?;
     Ok(())
@@ -271,7 +275,8 @@ fn bus_targets_in(
         })?
         .collect::<Result<_, _>>()?;
     let mut handles = conn.prepare(
-        "SELECT h.handle_kind, h.handle, s.ended_at IS NULL, h.last_seen_at, s.cwd \
+        "SELECT h.handle_kind, h.handle, s.ended_at IS NULL, h.last_seen_at, \
+                COALESCE(h.cwd, s.cwd) \
          FROM agent_wake_handles h JOIN sessions s ON s.id = h.session_id \
          WHERE h.workspace_id = ?1 AND h.project_id = ?2 AND h.agent_kind = ?3 \
          ORDER BY (s.ended_at IS NULL) DESC, h.last_seen_at DESC LIMIT 1",
