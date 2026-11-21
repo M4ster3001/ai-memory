@@ -48,14 +48,14 @@
   <aside id="connect" class="surface composer" aria-labelledby="connect-title">
     <div class="composer-heading"><span class="compose-icon" aria-hidden="true">⇄</span><div><p class="eyebrow">{{ i18n.text("web-chat-connect-eyebrow") }}</p><h2 id="connect-title">{{ i18n.text("web-chat-connect-title") }}</h2></div></div>
     <form id="link-form" action="chat/links" method="post">
-      <label class="field-label" for="link-from">{{ i18n.text("web-chat-connect-from") }}</label>
-      <select id="link-from" class="field-input" required>{% for option in projects %}<option data-workspace="{{ option.workspace }}" data-project="{{ option.project }}" {% if option.selected %}selected{% endif %}>{{ option.workspace }} / {{ option.project }}</option>{% endfor %}</select>
-      <label class="field-label" for="link-to">{{ i18n.text("web-chat-connect-to") }}</label>
-      <select id="link-to" class="field-input" required><option value="">{{ i18n.text("web-chat-connect-choose") }}</option>{% for option in projects %}<option data-workspace="{{ option.workspace }}" data-project="{{ option.project }}">{{ option.workspace }} / {{ option.project }}</option>{% endfor %}</select>
-      <label class="field-label" for="link-reason">{{ i18n.text("web-chat-connect-reason") }}</label>
-      <input id="link-reason" class="field-input" maxlength="300" required placeholder="{{ i18n.text("web-chat-connect-reason-hint") }}">
-      <label class="field-label" for="link-hours">{{ i18n.text("web-chat-connect-valid") }}</label>
-      <select id="link-hours" class="field-input"><option value="0.5">30 min</option><option value="1">1 h</option><option value="2" selected>2 h</option><option value="6">6 h</option><option value="12">12 h</option><option value="24">24 h</option></select>
+      <div class="chat-field"><label class="field-label" for="link-from">{{ i18n.text("web-chat-connect-from") }}</label>
+      <select id="link-from" class="field-input" required>{% for option in projects %}<option data-workspace="{{ option.workspace }}" data-project="{{ option.project }}" {% if option.selected %}selected{% endif %}>{{ option.workspace }} / {{ option.project }}</option>{% endfor %}</select></div>
+      <div class="chat-field"><label class="field-label" for="link-to">{{ i18n.text("web-chat-connect-to") }}</label>
+      <select id="link-to" class="field-input" required><option value="">{{ i18n.text("web-chat-connect-choose") }}</option>{% for option in projects %}<option data-workspace="{{ option.workspace }}" data-project="{{ option.project }}">{{ option.workspace }} / {{ option.project }}</option>{% endfor %}</select></div>
+      <div class="chat-field chat-field-wide"><label class="field-label" for="link-reason">{{ i18n.text("web-chat-connect-reason") }}</label>
+      <input id="link-reason" class="field-input" maxlength="300" required placeholder="{{ i18n.text("web-chat-connect-reason-hint") }}"></div>
+      <div class="chat-field"><label class="field-label" for="link-hours">{{ i18n.text("web-chat-connect-valid") }}</label>
+      <select id="link-hours" class="field-input"><option value="0.5">30 min</option><option value="1">1 h</option><option value="2" selected>2 h</option><option value="6">6 h</option><option value="12">12 h</option><option value="24">24 h</option></select></div>
       <label class="chat-check"><input id="link-both" type="checkbox"> <span>{{ i18n.text("web-chat-connect-both") }}</span></label>
       <div class="delivery-note"><span aria-hidden="true">◷</span><p>{{ i18n.text("web-chat-connect-note") }}</p></div>
       <button class="primary-button send-button" type="submit">{{ i18n.text("web-chat-connect-submit") }} <span aria-hidden="true">⇄</span></button>
@@ -130,7 +130,7 @@
   // Near real time without a model: the server holds this request until
   // something in the project changes, then answers with the fresh timeline.
   if(feed){
-    var cursor=feed.dataset.cursor,running=false,stopped=false,failures=0,wake=null;
+    var cursor=feed.dataset.cursor,running=false,stopped=false,failures=0,wake=null,first=true;
     function setLive(state,text){live.dataset.state=state;live.textContent=text;}
     function show(html){
       var atEnd=feed.scrollHeight-feed.scrollTop-feed.clientHeight<80;
@@ -153,7 +153,7 @@
       if(running)return;running=true;
       while(!stopped){
         if(document.hidden){await new Promise(function(resolve){wake=resolve;});wake=null;continue;}
-        try{await poll(20000);failures=0;}
+        try{await poll(first?0:20000);first=false;failures=0;}
         catch(error){failures+=1;setLive("offline",{{ i18n.js("web-chat-offline")|safe }});await new Promise(function(resolve){setTimeout(resolve,Math.min(15000,1000*failures*failures));});}
       }
       running=false;

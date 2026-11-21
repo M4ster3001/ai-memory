@@ -144,8 +144,7 @@ fn mail_bubble(
     );
     let direction = if mail.from.key.project_id == shown.project_id {
         format!(
-            "{} → {}{}",
-            sender_label(mail.from_agent, i18n),
+            "→ {}{}",
             to_agent,
             if cross {
                 format!(" · {}/{}", mail.to.workspace, mail.to.project)
@@ -155,11 +154,8 @@ fn mail_bubble(
         )
     } else {
         format!(
-            "{}/{} · {} → {}",
-            mail.from.workspace,
-            mail.from.project,
-            sender_label(mail.from_agent, i18n),
-            to_agent
+            "{}/{} → {}",
+            mail.from.workspace, mail.from.project, to_agent
         )
     };
     let (body, truncated) = mail
@@ -175,8 +171,18 @@ fn mail_bubble(
         Some(reason) => format!("{}/{reason}", mail.delivery_state),
         None => mail.delivery_state.clone(),
     };
+    // The mail a room mention creates repeats the post it points at: show it
+    // as a note under the post, with its delivery state, not as a bubble.
+    let mention = mail.scope == ChatScope::Internal
+        && mail.subject.as_deref().is_some_and(|subject| {
+            subject.starts_with("room ") && subject.ends_with(": you were mentioned")
+        })
+        && mail
+            .body
+            .as_deref()
+            .is_some_and(|body| body.starts_with("You were mentioned in room \""));
     ChatBubble {
-        kind: "mail",
+        kind: if mention { "mention" } else { "mail" },
         key: mail.id.to_string(),
         side: if mail.from_agent == AgentKind::Other {
             "end"
@@ -194,9 +200,9 @@ fn mail_bubble(
         },
         cross,
         redacted: mail.scope == ChatScope::Hidden,
-        subject,
-        body,
-        truncated,
+        subject: if mention { String::new() } else { subject },
+        body: if mention { String::new() } else { body },
+        truncated: truncated && !mention,
         when: when(mail.at),
         when_full: when_full(mail.at),
         delivery_tone: delivery_tone(&mail.delivery_state),

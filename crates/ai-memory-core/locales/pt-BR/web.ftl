@@ -861,3 +861,4 @@ web-chat-read = lida
 web-chat-receipt = Recibo
 web-chat-human = humano
 web-chat-any-agent = qualquer agente
+web-chat-mention-mail = Mensagem de menção enviada
