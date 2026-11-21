@@ -367,6 +367,44 @@ pub(crate) fn record_human_prompt_in_tx(
     Ok(())
 }
 
+/// Record that the root user wrote to the agents of a project from the
+/// dashboard at `at`: every harness the project has a wake handle for gets a
+/// human anchor, and every paused pair with a side in the project resumes.
+pub(crate) fn record_human_chat_in_tx(
+    tx: &Transaction<'_>,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    at: i64,
+) -> StoreResult<()> {
+    tx.execute(
+        "INSERT INTO agent_human_anchors (workspace_id, project_id, agent_kind, last_prompt_at) \
+         SELECT DISTINCT workspace_id, project_id, agent_kind, ?3 FROM agent_wake_handles \
+         WHERE workspace_id = ?1 AND project_id = ?2 \
+         ON CONFLICT DO UPDATE SET last_prompt_at = MAX(last_prompt_at, excluded.last_prompt_at)",
+        params![workspace_id.as_bytes(), project_id.as_bytes(), at],
+    )?;
+    let resumed = tx.execute(
+        "UPDATE agent_pair_pauses SET paused_at = NULL, resumed_at = ?3, resumed_via = 'dashboard' \
+         WHERE paused_at IS NOT NULL AND paused_at <= ?3 \
+           AND ((a_workspace_id = ?1 AND a_project_id = ?2) \
+             OR (b_workspace_id = ?1 AND b_project_id = ?2))",
+        params![workspace_id.as_bytes(), project_id.as_bytes(), at],
+    )?;
+    if resumed > 0 {
+        crate::ops::audit_with_detail(
+            tx,
+            "agent_pair_resumed",
+            Some(workspace_id.as_bytes()),
+            Some(project_id.as_bytes()),
+            None,
+            None,
+            at,
+            &serde_json::json!({"via": "dashboard_chat", "pairs": resumed}).to_string(),
+        )?;
+    }
+    Ok(())
+}
+
 /// Resume one paused pair from the dashboard. Returns whether it was
 /// paused.
 pub(crate) fn resume_pair(

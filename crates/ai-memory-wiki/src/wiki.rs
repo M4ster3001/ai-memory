@@ -422,6 +422,71 @@ impl Wiki {
         Ok(self.writer.resume_agent_pair(a, b).await?)
     }
 
+    /// Post to a room as the root user from the dashboard: the text is
+    /// scrubbed and bounded, the post counts as a human prompt for the
+    /// project's agents (it resumes their paused pairs), and an `@harness`
+    /// mention becomes mail as for any post. Callers must hold the root
+    /// credential and have resolved the project without creating it.
+    pub async fn post_human_room_message(
+        &self,
+        workspace_id: ai_memory_core::WorkspaceId,
+        project_id: ai_memory_core::ProjectId,
+        room: ai_memory_core::rooms::RoomName,
+        body: &str,
+    ) -> WikiResult<ai_memory_store::RoomPostOutcome> {
+        let body: String = self
+            .sanitizer
+            .scrub(body)
+            .chars()
+            .take(ai_memory_core::rooms::MAX_ROOM_POST_CHARS)
+            .collect();
+        Ok(self
+            .writer
+            .room_post_human(ai_memory_store::NewRoomPost {
+                workspace_id,
+                project_id,
+                room,
+                from_agent: ai_memory_core::AgentKind::Other,
+                from_session_id: None,
+                from_owner_user: None,
+                body,
+            })
+            .await?)
+    }
+
+    /// File a request to link two projects as the root user, scrubbing the
+    /// reason. Callers must hold the root credential.
+    pub async fn request_project_link(
+        &self,
+        mut request: ai_memory_store::NewLinkRequest,
+    ) -> WikiResult<ai_memory_store::LinkRequestOutcome> {
+        request.reason = self.sanitizer.scrub(&request.reason);
+        Ok(self.writer.link_request(request).await?)
+    }
+
+    /// Confirm a link from the destination project's dashboard page.
+    /// `viewing` is the project whose page the root user pressed the button
+    /// on: only the link's destination is accepted. Callers must hold the
+    /// root credential.
+    pub async fn confirm_project_link(
+        &self,
+        id: ai_memory_core::AgentLinkId,
+        viewing: ai_memory_store::ProjectKey,
+    ) -> WikiResult<ai_memory_store::LinkConfirmOutcome> {
+        Ok(self.writer.link_confirm_web(id, viewing).await?)
+    }
+
+    /// End a link as the root user. Callers must hold the root credential.
+    pub async fn close_project_link(
+        &self,
+        id: ai_memory_core::AgentLinkId,
+    ) -> WikiResult<ai_memory_store::LinkCloseOutcome> {
+        Ok(self
+            .writer
+            .link_close(id, ai_memory_store::LinkCloser::Human)
+            .await?)
+    }
+
     /// Take a pending message out of its recipient's queue so its sender can
     /// edit it. Until it is saved or released no harness can collect it.
     /// Returns `None` when the message is not pending in that project.

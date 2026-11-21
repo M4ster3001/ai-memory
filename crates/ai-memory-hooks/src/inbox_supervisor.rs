@@ -82,6 +82,11 @@ enum WakeSender {
     /// write to itself again would loop). Two sessions of one harness in one
     /// project cannot be told apart, so their mail to each other lands here.
     SameAgent,
+    /// Another project joined to the watched one by an active link
+    /// (`agent_links`: requested, confirmed by the destination, not yet
+    /// expired or closed). It wakes like `same_project`, and only for the
+    /// two projects the link names.
+    Linked,
     /// A project in `wake_from`, and the server recorded the sender's
     /// session there when the message was sent.
     Listed,
@@ -309,6 +314,7 @@ pub(crate) async fn handle_wake_candidates(
                 }
                 MessageKind::Message if candidate.pair_paused => WakeSender::Paused,
                 MessageKind::Message if own_project => WakeSender::SameProject,
+                MessageKind::Message if candidate.linked => WakeSender::Linked,
                 MessageKind::Message
                     if listed
                         .contains(&(candidate.from_workspace_id, candidate.from_project_id)) =>
@@ -406,9 +412,10 @@ pub(crate) async fn handle_wake_report(
 
 /// The pending mail that may interrupt `agent` in the middle of a turn, from
 /// its wake candidates in `(ws, proj)`: a receipt, or a message from another
-/// harness of the same project that the loop guard did not pause. Mail from
-/// another project, the agent's own mail and paused mail never interrupt it,
-/// the same rule the wake supervisor applies to a discovered agent.
+/// harness of the same project or of a project joined to it by an active
+/// link, that the loop guard did not pause. Mail from any other project, the
+/// agent's own mail and paused mail never interrupt it, the same rule the
+/// wake supervisor applies to a discovered agent.
 #[must_use]
 pub fn turn_notice_ids(
     candidates: &[ai_memory_store::WakeCandidate],
@@ -421,10 +428,10 @@ pub fn turn_notice_ids(
         .filter(|candidate| match candidate.kind {
             MessageKind::Receipt => true,
             MessageKind::Message => {
-                candidate.from_workspace_id == ws
+                let own = candidate.from_workspace_id == ws
                     && candidate.from_project_id == proj
-                    && candidate.from_agent != agent
-                    && !candidate.pair_paused
+                    && candidate.from_agent != agent;
+                (own || candidate.linked) && !candidate.pair_paused
             }
         })
         .map(|candidate| candidate.id)
@@ -449,6 +456,7 @@ mod tests {
             from_agent: agent,
             sender_session_recorded: false,
             pair_paused: paused,
+            linked: false,
         }
     }
 
@@ -471,5 +479,29 @@ mod tests {
         ];
         let ids = turn_notice_ids(&all, here.0, here.1, codex);
         assert_eq!(ids, [all[0].id, all[4].id]);
+    }
+
+    #[test]
+    fn mail_from_a_linked_project_interrupts_like_mail_from_the_own_project() {
+        let here = (WorkspaceId::new(), ProjectId::new());
+        let elsewhere = (here.0, ProjectId::new());
+        let codex = AgentKind::Codex;
+        let linked = |agent, paused| ai_memory_store::WakeCandidate {
+            linked: true,
+            ..candidate(MessageKind::Message, elsewhere, agent, paused)
+        };
+        let all = [
+            linked(AgentKind::ClaudeCode, false),
+            linked(codex, false),
+            linked(AgentKind::GeminiCli, true),
+            candidate(MessageKind::Message, elsewhere, AgentKind::Grok, false),
+        ];
+        let ids = turn_notice_ids(&all, here.0, here.1, codex);
+        assert_eq!(
+            ids,
+            [all[0].id, all[1].id],
+            "a linked project's agent of the same harness is another agent; only paused and \
+             unlinked mail stays quiet"
+        );
     }
 }

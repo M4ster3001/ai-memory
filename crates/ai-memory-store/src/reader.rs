@@ -2540,6 +2540,10 @@ pub struct WakeCandidate {
     /// Whether the loop guard paused wakes between the sender and the
     /// recipient (`agent_pair_pauses`). Always false for a receipt.
     pub pair_paused: bool,
+    /// Whether the sending project is another project joined to the
+    /// recipient's by an active, unexpired link (`agent_links`) at the time
+    /// of the read. A linked sender wakes like the recipient's own project.
+    pub linked: bool,
 }
 
 /// One workspace scope with the id + name needed to write its
@@ -9883,11 +9887,43 @@ impl ReaderPool {
         include_shared: bool,
         limit: usize,
     ) -> StoreResult<Vec<WakeCandidate>> {
+        self.wake_candidates_at(
+            workspace_id,
+            project_id,
+            agent,
+            include_shared,
+            limit,
+            jiff::Timestamp::now().as_microsecond(),
+        )
+        .await
+    }
+
+    /// [`Self::wake_candidates`] with the clock a link's expiry is compared
+    /// against (unix microseconds), so a test can read past a link's end.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn wake_candidates_at(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        agent: AgentKind,
+        include_shared: bool,
+        limit: usize,
+        now_us: i64,
+    ) -> StoreResult<Vec<WakeCandidate>> {
         let limit = i64::try_from(limit.clamp(1, 1_000)).unwrap_or(1_000);
         self.with_conn(move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, kind, from_workspace_id, from_project_id, from_session_id IS NOT NULL, \
-                 from_agent \
+                 from_agent, \
+                 from_project_id <> to_project_id AND EXISTS ( \
+                     SELECT 1 FROM agent_links l \
+                     WHERE l.state = 'active' AND l.expires_at > ?6 \
+                       AND ((l.from_project_id = agent_messages.from_project_id \
+                             AND l.to_project_id = agent_messages.to_project_id) \
+                         OR (l.from_project_id = agent_messages.to_project_id \
+                             AND l.to_project_id = agent_messages.from_project_id))) \
                  FROM agent_messages \
                  WHERE to_workspace_id = ?1 AND to_project_id = ?2 AND state = 'pending' \
                    AND (to_agent = ?3 OR (?4 AND to_agent IS NULL)) \
@@ -9900,6 +9936,7 @@ impl ReaderPool {
                     agent.as_str(),
                     include_shared,
                     limit,
+                    now_us,
                 ],
                 |row| {
                     Ok((
@@ -9909,6 +9946,7 @@ impl ReaderPool {
                         row.get::<_, Vec<u8>>(3)?,
                         row.get::<_, bool>(4)?,
                         row.get::<_, String>(5)?,
+                        row.get::<_, bool>(6)?,
                     ))
                 },
             )?;
@@ -9922,7 +9960,7 @@ impl ReaderPool {
                 },
             )?;
             let mut out = Vec::new();
-            for (id, kind, from_ws, from_pj, recorded, from_agent) in rows {
+            for (id, kind, from_ws, from_pj, recorded, from_agent, linked) in rows {
                 let kind: ai_memory_core::MessageKind = kind.parse().map_err(StoreError::from)?;
                 let from_workspace_id = WorkspaceId::from_slice(&from_ws)?;
                 let from_project_id = ProjectId::from_slice(&from_pj)?;
@@ -9941,6 +9979,7 @@ impl ReaderPool {
                     from_agent,
                     sender_session_recorded: recorded,
                     pair_paused,
+                    linked: linked && kind == ai_memory_core::MessageKind::Message,
                 });
             }
             Ok(out)

@@ -427,6 +427,40 @@ pub(crate) enum WriteCmd {
         post: crate::agent_rooms::NewRoomPost,
         reply: oneshot::Sender<StoreResult<crate::agent_rooms::RoomPostOutcome>>,
     },
+    /// Post to a room as the root user, from the dashboard.
+    RoomPostHuman {
+        post: crate::agent_rooms::NewRoomPost,
+        reply: oneshot::Sender<StoreResult<crate::agent_rooms::RoomPostOutcome>>,
+    },
+    /// File a request to link two projects.
+    LinkRequest {
+        request: crate::agent_links::NewLinkRequest,
+        reply: oneshot::Sender<StoreResult<crate::agent_links::LinkRequestOutcome>>,
+    },
+    /// Show the requests waiting for a project to one of its agent sessions.
+    LinkPresent {
+        project: crate::agent_links::ProjectKey,
+        agent: AgentKind,
+        session: SessionId,
+        reply: oneshot::Sender<StoreResult<Vec<ai_memory_core::AgentLinkId>>>,
+    },
+    /// Confirm a link from the destination project's web page.
+    LinkConfirmWeb {
+        id: ai_memory_core::AgentLinkId,
+        viewing: crate::agent_links::ProjectKey,
+        reply: oneshot::Sender<StoreResult<crate::agent_links::LinkConfirmOutcome>>,
+    },
+    /// Confirm a link as an agent of the destination project.
+    LinkConfirmAgent {
+        confirm: crate::agent_links::AgentConfirm,
+        reply: oneshot::Sender<StoreResult<crate::agent_links::LinkConfirmOutcome>>,
+    },
+    /// End a link.
+    LinkClose {
+        id: ai_memory_core::AgentLinkId,
+        closer: crate::agent_links::LinkCloser,
+        reply: oneshot::Sender<StoreResult<crate::agent_links::LinkCloseOutcome>>,
+    },
     /// Audit a program the host supervisor trusted.
     RecordBusProgram {
         detail: String,
@@ -2365,6 +2399,110 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Post to a room as the root user from the dashboard. Like
+    /// [`Self::room_post`], and the post also counts as a human prompt for
+    /// the project's agents: it resumes the project's paused pairs.
+    ///
+    /// # Errors
+    /// [`StoreError::WriterClosed`] or SQL errors.
+    pub async fn room_post_human(
+        &self,
+        post: crate::agent_rooms::NewRoomPost,
+    ) -> StoreResult<crate::agent_rooms::RoomPostOutcome> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RoomPostHuman { post, reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// File a request to link two projects.
+    ///
+    /// # Errors
+    /// [`StoreError::WriterClosed`] or SQL errors.
+    pub async fn link_request(
+        &self,
+        request: crate::agent_links::NewLinkRequest,
+    ) -> StoreResult<crate::agent_links::LinkRequestOutcome> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::LinkRequest { request, reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Mark the requests waiting for `project` as shown to `session`.
+    /// Returns the ids of the requests the session had not seen.
+    ///
+    /// # Errors
+    /// [`StoreError::WriterClosed`] or SQL errors.
+    pub async fn link_present(
+        &self,
+        project: crate::agent_links::ProjectKey,
+        agent: AgentKind,
+        session: SessionId,
+    ) -> StoreResult<Vec<ai_memory_core::AgentLinkId>> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::LinkPresent {
+            project,
+            agent,
+            session,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Confirm a link from the destination project's web page.
+    ///
+    /// # Errors
+    /// [`StoreError::WriterClosed`] or SQL errors.
+    pub async fn link_confirm_web(
+        &self,
+        id: ai_memory_core::AgentLinkId,
+        viewing: crate::agent_links::ProjectKey,
+    ) -> StoreResult<crate::agent_links::LinkConfirmOutcome> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::LinkConfirmWeb {
+            id,
+            viewing,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Confirm a link as an agent of the destination project.
+    ///
+    /// # Errors
+    /// [`StoreError::WriterClosed`] or SQL errors.
+    pub async fn link_confirm_agent(
+        &self,
+        confirm: crate::agent_links::AgentConfirm,
+    ) -> StoreResult<crate::agent_links::LinkConfirmOutcome> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::LinkConfirmAgent { confirm, reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// End a link.
+    ///
+    /// # Errors
+    /// [`StoreError::WriterClosed`] or SQL errors.
+    pub async fn link_close(
+        &self,
+        id: ai_memory_core::AgentLinkId,
+        closer: crate::agent_links::LinkCloser,
+    ) -> StoreResult<crate::agent_links::LinkCloseOutcome> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::LinkClose {
+            id,
+            closer,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Advance a member's read position, never backwards. Returns whether
     /// `agent` is a member.
     ///
@@ -4293,6 +4431,10 @@ impl Drop for WriterInner {
 /// noise instead of silent loss. The result itself is consumed by
 /// the failed `send` and discarded — the caller's await has already
 /// returned a JoinError-shaped failure by this point.
+fn now_micros() -> i64 {
+    jiff::Timestamp::now().as_microsecond()
+}
+
 fn send_or_warn<T>(reply: oneshot::Sender<T>, result: T, op: &'static str) {
     if reply.send(result).is_err() {
         tracing::warn!(
@@ -4336,6 +4478,9 @@ fn worker_loop(
                 let result = conn.transaction().map_err(StoreError::from).and_then(|tx| {
                     let outcome =
                         crate::message_delivery::sweep_message_deadlines(&tx, now_us, batch)?;
+                    // Links share the sweep: a link whose clock ran out ends
+                    // here, though the wake gate never waited for it.
+                    crate::agent_links::expire_due_in_tx(&tx, now_us)?;
                     tx.commit()?;
                     Ok(outcome)
                 });
@@ -4994,6 +5139,41 @@ fn worker_loop(
                     }
                 }
                 send_or_warn(reply, result, "room_post");
+            }
+            WriteCmd::RoomPostHuman { post, reply } => {
+                let result = crate::agent_rooms::post_as_human(&mut conn, &post, &delivery_policy);
+                if let Ok(outcome) = &result {
+                    for (agent, _) in &outcome.mentioned {
+                        inbox_signals.notify(post.workspace_id, post.project_id, Some(*agent));
+                    }
+                }
+                send_or_warn(reply, result, "room_post_human");
+            }
+            WriteCmd::LinkRequest { request, reply } => {
+                let result = crate::agent_links::request(&mut conn, &request, now_micros());
+                send_or_warn(reply, result, "link_request");
+            }
+            WriteCmd::LinkPresent {
+                project,
+                agent,
+                session,
+                reply,
+            } => {
+                let result =
+                    crate::agent_links::present(&mut conn, project, agent, session, now_micros());
+                send_or_warn(reply, result, "link_present");
+            }
+            WriteCmd::LinkConfirmWeb { id, viewing, reply } => {
+                let result = crate::agent_links::confirm_web(&mut conn, id, viewing, now_micros());
+                send_or_warn(reply, result, "link_confirm_web");
+            }
+            WriteCmd::LinkConfirmAgent { confirm, reply } => {
+                let result = crate::agent_links::confirm_agent(&mut conn, &confirm, now_micros());
+                send_or_warn(reply, result, "link_confirm_agent");
+            }
+            WriteCmd::LinkClose { id, closer, reply } => {
+                let result = crate::agent_links::close(&mut conn, id, closer, now_micros());
+                send_or_warn(reply, result, "link_close");
             }
             WriteCmd::RecordBusProgram { detail, reply } => {
                 let result = crate::agent_wake_guard::record_bus_program(&mut conn, &detail);

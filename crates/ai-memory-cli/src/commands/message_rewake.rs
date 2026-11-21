@@ -107,7 +107,9 @@ fn split_candidates(
             continue;
         }
         match candidate.sender {
-            CandidateSender::SameProject | CandidateSender::System => wake.push(id),
+            CandidateSender::SameProject | CandidateSender::Linked | CandidateSender::System => {
+                wake.push(id);
+            }
             CandidateSender::Paused => paused.push(id),
             _ => {}
         }
@@ -361,13 +363,18 @@ mod tests {
                 {"id": id(5), "sender": "unlisted"},
                 {"id": id(6), "sender": "a_label_from_a_newer_server"},
                 {"id": id(7), "sender": "same_project"},
+                {"id": id(8), "sender": "linked"},
             ],
             "unresolved_wake_from": 0,
         }))
         .unwrap();
-        let new: BTreeSet<String> = (1..=6).map(id).collect();
+        let new: BTreeSet<String> = [1, 2, 3, 4, 5, 6, 8].into_iter().map(id).collect();
         let (wake, paused) = split_candidates(&reply, &new);
-        assert_eq!(wake, [id(1), id(4)], "id 7 was already announced");
+        assert_eq!(
+            wake,
+            [id(1), id(4), id(8)],
+            "id 7 was already announced; a linked project wakes like the own one"
+        );
         assert_eq!(paused, [id(3)]);
     }
 }

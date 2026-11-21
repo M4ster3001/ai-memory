@@ -253,6 +253,27 @@ pub(crate) fn post(
     post: &NewRoomPost,
     policy: &ai_memory_core::DeliveryPolicy,
 ) -> StoreResult<RoomPostOutcome> {
+    post_as(conn, post, policy, false)
+}
+
+/// Post as the root user from the dashboard. Besides the post itself, it
+/// counts as a human prompt for every agent of the project: it anchors the
+/// loop guard and resumes the project's paused pairs, the way a prompt typed
+/// into one of the agents does.
+pub(crate) fn post_as_human(
+    conn: &mut Connection,
+    post: &NewRoomPost,
+    policy: &ai_memory_core::DeliveryPolicy,
+) -> StoreResult<RoomPostOutcome> {
+    post_as(conn, post, policy, true)
+}
+
+fn post_as(
+    conn: &mut Connection,
+    post: &NewRoomPost,
+    policy: &ai_memory_core::DeliveryPolicy,
+    human: bool,
+) -> StoreResult<RoomPostOutcome> {
     if post.body.trim().is_empty() || post.body.chars().count() > MAX_ROOM_POST_CHARS {
         return Err(StoreError::InvalidState(format!(
             "a room post is 1 to {MAX_ROOM_POST_CHARS} characters"
@@ -341,6 +362,14 @@ pub(crate) fn post(
         };
         let id = crate::ops::insert_message_in_tx(&tx, &message, policy)?;
         mentioned.push((agent, id));
+    }
+    if human {
+        crate::agent_wake_guard::record_human_chat_in_tx(
+            &tx,
+            post.workspace_id,
+            post.project_id,
+            at,
+        )?;
     }
     tx.commit()?;
     Ok(RoomPostOutcome {
