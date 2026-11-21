@@ -1357,4 +1357,131 @@ mod slow {
         pop_as(&f, "claude-code", &id);
         pop_as(&f, "claude-code", &own);
     }
+
+    /// Run the native `ai-memory hook` the way Codex runs it around a tool
+    /// call, from `dir`, against the fixture's server. Returns its stdout and
+    /// how long it took.
+    fn tool_hook(
+        f: &Fixture,
+        dir: &Path,
+        server: &str,
+        event: &str,
+        session: &str,
+    ) -> (String, Duration) {
+        use std::io::Write as _;
+        let started = Instant::now();
+        let mut child = hermetic(BIN)
+            .args([
+                "hook",
+                "--agent",
+                "codex",
+                "--event",
+                event,
+                "--server-url",
+                server,
+            ])
+            .env("AI_MEMORY_DATA_DIR", f.dd().join("hook-data"))
+            .env("AI_MEMORY_HOME", f.home.path())
+            .env("HOME", f.home.path())
+            .env("RUST_LOG", "off")
+            .current_dir(dir)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let hook_name = if event == "pre-tool-use" {
+            "PreToolUse"
+        } else {
+            "PostToolUse"
+        };
+        let body = json!({
+            "session_id": session, "cwd": dir, "hook_event_name": hook_name,
+            "tool_name": "Bash", "tool_input": {"command": "ls"}, "tool_response": "ok",
+        });
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(body.to_string().as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "{out:?}");
+        (String::from_utf8(out.stdout).unwrap(), started.elapsed())
+    }
+
+    fn context_of(stdout: &str) -> Option<String> {
+        stdout.lines().find_map(|line| {
+            serde_json::from_str::<Value>(line)
+                .ok()?
+                .pointer("/hookSpecificOutput/additionalContext")?
+                .as_str()
+                .map(str::to_owned)
+        })
+    }
+
+    /// The mid-turn notice: a Codex `PostToolUse` hook adds one fixed line
+    /// naming new mail from another agent of the project, once per message
+    /// and at most every 15 seconds; never the agent's own mail, never text;
+    /// and a server that does not answer costs the tool call nothing.
+    #[tokio::test]
+    async fn a_busy_codex_hears_of_new_mail_between_tool_calls() {
+        let f = fixture().await;
+        let project = tempfile::Builder::new()
+            .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+            .unwrap();
+        std::fs::write(
+            project.path().join(".ai-memory.toml"),
+            format!("workspace = \"{WORKSPACE}\"\nproject = \"{INBOX}\"\n"),
+        )
+        .unwrap();
+        const SESSION_A: &str = "00000000-0000-4000-8000-000000000306";
+        const SESSION_B: &str = "00000000-0000-4000-8000-000000000307";
+
+        let (out, _) = tool_hook(&f, project.path(), &f.base, "post-tool-use", SESSION_A);
+        assert_eq!(context_of(&out), None, "an empty inbox says nothing: {out}");
+
+        let id = send_to(&f, "claude-code", "codex", "BODY-CANARY build is green").await;
+        // Within the check interval of the first call: not checked yet.
+        let (out, _) = tool_hook(&f, project.path(), &f.base, "pre-tool-use", SESSION_A);
+        assert_eq!(context_of(&out), None, "checked again too soon: {out}");
+        std::thread::sleep(Duration::from_secs(5));
+        let (out, _) = tool_hook(&f, project.path(), &f.base, "pre-tool-use", SESSION_A);
+        let notice = context_of(&out).unwrap_or_else(|| panic!("no notice: {out}"));
+        assert!(
+            notice.starts_with(&format!(
+                "ai-memory: 1 new message(s) arrived for codex in {WORKSPACE}/{INBOX}"
+            )),
+            "{notice}"
+        );
+        assert!(notice.contains(&id) && !out.contains("CANARY"), "{out}");
+        let line: Value = serde_json::from_str(out.lines().next().unwrap()).unwrap();
+        assert_eq!(line["hookSpecificOutput"]["hookEventName"], "PreToolUse");
+
+        // The next tool call does not repeat it.
+        let (out, _) = tool_hook(&f, project.path(), &f.base, "post-tool-use", SESSION_A);
+        assert_eq!(context_of(&out), None, "{out}");
+
+        // Another session that never heard of the mail is told; once read,
+        // the agent's own mail to itself never makes a notice.
+        pop_as(&f, "codex", &id);
+        let own = send_to(&f, "codex", "codex", "a note to myself").await;
+        let (out, _) = tool_hook(&f, project.path(), &f.base, "post-tool-use", SESSION_B);
+        assert_eq!(context_of(&out), None, "its own mail was announced: {out}");
+        pop_as(&f, "codex", &own);
+
+        // A server that accepts the connection and never answers.
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let silent_url = format!("http://{}", silent.local_addr().unwrap());
+        let (out, took) = tool_hook(
+            &f,
+            project.path(),
+            &silent_url,
+            "post-tool-use",
+            "00000000-0000-4000-8000-000000000308",
+        );
+        assert_eq!(context_of(&out), None);
+        assert!(took < Duration::from_secs(3), "the hook waited {took:?}");
+        drop(silent);
+    }
 }

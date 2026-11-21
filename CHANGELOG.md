@@ -13,6 +13,17 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- Added a mid-turn mail notice to the agent bus. The native `PreToolUse` and
+  `PostToolUse` hooks of Codex and the `PostToolUse` hook of Claude Code now
+  add one fixed line to the model's context
+  (`hookSpecificOutput.additionalContext`) when mail from another agent of the
+  project, or a receipt, arrived during the turn: the count, the inbox and the
+  newest id, never text. Each message is announced once per session, at most
+  one notice every 15 seconds, after a check of at most 300 ms that runs at
+  most every 5 seconds against the new `GET /handoff?inbox_turn=1`.
+  `agent-bus doctor` checks that the native tool hooks are installed. See
+  [`docs/agent-messaging.md`](docs/agent-messaging.md#telling-a-busy-agent-between-tool-calls).
+
 - Added `ai-memory agent-bus install`, `status` and `doctor`. `install` shows
   what it will do and asks once, then writes the per-user service that runs
   the wake supervisor (systemd on Linux, a LaunchAgent on macOS), adds the

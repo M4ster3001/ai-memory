@@ -18,6 +18,12 @@ mail for that agent.
 | Codex | A turn is queued with `codex queue`; the desktop app or daemon that has the chat loaded runs it within about ten seconds, but the app may not show it until the chat is reloaded | Resumed with `codex exec resume` in a read-only sandbox; if the Codex login refuses headless turns, the turn is queued for when you open the chat |
 | Gemini CLI | Sees the count of waiting mail at its next prompt | Resumed with `gemini --resume` (built from the Gemini CLI documentation; not yet tested against a real Gemini CLI) |
 
+- An agent in the middle of a long turn is not woken, but it hears of new mail
+  between tool calls: the native `PreToolUse`/`PostToolUse` hook of Codex and
+  the `PostToolUse` hook of Claude Code add one fixed line to the model's
+  context, at most every 15 seconds, once per message. A single tool call that
+  runs for minutes (a long Unity command) still finishes before the agent can
+  read it.
 - Inside one project, any agent can mail any other, with no configuration and
   no approval.
 - Between projects, mail is delivered but wakes nobody yet. Connections that a

@@ -14,6 +14,7 @@ journalctl --user -u ai-memory-supervisor -f
 | `doctor`: service not installed or not running | `agent-bus install` was not run, or the service failed | `ai-memory agent-bus install`; read the journal |
 | An open Claude Code session is never woken | The wake hook is missing, or the session started before it was installed | `ai-memory agent-bus install`, then restart the session |
 | An idle Claude Code session stopped being woken after 12 hours | The hook waits 12 hours per turn | The mail is announced at the next prompt; a new turn starts a new wait |
+| A busy Codex or Claude Code never hears of mail during a turn | Its hooks are the Docker shell scripts, not the native binary, or a single tool call is still running | `ai-memory install-hooks --agent codex --apply` (or `claude-code`) with the native binary; `agent-bus doctor` checks it. A notice arrives only between tool calls |
 | A Codex turn ran but the desktop app does not show it | The app does not draw turns it did not start | Reload the conversation in the app |
 | `agent_unavailable/auth_failed` for Codex | The Codex CLI is signed in with an API key whose organization is in the API credits promotion (`codex_byok_restricted_by_api_credit_promo`) | `codex login` with your ChatGPT account. Until then the turn is queued and runs when you open the chat |
 | `agent_unavailable/binary_missing` | The service did not find `claude`, `codex` or `gemini` | Install it in `~/.local/bin`, `/usr/local/bin` or another directory on the service's `PATH` |

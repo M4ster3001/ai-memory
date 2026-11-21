@@ -2555,7 +2555,61 @@ where
         }
     }
 
-    // post-tool-use: Grok shows hookSpecificOutput.additionalContext to the
+    // pre/post-tool-use, Codex and Claude Code: the agent bus's mid-turn mail
+    // notice (`turn_notice`). A busy agent is not woken until its turn ends;
+    // this tells it between tool calls instead, with one fixed line per new
+    // message, at most every 15 seconds, after a check that costs one local
+    // request of at most 300 ms and runs at most every 5 seconds. Claude
+    // Code gets it after a tool only; Codex documents the context on both.
+    let turn_notice = if matches!(
+        (agent_kind, hook_event),
+        (
+            AgentKind::Codex,
+            HookEvent::PreToolUse | HookEvent::PostToolUse
+        ) | (AgentKind::ClaudeCode, HookEvent::PostToolUse)
+    ) && ai_memory_hooks::agent_from_payload(&json) != Some(AgentKind::Cursor)
+        && !subagent_payload
+        && let Some(session_id) = canonical_session_id.as_deref()
+        && let Some(cwd) = policy_cwd.as_deref()
+    {
+        let path = super::turn_notice::state_path(&dd, &args.agent, session_id);
+        let mut state = super::turn_notice::load(&path);
+        let now = jiff::Timestamp::now().as_second();
+        if state.due(now) {
+            let client = build_client();
+            let bearer = hook_spool::resolve_bearer(&client, &dd, effective_token).await;
+            let url = format!(
+                "{base}/handoff?agent={}&inbox_turn=1{qs}&session_id={}",
+                args.agent,
+                url_encode(session_id),
+                qs = inbox_notice_query_suffix(cwd, args.project_strategy.and_then(|s| s.baked())),
+            );
+            let body = get_handoff(
+                &client,
+                &url,
+                bearer.as_deref(),
+                super::turn_notice::CHECK_TIMEOUT,
+            )
+            .await;
+            let notice = match body.as_deref() {
+                Some(body) => super::turn_notice::notice_for(&mut state, agent_kind, body, now),
+                None => {
+                    // Nothing pending (or no answer in time): only space the
+                    // next check, and forget what was popped meanwhile.
+                    state.take_new(&[], now);
+                    None
+                }
+            };
+            super::turn_notice::save(&path, &state);
+            notice
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // post-tool-use: Grok shows hookSpecificOutput.additionalContext to the    // post-tool-use: Grok shows hookSpecificOutput.additionalContext to the
     // model after the tool result. SessionStart and UserPromptSubmit stdout
     // are discarded, so this is the event that can carry a handoff without
     // burning it. One fetch per session. A session that never calls a tool
@@ -2660,6 +2714,19 @@ where
         );
     }
 
+    if let Some(notice) = turn_notice {
+        let event_name = if hook_event == HookEvent::PreToolUse {
+            "PreToolUse"
+        } else {
+            "PostToolUse"
+        };
+        writeln!(
+            stdout,
+            "{}",
+            super::turn_notice::envelope(event_name, &notice)
+        )?;
+        return Ok(());
+    }
     write_success_response(stdout, agent_kind, hook_event)?;
     Ok(())
 }

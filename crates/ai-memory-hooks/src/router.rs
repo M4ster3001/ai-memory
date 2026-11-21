@@ -1955,6 +1955,15 @@ pub struct HandoffQuery {
     /// ignores it; the clients also send `handoff=0&recovery=0&profile_digest=0`
     /// so that server still returns only the notice.
     pub inbox_only: Option<String>,
+    /// Truthy from the agent bus's mid-turn notice (`PreToolUse` and
+    /// `PostToolUse` hooks of Codex and Claude Code). Checked before
+    /// `inbox_only` and read-only like it. The response is a JSON object with
+    /// the inbox names and the ids of pending mail that may interrupt the
+    /// agent: from another harness of its own project, not paused by the
+    /// loop guard, or a receipt. Never a subject, body or sender. The client
+    /// also sends `inbox_only=1` and the opt-outs, so a server that predates
+    /// this flag answers with its count-only text, which the client ignores.
+    pub inbox_turn: Option<String>,
 }
 
 impl HandoffQuery {
@@ -2059,6 +2068,9 @@ async fn fetch_and_accept_handoff_at(
     // Mid-session notice poll (#1942): authorized like a session start, then
     // read-only. Returning here skips every claim, write and pointer publish
     // below.
+    if crate::payload::query_flag_truthy(query.inbox_turn.as_deref()) {
+        return Ok(turn_notice_body(state, ws, proj, agent).await);
+    }
     if crate::payload::query_flag_truthy(query.inbox_only.as_deref()) {
         return Ok(pending_inbox_notice(state, ws, proj, agent).await);
     }
@@ -2722,6 +2734,36 @@ async fn pending_inbox_notice(
         // count could not be read.
         Err(_) => None,
     }
+}
+
+/// The mid-turn notice body for `agent` in `(ws, proj)`: the inbox names and
+/// the ids [`crate::turn_notice_ids`] keeps, as JSON, or `None` when there is
+/// nothing to announce or the inbox cannot be read.
+async fn turn_notice_body(
+    state: &HookState,
+    ws: WorkspaceId,
+    proj: ProjectId,
+    agent: AgentKind,
+) -> Option<String> {
+    let limit = usize::try_from(ai_memory_store::MAX_PENDING_INBOX_MESSAGES).unwrap_or(256);
+    let candidates = state
+        .reader
+        .wake_candidates(ws, proj, agent, false, limit)
+        .await
+        .ok()?;
+    let ids = crate::turn_notice_ids(&candidates, ws, proj, agent);
+    if ids.is_empty() {
+        return None;
+    }
+    let (workspace, project) = inbox_scope_names(state, ws, proj).await?;
+    Some(
+        serde_json::json!({
+            "workspace": workspace,
+            "project": project,
+            "ids": ids.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        })
+        .to_string(),
+    )
 }
 
 /// Workspace and project names of the inbox the notice counts, or `None` when
@@ -6819,6 +6861,7 @@ pub(crate) mod tests {
             recovery: None,
             claim: None,
             inbox_only: None,
+            inbox_turn: None,
             agent: Some("claude-code".into()),
             cwd: Some(cwd.to_string()),
             workspace: Some("default".into()),
@@ -7110,6 +7153,7 @@ pub(crate) mod tests {
             let state = state.clone();
             let query = HandoffQuery {
                 inbox_only: inbox_only.map(Into::into),
+                inbox_turn: None,
                 ..session_start_query(&cwd)
             };
             async move {
@@ -7203,6 +7247,7 @@ pub(crate) mod tests {
             let state = state.clone();
             let query = HandoffQuery {
                 inbox_only: Some("1".into()),
+                inbox_turn: None,
                 handoff: Some("0".into()),
                 recovery: Some("0".into()),
                 profile_digest: Some("0".into()),
@@ -7942,6 +7987,7 @@ pub(crate) mod tests {
             handoff: None,
             recovery: None,
             inbox_only: None,
+            inbox_turn: None,
             identity: Some(identity.to_owned()),
             identity_src: Some(source.to_owned()),
             aliases: None,
@@ -18357,6 +18403,7 @@ pub(crate) mod tests {
                 handoff: None,
                 recovery: None,
                 inbox_only: None,
+                inbox_turn: None,
                 workspace: Some("checkpoint-workspace".into()),
                 project: Some(project.into()),
                 agent: Some("codex".into()),
@@ -18438,6 +18485,7 @@ pub(crate) mod tests {
             handoff: None,
             recovery: None,
             inbox_only: None,
+            inbox_turn: None,
             agent: Some("opencode2".into()),
             session_id: Some(SessionId::new().to_string()),
             ..Default::default()
@@ -18674,6 +18722,7 @@ pub(crate) mod tests {
             handoff: None,
             recovery: None,
             inbox_only: None,
+            inbox_turn: None,
             agent: Some(agent.into()),
             session_id: Some(session_id),
             ..Default::default()
@@ -18867,6 +18916,7 @@ pub(crate) mod tests {
             handoff: None,
             recovery: None,
             inbox_only: None,
+            inbox_turn: None,
             agent: Some("claude-code".into()),
             session_id: Some(SessionId::new().to_string()),
             ..Default::default()
@@ -20449,6 +20499,7 @@ pub(crate) mod tests {
                     recovery: None,
                     claim: None,
                     inbox_only: None,
+                    inbox_turn: None,
                     agent: Some("claude-code".into()),
                     cwd: Some(tmp.path().to_string_lossy().into_owned()),
                     workspace: Some("default".into()),
@@ -21073,6 +21124,7 @@ pub(crate) mod tests {
             recovery: None,
             claim: None,
             inbox_only: None,
+            inbox_turn: None,
             agent: Some("claude-code".into()),
             cwd: Some(cwd.clone()),
             workspace: Some("default".into()),
@@ -21166,6 +21218,7 @@ pub(crate) mod tests {
             recovery: None,
             claim: None,
             inbox_only: None,
+            inbox_turn: None,
             agent: Some("claude-code".into()),
             cwd: Some(cwd.clone()),
             workspace: Some("default".into()),
@@ -21278,6 +21331,7 @@ pub(crate) mod tests {
             recovery: None,
             claim: None,
             inbox_only: None,
+            inbox_turn: None,
             agent: Some("claude-code".into()),
             cwd: Some(cwd),
             workspace: Some("default".into()),
@@ -21477,6 +21531,7 @@ pub(crate) mod tests {
                     recovery: None,
                     claim: None,
                     inbox_only: None,
+                    inbox_turn: None,
                     agent: Some("claude-code".into()),
                     cwd: Some(cwd.to_string()),
                     workspace: Some("default".into()),
@@ -22646,6 +22701,7 @@ pub(crate) mod tests {
                 recovery: None,
                 claim: None,
                 inbox_only: None,
+                inbox_turn: None,
                 agent: Some("codex".into()),
                 cwd: Some(cwd.into()),
                 workspace: Some("acme".into()),
@@ -22733,6 +22789,7 @@ pub(crate) mod tests {
                 recovery: None,
                 claim: None,
                 inbox_only: None,
+                inbox_turn: None,
                 agent: Some("codex".into()),
                 cwd: Some("/repo/api/src".into()),
                 workspace: Some("default".into()),
@@ -22812,6 +22869,7 @@ pub(crate) mod tests {
             recovery: None,
             claim: None,
             inbox_only: None,
+            inbox_turn: None,
             agent: Some("codex".into()),
             cwd: Some(cwd.clone()),
             workspace: Some("default".into()),
@@ -22972,6 +23030,7 @@ pub(crate) mod tests {
             recovery: None,
             claim: None,
             inbox_only: None,
+            inbox_turn: None,
             agent: Some("codex".into()),
             cwd: Some(cwd),
             workspace: Some("default".into()),
@@ -23098,6 +23157,7 @@ pub(crate) mod tests {
             recovery: None,
             claim: None,
             inbox_only: None,
+            inbox_turn: None,
             agent: Some("claude-code".into()),
             cwd: Some(cwd.into()),
             workspace: None,
@@ -23186,6 +23246,7 @@ pub(crate) mod tests {
             recovery: None,
             claim: None,
             inbox_only: None,
+            inbox_turn: None,
             agent: Some("claude-code".into()),
             cwd: Some(cwd.into()),
             workspace: None,
@@ -23620,6 +23681,7 @@ pub(crate) mod tests {
             recovery: None,
             claim: None,
             inbox_only: None,
+            inbox_turn: None,
             agent: Some("claude-code".into()),
             cwd: Some(cwd.into()),
             workspace: None,
@@ -23790,6 +23852,7 @@ pub(crate) mod tests {
             recovery: None,
             claim: None,
             inbox_only: None,
+            inbox_turn: None,
             agent: Some("kimi-code".into()),
             cwd: Some("/repo".into()),
             workspace: Some("default".into()),
@@ -24649,6 +24712,7 @@ pub(crate) mod tests {
                 recovery: None,
                 claim: None,
                 inbox_only: None,
+                inbox_turn: None,
                 agent: Some("codex".into()),
                 cwd: Some(cwd.into()),
                 workspace: None,
@@ -28776,6 +28840,7 @@ pub(crate) mod tests {
                     handoff: None,
                     recovery: None,
                     inbox_only: None,
+                    inbox_turn: None,
                     managed_run: Some(run.run_id.to_string()),
                     session_id: Some("private-vendor".into()),
                     cwd: Some(cwd.clone()),
@@ -28853,6 +28918,7 @@ pub(crate) mod tests {
             recovery: None,
             claim: None,
             inbox_only: None,
+            inbox_turn: None,
             agent: Some(agent.into()),
             cwd: Some(cwd.into()),
             workspace: None,

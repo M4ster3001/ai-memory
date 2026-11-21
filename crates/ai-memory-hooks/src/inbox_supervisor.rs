@@ -403,3 +403,73 @@ pub(crate) async fn handle_wake_report(
         }
     }
 }
+
+/// The pending mail that may interrupt `agent` in the middle of a turn, from
+/// its wake candidates in `(ws, proj)`: a receipt, or a message from another
+/// harness of the same project that the loop guard did not pause. Mail from
+/// another project, the agent's own mail and paused mail never interrupt it,
+/// the same rule the wake supervisor applies to a discovered agent.
+#[must_use]
+pub fn turn_notice_ids(
+    candidates: &[ai_memory_store::WakeCandidate],
+    ws: WorkspaceId,
+    proj: ProjectId,
+    agent: AgentKind,
+) -> Vec<MessageId> {
+    candidates
+        .iter()
+        .filter(|candidate| match candidate.kind {
+            MessageKind::Receipt => true,
+            MessageKind::Message => {
+                candidate.from_workspace_id == ws
+                    && candidate.from_project_id == proj
+                    && candidate.from_agent != agent
+                    && !candidate.pair_paused
+            }
+        })
+        .map(|candidate| candidate.id)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn candidate(
+        kind: MessageKind,
+        from: (WorkspaceId, ProjectId),
+        agent: AgentKind,
+        paused: bool,
+    ) -> ai_memory_store::WakeCandidate {
+        ai_memory_store::WakeCandidate {
+            id: MessageId::new(),
+            kind,
+            from_workspace_id: from.0,
+            from_project_id: from.1,
+            from_agent: agent,
+            sender_session_recorded: false,
+            pair_paused: paused,
+        }
+    }
+
+    #[test]
+    fn only_another_agent_of_the_project_or_a_receipt_interrupts_a_turn() {
+        let here = (WorkspaceId::new(), ProjectId::new());
+        let elsewhere = (here.0, ProjectId::new());
+        let codex = AgentKind::Codex;
+        let all = [
+            candidate(MessageKind::Message, here, AgentKind::ClaudeCode, false),
+            candidate(MessageKind::Message, here, codex, false),
+            candidate(MessageKind::Message, here, AgentKind::GeminiCli, true),
+            candidate(
+                MessageKind::Message,
+                elsewhere,
+                AgentKind::ClaudeCode,
+                false,
+            ),
+            candidate(MessageKind::Receipt, elsewhere, AgentKind::Other, false),
+        ];
+        let ids = turn_notice_ids(&all, here.0, here.1, codex);
+        assert_eq!(ids, [all[0].id, all[4].id]);
+    }
+}

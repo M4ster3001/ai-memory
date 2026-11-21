@@ -162,6 +162,14 @@ fn has_rewake_hook(path: &Path) -> bool {
         })
 }
 
+/// Whether a hooks file runs the native `ai-memory hook` for `agent`'s
+/// `PostToolUse`, the hook that carries the mid-turn mail notice.
+fn has_native_tool_hook(path: &Path, agent: &str) -> bool {
+    std::fs::read_to_string(path).is_ok_and(|text| {
+        text.contains("hook --event post-tool-use") && text.contains(&format!("--agent {agent}"))
+    })
+}
+
 fn read_settings(path: &Path) -> Result<Value> {
     match std::fs::read_to_string(path) {
         Ok(raw) if raw.trim().is_empty() => Ok(json!({})),
@@ -593,6 +601,28 @@ async fn doctor_command(config: &Config, config_path: Option<&Path>) -> Result<i
             "run `ai-memory agent-bus install`, then restart open Claude Code sessions",
         );
     }
+    if let Some(path) = &host.claude_settings {
+        check(
+            has_native_tool_hook(path, "claude-code"),
+            format!(
+                "Claude Code mid-turn mail notice (native PostToolUse hook) in {}",
+                path.display()
+            ),
+            "run `ai-memory install-hooks --agent claude-code --apply` with the native binary; the Docker hook scripts do not send the notice",
+        );
+    }
+    if let Ok(path) = super::install_hooks::codex_hooks_path(&config.runtime_env)
+        && path.parent().is_some_and(Path::is_dir)
+    {
+        check(
+            has_native_tool_hook(&path, "codex"),
+            format!(
+                "Codex mid-turn mail notice (native PostToolUse hook) in {}",
+                path.display()
+            ),
+            "run `ai-memory install-hooks --agent codex --apply` with the native binary; the Docker hook scripts do not send the notice",
+        );
+    }
     if let Ok(status) = &status {
         let agents = status["agents"].as_array().cloned().unwrap_or_default();
         check(
@@ -705,6 +735,32 @@ mod tests {
         std::fs::write(&path, "{}").unwrap();
         assert!(!has_rewake_hook(&path));
         assert!(with_rewake_hook(json!([1]), json!({})).is_err());
+    }
+
+    #[test]
+    fn the_mid_turn_notice_needs_the_native_tool_hook() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("hooks.json");
+        std::fs::write(
+            &path,
+            r#"{"hooks":{"PostToolUse":[{"hooks":[{"type":"command","command":"/x/post-tool-use.sh"}]}]}}"#,
+        )
+        .unwrap();
+        assert!(
+            !has_native_tool_hook(&path, "codex"),
+            "a script hook sends no notice"
+        );
+        std::fs::write(
+            &path,
+            r#"{"hooks":{"PostToolUse":[{"hooks":[{"type":"command","command":"'/b/ai-memory' hook --event post-tool-use --agent codex --server-url http://x"}]}]}}"#,
+        )
+        .unwrap();
+        assert!(has_native_tool_hook(&path, "codex"));
+        assert!(!has_native_tool_hook(&path, "claude-code"));
+        assert!(!has_native_tool_hook(
+            &tmp.path().join("missing.json"),
+            "codex"
+        ));
     }
 
     #[test]

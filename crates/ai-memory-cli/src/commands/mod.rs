@@ -125,6 +125,7 @@ pub(crate) mod setup_web;
 pub mod show;
 pub mod status;
 pub mod transcript_capture;
+pub(crate) mod turn_notice;
 pub mod uninstall;
 pub mod upgrade;
 pub mod user;

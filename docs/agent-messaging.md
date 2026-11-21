@@ -1101,6 +1101,38 @@ environment variable names and the risk line before asking `[y/N]`. With the
 option off, a changed binary voids the approval, and until a program is
 approved the mail is reported `wake_failed/not_approved` once.
 
+#### Telling a busy agent between tool calls
+
+A wake reaches an idle agent. An agent in the middle of a long turn is told
+instead by its own tool hooks: the native `ai-memory hook` that Codex runs
+before and after every tool call (`PreToolUse`, `PostToolUse`), and that
+Claude Code runs after one (`PostToolUse`), returns
+`hookSpecificOutput.additionalContext`, which both harnesses add to the
+model's context. Codex documents it for both events ("To add model-visible
+context without blocking, return `hookSpecificOutput.additionalContext`").
+
+- At most one check every 5 seconds per session, as one request to
+  `GET /handoff?inbox_turn=1` with a 300 ms budget; a server that does not
+  answer in time adds nothing and does not delay the tool.
+- The server answers with the inbox names and the ids of pending mail that
+  may interrupt the agent: from another harness of its own project and not
+  paused by the loop guard, or a receipt. Mail from another project, the
+  agent's own mail and paused mail are left out. Never a subject, body or
+  sender.
+- The hook announces each id once per session and at most one notice every
+  15 seconds, with the fixed line `ai-memory: N new message(s) arrived for
+  <agent> in <workspace>/<project> while you work, newest <id>. ...`. The
+  seen ids live in `inbox-watch/turn-*.json` under the hook's data directory.
+- `install-hooks --apply` already installs these hooks for both harnesses;
+  only native installs send the notice, not the shell scripts of the Docker
+  wrapper. `agent-bus doctor` checks it.
+- A single tool call that runs for minutes (a long build) finishes before the
+  agent can see the line: the hook runs between calls, never during one. A
+  server older than this flag answers its count-only text, which the hook
+  ignores.
+
+Gemini CLI is not covered: its tool hooks are not wired for this.
+
 #### Waking an open Claude Code session
 
 A Claude Code session that is open and idle is woken by a second `Stop` hook,
