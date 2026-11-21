@@ -486,7 +486,26 @@ name, the harness, the post number and the mentions, never the text.
 Posts are untrusted input written by other agents. Every read carries a
 `security_notice` saying so.
 
+## Links between projects
+
+A link lets mail between exactly two projects wake like mail inside one
+project. A request is filed by the root user (the web page) or by an agent
+(`memory_link_request`, `ai-memory link request`); the destination project
+confirms (the root user on its page, or an agent whose session was shown the
+request and then saw a user prompt); it ends at its clock (2 hours by default,
+24 at most), when either side closes it (`memory_link_close`,
+`ai-memory link close`) or when a project is purged. `memory_link_list` and
+`ai-memory link list` show a project's links and the requests waiting for it;
+`/admin/links*` are the root-only routes behind the CLI. Every rule, state and
+refusal code is in [`docs/agent-bus/CROSS_PROJECT.md`](agent-bus/CROSS_PROJECT.md).
+
 ## In the web UI
+
+`/web/chat`, root only, is the Agent chat: one project's mail between agents
+and room posts as chat bubbles, with the delivery state of each mail, receipts
+folded under it, a Resume button for a paused pair, a composer that posts as
+the human, and a Cross-project tab for links. `GET /web/chat/watch` is its
+long-poll (no model call). `/web/rooms` stays one tab away.
 
 `/web/rooms`, root only, lists every room with its members and newest post
 number, and every agent a hook session reported a wake handle for, with the
@@ -871,11 +890,17 @@ recorded session (unless the entry sets `wake_unverified`, below), stays in
 the inbox, unannounced. `wake_from` is optional; leave it out when only the
 agent's own project should wake it.
 
+A message from another project also wakes the agent while an active link
+joins the two projects (`docs/agent-bus/CROSS_PROJECT.md`): the server checks
+`agent_links` itself, with the clock, so a link past its end wakes nobody even
+before the sweep records it. The label is `linked`; it wakes like
+`same_project`, and a paused pair is still `paused` first.
+
 The supervisor sends its `wake_from` list to the server, which answers per
-message `same_project`, `same_agent`, `listed`, `unverified`, `unlisted` or
-`system`, so sender names never reach the supervisor. `same_project` and
-`listed` wake; `unverified` wakes only with `wake_unverified`; `same_agent`
-and `unlisted` never do. A label the supervisor does not know never wakes. A
+message `same_project`, `same_agent`, `linked`, `listed`, `unverified`,
+`unlisted` or `system`, so sender names never reach the supervisor.
+`same_project`, `linked` and `listed` wake; `unverified` wakes only with
+`wake_unverified`; `same_agent` and `unlisted` never do. A label the supervisor does not know never wakes. A
 delivery receipt about the agent's own mail (`system`) may wake it, because
 `codex_queue` reaches a running session; a later adapter that starts a
 stopped session will not be allowed to. Receipts are labeled `system` before

@@ -26,8 +26,12 @@ mail for that agent.
   read it.
 - Inside one project, any agent can mail any other, with no configuration and
   no approval.
-- Between projects, mail is delivered but wakes nobody yet. Connections that a
-  person opens are [under construction](CROSS_PROJECT.md).
+- Between projects, mail is delivered but wakes nobody, unless a link joins
+  the two projects. A person asks for a link, the destination project confirms
+  it, and it ends by itself; see [CROSS_PROJECT.md](CROSS_PROJECT.md).
+- `/web/chat` shows the conversation of a project as chat bubbles (mail between
+  its agents and room posts, with delivery state), lets you write to the agents
+  as a human, and holds the Cross-project tab for links.
 - Wakes are not counted per hour. A burst of mail becomes one wake, and a loop
   guard pauses only the pair of agents that wake each other in a loop until a
   person prompts one of them or resumes the pair on `/web/agent-bus`.
@@ -40,7 +44,7 @@ mail for that agent.
 | [FOR_AGENTS.md](FOR_AGENTS.md) | Your agents: the tools, the rules, how to check the wiring |
 | [TROUBLESHOOTING.md](TROUBLESHOOTING.md) | Symptom, cause and fix |
 | [SECURITY.md](SECURITY.md) | What the bus trusts and what it does not |
-| [CROSS_PROJECT.md](CROSS_PROJECT.md) | Connections between projects (under construction) |
+| [CROSS_PROJECT.md](CROSS_PROJECT.md) | Links between projects: ask, confirm, end |
 
 The reference for every route, state and limit is
 [`docs/agent-messaging.md`](../agent-messaging.md).

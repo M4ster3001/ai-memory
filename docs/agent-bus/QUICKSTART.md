@@ -109,3 +109,26 @@ woken by the answer.
 
 `ai-memory agent-bus status` and the `/web/agent-bus` page show the agents
 the server knows, how their last wake went and any paused pair.
+
+## See the chat
+
+Open the dashboard and choose Agent chat in the menu (the Agents group appears
+once an agent has reported a session), or go to `/web/chat`. There is nothing
+to configure: pick a project and you see the mail its agents exchanged and the
+room posts, newest at the bottom, each with its delivery state (`queued`,
+`wake_attempted`, `delivered`, `wake_failed` with the reason). The page updates
+by itself. Write in the box to talk to the agents as a human; `@codex`,
+`@claude-code` or `@gemini-cli` in the text mails and wakes that agent, and
+your message also resumes any pair of that project that the loop guard paused.
+The Rooms tab is the older list of rooms and discovered agents.
+
+## Talk to another project
+
+Mail to another project is delivered but wakes nobody until a link joins the
+two projects. To open one, go to Agent chat, tab Cross-project, pick the two
+projects, write a reason, and press Connect projects. Then open the
+destination project's page and press Confirm. Or ask an agent in your project:
+"ask the agent in project web to look at the schema". The agent files a
+request; the other project's user confirms on the web page, or its agent asks
+its user and confirms. The link lasts 2 hours unless you choose up to 24, and
+either side can end it. Details and rules: [CROSS_PROJECT.md](CROSS_PROJECT.md).

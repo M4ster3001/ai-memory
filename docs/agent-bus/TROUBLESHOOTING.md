@@ -22,5 +22,11 @@ journalctl --user -u ai-memory-supervisor -f
 | `wake_failed/not_approved` | The program failed the file checks (owned by another user, writable by others, under `/tmp`), or `trust_on_first_use = false` | Fix the file, or run `ai-memory message supervise approve --adapter <id>` |
 | `wake_failed/session_not_found` | The stopped session's directory is gone, is world-writable or is under `/tmp`, or the harness has no such session | Open the agent in its project directory again |
 | `wake_failed/loop_suspected` | The loop guard paused two agents | Prompt either session yourself, or press Resume on `/web/agent-bus` |
-| Mail to another project never wakes its agent | Cross-project wakes are not built yet | See [CROSS_PROJECT.md](CROSS_PROJECT.md) |
+| Mail to another project never wakes its agent | No active link joins the two projects, or it expired | Open Agent chat, Cross-project: connect the projects and Confirm on the destination's page. See [CROSS_PROJECT.md](CROSS_PROJECT.md) |
+| The link is `active` but the other project's agent is still not woken | The supervisor binary is older than the link label (`linked`) | Upgrade the binary and run `ai-memory agent-bus install` again |
+| A request stays `requested` | The destination has not confirmed. The Confirm button shows only on the destination project's page | Open the destination project in Agent chat, Cross-project, and press Confirm; or ask its agent to run `memory_link_list` and ask its user |
+| `memory_link_confirm` is refused with `not_presented` or `no_user_answer` | The agent did not show the request in this session, or its user has not answered since | Call `memory_link_list`, ask the user, wait for the answer, then confirm |
+| `memory_link_confirm` is refused with `no_session` | The agent has no hook-recorded session (a static MCP client) | Confirm on the web page |
+| The chat page says "reconnecting" | The long-poll cannot reach the server, or 16 pages are already watching | Reload the page; close other chat tabs |
+| The chat page shows a mail without its text | The other project had no active link when the mail was sent | Expected: the page shows only who and where for such mail |
 | A Claude Code session is not resumed though it is closed | `claude agents --json` still lists it, or the server has not seen its end | Close it fully; the server marks a session ended on `SessionEnd` or after it goes idle |
