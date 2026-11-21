@@ -181,6 +181,40 @@ async fn rooms_are_per_project_and_a_mention_mails_only_the_mentioned_agent() {
         "after re-reads"
     );
 
+    // A look ahead with `after` leaves the read position where it was, so the
+    // next plain read still returns the posts it skipped.
+    for body in ["second", "third"] {
+        call(
+            &router,
+            "memory_room_post",
+            at(A, "claude-code", json!({"room": "review", "body": body})),
+        )
+        .await
+        .unwrap();
+    }
+    let ahead = call(
+        &router,
+        "memory_room_read",
+        at(A, "codex", json!({"room": "review", "after": 2})),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ahead["posts"][0]["body"], "third");
+    let unread = call(
+        &router,
+        "memory_room_read",
+        at(A, "codex", json!({"room": "review"})),
+    )
+    .await
+    .unwrap();
+    let bodies: Vec<&str> = unread["posts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|post| post["body"].as_str())
+        .collect();
+    assert_eq!(bodies, ["second", "third"], "{unread}");
+
     // The same name in project B is another, absent, room.
     assert!(
         call(

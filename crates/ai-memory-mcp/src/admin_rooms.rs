@@ -281,6 +281,9 @@ pub(crate) async fn read_room(
         return Ok(None);
     };
     let member = summary.members.iter().find(|m| m.agent == who);
+    // An explicit `after` is a look at history: moving the read position to
+    // what it returned would skip the posts between the position and `after`.
+    let advances = after.is_none() && member.is_some();
     let after = after
         .or_else(|| member.map(|m| m.read_seq))
         .unwrap_or(0)
@@ -293,7 +296,7 @@ pub(crate) async fn read_room(
     };
     let newest = posts.last().map(|post| post.seq);
     if let Some(newest) = newest
-        && member.is_some()
+        && advances
     {
         writer
             .room_mark_read(ws, proj, name.clone(), who, newest)
