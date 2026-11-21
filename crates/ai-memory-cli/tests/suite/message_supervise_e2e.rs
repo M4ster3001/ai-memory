@@ -1137,6 +1137,9 @@ mod slow {
                    "cwd": project.path()}),
         )
         .await;
+        // The server acknowledges a hook before storing it; keep the start
+        // ahead of the end, as a real session does.
+        tokio::time::sleep(Duration::from_millis(400)).await;
         hook(
             &f,
             INBOX,

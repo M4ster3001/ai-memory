@@ -2584,7 +2584,7 @@ where
                 url_encode(session_id),
                 qs = inbox_notice_query_suffix(cwd, args.project_strategy.and_then(|s| s.baked())),
             );
-            let body = get_handoff(
+            let body = super::hook_capture::get_turn_notice(
                 &client,
                 &url,
                 bearer.as_deref(),

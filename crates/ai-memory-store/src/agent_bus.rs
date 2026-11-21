@@ -21,6 +21,7 @@ const LAST_SEEN_REFRESH_MICROS: i64 = 60_000_000;
 /// through `kind`. The handle is the session id itself: the router reports a
 /// kind only when the native id was a canonical UUID, which the store keeps
 /// unchanged.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn record_wake_handle_in_tx(
     tx: &Transaction<'_>,
     session: SessionId,

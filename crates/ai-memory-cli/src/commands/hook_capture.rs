@@ -1171,6 +1171,31 @@ fn accepted_indices(v: &serde_json::Value) -> Option<Vec<usize>> {
     Some(indices)
 }
 
+/// GET the agent bus's mid-turn notice body (`/handoff?inbox_turn=1`). Like
+/// [`get_handoff`], but silent: it runs around every tool call, so an
+/// unreachable or refusing server must not print a warning each time. Any
+/// error, non-success status, redirect or empty body is `None`.
+pub async fn get_turn_notice(
+    client: &reqwest::Client,
+    url: &str,
+    token: Option<&str>,
+    timeout: Duration,
+) -> Option<String> {
+    let mut req = client
+        .get(url)
+        .header(CLIENT_MARKER_HEADER, NATIVE_HOOK_CLIENT_KIND)
+        .timeout(timeout);
+    if let Some(t) = token {
+        req = req.bearer_auth(t);
+    }
+    let resp = req.send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body = resp.text().await.ok()?;
+    (!body.trim().is_empty() && body.len() <= 64 * 1024).then_some(body)
+}
+
 /// GET the handoff text with a caller-chosen budget. Returns None on any error
 /// or an empty body. This is the one synchronous read on the agent's critical
 /// path (session-start injects it as context), so the budget is larger than a
