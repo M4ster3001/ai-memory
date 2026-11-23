@@ -5,6 +5,10 @@
 mod access_breadth;
 mod access_mode;
 mod agent_bus;
+mod agent_bus_regression_cross_project;
+mod agent_bus_regression_migration;
+mod agent_bus_regression_same_project;
+mod agent_bus_regression_support;
 mod agent_links;
 mod agent_messages;
 mod agent_rooms;
