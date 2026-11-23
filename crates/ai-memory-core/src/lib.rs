@@ -8,6 +8,8 @@
 pub mod active_project;
 pub mod actor;
 pub mod agent_backup;
+#[cfg(test)]
+mod agent_bus_regression;
 pub mod compaction_recap;
 pub mod error;
 pub mod excerpt;
