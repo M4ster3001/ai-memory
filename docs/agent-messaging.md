@@ -1000,6 +1000,14 @@ supervisor quiet instead:
 - Coalescing: while mail the agent was woken for is still unread, new mail
   joins it instead of waking the agent again, for up to 10 minutes. Once the
   agent pops what it was woken for, the next message wakes it at once.
+- A Codex thread that is busy has its wake queued as a follow-up prompt, and
+  reading mail in the middle of the turn (the tool-call notice) does not take
+  that prompt out of the queue. While a queued prompt may still be waiting
+  (up to 10 minutes), the supervisor therefore queues no second one: each
+  new message first tries the headless resume, and a thread that is still
+  busy keeps the mail for the next wake (no failure, no backoff, no change
+  of the message's delivery state). An idle thread is woken at once, with the
+  count of everything not announced yet.
 - The [loop guard](#the-loop-guard) pauses a pair of agents that wake each
   other in a loop.
 - After a failed wake the supervisor waits 1 minute, then 5, 30 and 120

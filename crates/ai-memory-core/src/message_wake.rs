@@ -802,6 +802,10 @@ pub const AUTH_COOLDOWN_SECS: i64 = 6 * 3_600;
 /// before new mail wakes it again. Mail that arrives meanwhile is read with
 /// the earlier batch, so a burst becomes one wake.
 pub const COALESCE_HOLD_SECS: i64 = 600;
+/// How long a busy Codex thread is left alone after a probe found it busy
+/// while a queued wake prompt still waits: the next probe is not before
+/// this.
+pub const QUEUE_PROBE_GAP_SECS: i64 = 30;
 /// How long a settled message id is remembered.
 const SETTLED_RETENTION_SECS: i64 = 14 * 24 * 3_600;
 /// Most message ids remembered per agent.
@@ -851,6 +855,16 @@ pub struct AgentLedger {
     /// Whether the harness stated the quota reset delay.
     #[serde(default)]
     quota_stated: bool,
+    /// Unix second of the wake prompt the Codex queue accepted and that may
+    /// still wait in the app's follow-up queue. Reading mail does not take
+    /// the prompt out of that queue (a busy turn reads mail from the
+    /// mid-turn notice), so only an idle thread (a headless resume that
+    /// runs) or [`COALESCE_HOLD_SECS`] end it.
+    #[serde(default)]
+    queued_at: Option<i64>,
+    /// No probe of the busy thread before this unix second.
+    #[serde(default)]
+    probe_after: Option<i64>,
     /// Message ids a wake was launched for, with the unix second.
     #[serde(default)]
     woken: BTreeMap<String, i64>,
@@ -890,6 +904,9 @@ impl WakeLedger {
         }
         if let Some(until) = agent.retry_at.filter(|until| *until > now) {
             return WakeGate::Backoff { until };
+        }
+        if let Some(until) = agent.probe_after.filter(|until| *until > now) {
+            return WakeGate::Coalescing { until };
         }
         let unread_since = pending
             .iter()
@@ -944,6 +961,8 @@ impl WakeLedger {
                 agent.quota_until = None;
                 agent.quota_stated = false;
                 agent.last_wake = Some(now);
+                agent.probe_after = None;
+                agent.queued_at = (adapter == AdapterKind::CodexQueue).then_some(now);
                 self.auth_blocked.remove(adapter.id());
                 for id in ids {
                     agent.woken.insert(id.clone(), now);
@@ -964,6 +983,26 @@ impl WakeLedger {
                 agent.retry_at = Some(now.saturating_add(WAKE_BACKOFF_SECS[step]));
             }
         }
+    }
+
+    /// Whether a prompt the Codex queue accepted for `name` may still wait
+    /// in the thread's follow-up queue at `now`. Another prompt behind it
+    /// would only pile up: the first one already tells the agent to read
+    /// its whole inbox.
+    #[must_use]
+    pub fn queue_prompt_waiting(&self, name: &str, now: i64) -> bool {
+        self.agents
+            .get(name)
+            .and_then(|agent| agent.queued_at)
+            .is_some_and(|at| at.saturating_add(COALESCE_HOLD_SECS) > now)
+    }
+
+    /// Note that a probe found `name`'s thread busy while a queued prompt
+    /// waits: the mail joins that prompt's turn, and the thread is not
+    /// probed again for [`QUEUE_PROBE_GAP_SECS`].
+    pub fn hold_for_queued_prompt(&mut self, name: &str, now: i64) {
+        self.agents.entry(name.to_owned()).or_default().probe_after =
+            Some(now.saturating_add(QUEUE_PROBE_GAP_SECS));
     }
 
     /// When `name` was last woken, as a unix second.
@@ -1502,6 +1541,75 @@ mod tests {
         );
         assert_eq!(ledger.last_wake("a"), Some(t0 + 49));
         assert_eq!(ledger.gate("b", &pending, t0), WakeGate::Open, "per agent");
+    }
+
+    /// The pile the app showed: mail the agent read in the middle of a busy
+    /// turn leaves `pending`, so the coalescing gate no longer sees the
+    /// woken id; the prompt the queue accepted is still waiting, and the
+    /// ledger must say so.
+    #[test]
+    fn a_queued_prompt_outlives_the_mail_it_announced() {
+        let mut ledger = WakeLedger::default();
+        let t0 = 2_000_000;
+        assert!(!ledger.queue_prompt_waiting("a", t0));
+        ledger.record_outcome("a", CODEX, &ids(1), WakeOutcome::Attempted, t0);
+        // The agent read id-0 mid-turn: new mail meets an open gate.
+        let later = vec!["new".to_owned()];
+        assert_eq!(ledger.gate("a", &later, t0 + 60), WakeGate::Open);
+        assert!(ledger.queue_prompt_waiting("a", t0 + 60));
+        assert!(ledger.queue_prompt_waiting("a", t0 + COALESCE_HOLD_SECS - 1));
+        assert!(
+            !ledger.queue_prompt_waiting("a", t0 + COALESCE_HOLD_SECS),
+            "a prompt that never ran does not hold mail forever"
+        );
+        assert!(!ledger.queue_prompt_waiting("b", t0 + 60), "per agent");
+
+        // A probe that finds the thread busy keeps it from being probed again
+        // at once, and never counts as a failed wake.
+        ledger.hold_for_queued_prompt("a", t0 + 60);
+        assert_eq!(
+            ledger.gate("a", &later, t0 + 61),
+            WakeGate::Coalescing {
+                until: t0 + 60 + QUEUE_PROBE_GAP_SECS
+            }
+        );
+        assert_eq!(
+            ledger.gate("a", &later, t0 + 60 + QUEUE_PROBE_GAP_SECS),
+            WakeGate::Open
+        );
+        assert_eq!(
+            ledger.not_woken("a", &later),
+            ["new"],
+            "held mail is not woken"
+        );
+
+        // A wake that ran (the thread was idle) ends the wait; so does a
+        // fresh queue prompt, which starts its own.
+        ledger.record_outcome(
+            "a",
+            AdapterKind::CodexExecResume,
+            &later,
+            WakeOutcome::Attempted,
+            t0 + 120,
+        );
+        assert!(!ledger.queue_prompt_waiting("a", t0 + 121));
+        ledger.record_outcome("a", CODEX, &later, WakeOutcome::Attempted, t0 + 200);
+        assert!(ledger.queue_prompt_waiting("a", t0 + 201));
+        assert_eq!(
+            ledger.gate("a", &later, t0 + 201),
+            WakeGate::Coalescing {
+                until: t0 + 200 + COALESCE_HOLD_SECS
+            }
+        );
+    }
+
+    #[test]
+    fn a_ledger_saved_before_the_queued_prompt_field_still_loads() {
+        let old =
+            r#"{"agents":{"a":{"last_wake":5,"failures":0,"woken":{"x":5}}},"auth_blocked":{}}"#;
+        let ledger: WakeLedger = serde_json::from_str(old).unwrap();
+        assert!(!ledger.queue_prompt_waiting("a", 6));
+        assert_eq!(ledger.last_wake("a"), Some(5));
     }
 
     #[test]
