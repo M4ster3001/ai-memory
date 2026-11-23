@@ -45,6 +45,7 @@ mail for that agent.
 | [TROUBLESHOOTING.md](TROUBLESHOOTING.md) | Symptom, cause and fix |
 | [SECURITY.md](SECURITY.md) | What the bus trusts and what it does not |
 | [CROSS_PROJECT.md](CROSS_PROJECT.md) | Links between projects: ask, confirm, end |
+| [TESTING.md](TESTING.md) | Whoever changes the bus: the regression suite, how to run it and extend it |
 
 The reference for every route, state and limit is
 [`docs/agent-messaging.md`](../agent-messaging.md).
