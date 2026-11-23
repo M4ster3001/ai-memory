@@ -4,10 +4,11 @@
 
 {% block content %}
 <div class="page-heading"><div><p class="eyebrow">{{ i18n.text("web-chat-eyebrow") }}</p><h1>{{ i18n.text("web-chat-heading") }}</h1><p>{{ i18n.text("web-chat-intro") }}</p></div></div>
+<section id="pending-links" class="chat-pending" aria-label="{{ i18n.text("web-chat-pending-title") }}" aria-live="polite" tabindex="-1">{% include "_chat_pending_links.html" %}</section>
 <div class="project-navigation chat-navigation">
   <nav class="project-tabs" aria-label="{{ i18n.text("web-chat-tabs") }}">
     <a href="{{ chat_href }}" data-chat-tab="chat" {% if tab == "chat" %}aria-selected="true" aria-current="page"{% endif %}>{{ i18n.text("web-chat-tab-chat") }}</a>
-    <a href="{{ cross_href }}" data-chat-tab="cross" {% if tab == "cross" %}aria-selected="true" aria-current="page"{% endif %}>{{ i18n.text("web-chat-tab-cross") }}{% if waiting_count > 0 %} <span class="nav-message-count" data-waiting="{{ waiting_count }}">{{ waiting_count }}</span>{% endif %}</a>
+    <a href="{{ cross_href }}" data-chat-tab="cross" {% if tab == "cross" %}aria-selected="true" aria-current="page"{% endif %}>{{ i18n.text("web-chat-tab-cross") }}{% if !pending.is_empty() %} <span class="nav-message-count" data-waiting="{{ pending.len() }}">{{ pending.len() }}</span>{% endif %}</a>
     <a href="rooms" data-chat-tab="rooms">{{ i18n.text("web-chat-tab-rooms") }}</a>
   </nav>
   {% if has_projects %}<div class="chat-project-picker"><label class="sr-only" for="chat-project">{{ i18n.text("web-chat-project") }}</label><select id="chat-project" class="field-input">{% for option in projects %}<option data-workspace="{{ option.workspace }}" data-project="{{ option.project }}" {% if option.selected %}selected{% endif %}>{{ option.workspace }} / {{ option.project }}</option>{% endfor %}</select></div>{% endif %}
@@ -91,10 +92,32 @@
     button.disabled=true;
     try{
       if(button.dataset.resume){await post("agent-bus/resume",JSON.parse(button.dataset.resume));refreshNow();}
-      else if(button.dataset.linkConfirm){await post("chat/links/"+encodeURIComponent(button.dataset.linkConfirm)+"/confirm",{workspace:workspace,project:projectName});location.reload();}
+      else if(button.dataset.linkConfirm){await post("chat/links/"+encodeURIComponent(button.dataset.linkConfirm)+"/confirm",{workspace:button.dataset.destWorkspace||workspace,project:button.dataset.destProject||projectName});location.reload();}
       else if(button.dataset.linkClose){await post("chat/links/"+encodeURIComponent(button.dataset.linkClose)+"/close",{});location.reload();}
     }catch(error){button.disabled=false;window.alert(error.message);}
   });
+  // Waiting link requests: look again now and then, so a request filed while
+  // this page is open shows up without a reload. Only the cards change.
+  var pendingBox=document.getElementById("pending-links");
+  if(pendingBox){
+    var pendingTimer=window.setInterval(async function(){
+      if(document.hidden)return;
+      try{
+        var response=await fetch(new URL("chat/pending-links",document.baseURI),{credentials:"same-origin",cache:"no-store",headers:{"Accept":"application/json","X-Ai-Memory-UI":"1"}});
+        if(!response.ok)return;
+        var data=await response.json();
+        var template=document.createElement("template");template.innerHTML=data.html;
+        function ids(root){return Array.from(root.querySelectorAll("[data-pending-link]")).map(function(n){return n.dataset.linkRequest;}).join();}
+        if(ids(pendingBox)===ids(template.content)||pendingBox.contains(document.activeElement))return;
+        pendingBox.replaceChildren(template.content);
+        var count=data.count,tab=document.querySelector('[data-chat-tab="cross"]');
+        if(tab){var badge=tab.querySelector(".nav-message-count");
+          if(count>0){if(!badge){badge=document.createElement("span");badge.className="nav-message-count";tab.append(" ",badge);}badge.dataset.waiting=String(count);badge.textContent=String(count);}
+          else if(badge){badge.remove();}}
+      }catch(error){}
+    },20000);
+    window.addEventListener("pagehide",function(){window.clearInterval(pendingTimer);});
+  }
   var form=document.getElementById("chat-composer");
   if(form){
     var body=document.getElementById("chat-body"),room=document.getElementById("chat-room"),result=document.getElementById("chat-result"),sending=false;

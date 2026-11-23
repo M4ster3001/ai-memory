@@ -523,9 +523,18 @@ async fn a_link_needs_the_destinations_confirmation_and_either_page_can_end_it()
     )
     .await;
     assert!(from_page.contains("data-link=\""), "{from_page}");
+    // The waiting card shows on every page but names the destination; the
+    // requester's own table row offers no Confirm.
     assert!(
-        !from_page.contains("data-link-confirm=\""),
+        !from_page.contains("data-dest-project=\"api\""),
         "the requester can confirm"
+    );
+    assert_eq!(
+        from_page
+            .matches(&format!("data-link-confirm=\"{id}\""))
+            .count(),
+        1,
+        "only the card offers Confirm on the requester's page"
     );
     let (_, to_page) = send(
         root(&w),

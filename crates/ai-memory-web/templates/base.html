@@ -19,6 +19,7 @@
       <a href="inbox" data-nav="inbox"><span aria-hidden="true">✉</span>{{ i18n.text("web-inbox") }} <span id="inbox-pending-count" class="nav-message-count" hidden aria-hidden="true"></span></a>
       <div id="inbox-notifications" class="nav-inbox-notifications" hidden><p id="inbox-notification-summary"></p><ul id="inbox-notification-projects" aria-label="{{ i18n.text("web-projects-with-pending-messages") }}"></ul></div>
       <span id="inbox-notification-status" class="sr-only" role="status" aria-live="polite"></span>
+      <a href="chat?tab=cross#pending-links" id="pending-links-nav" data-nav-pending-links hidden><span aria-hidden="true">⇄</span>{{ i18n.text("web-nav-pending-links") }} <span id="pending-links-count" class="nav-message-count" data-label="{{ i18n.text("web-nav-pending-links") }}"></span></a>
       <a href="workstreams" data-nav="workstreams" {% block nav_workstreams_current %}{% endblock %}><span aria-hidden="true">⑂</span>{{ i18n.text("web-workstreams") }}</a>
       <a href="search" data-nav="search"><span aria-hidden="true">⌕</span>{{ i18n.text("web-search-memory") }}</a>
       <a href="graph" data-nav="graph" {% block nav_graph_current %}{% endblock %}><span aria-hidden="true">⌘</span>{{ i18n.text("web-knowledge-graph") }}</a>
@@ -35,6 +36,12 @@
           if(!response.ok)return;
           var summary=await response.json();
           document.querySelectorAll("[data-nav-agents]").forEach(function(node){node.hidden=false;});
+          if(summary.pending_links>0){
+            var pendingNav=document.getElementById("pending-links-nav"),pendingCount=document.getElementById("pending-links-count");
+            pendingCount.textContent=String(summary.pending_links);
+            pendingNav.setAttribute("aria-label",pendingCount.dataset.label+" ("+summary.pending_links+")");
+            pendingNav.hidden=false;
+          }
           [["agents-chat-count",summary.chat_unread],["agents-bus-count",summary.paused_pairs]].forEach(function(pair){
             var badge=document.getElementById(pair[0]);
             if(badge&&pair[1]>0){badge.textContent=String(pair[1]);badge.hidden=false;}

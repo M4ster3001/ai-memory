@@ -1246,7 +1246,14 @@ pub(crate) struct ChatPause {
 /// A request waiting for the project on the page to confirm.
 pub(crate) struct ChatRequest {
     pub id: String,
+    /// `workspace / project` that asked.
     pub from: String,
+    /// `workspace / project` that must confirm.
+    pub to: String,
+    /// The destination's names, sent back with Confirm: only the
+    /// destination's confirmation counts, whatever project the page shows.
+    pub to_workspace: String,
+    pub to_project: String,
     pub reason: String,
     pub asked_by: String,
     pub valid_hours: String,
@@ -1258,7 +1265,6 @@ pub(crate) struct ChatRequest {
 pub(crate) struct ChatFeed {
     pub items: Vec<ChatBubble>,
     pub pauses: Vec<ChatPause>,
-    pub requests: Vec<ChatRequest>,
 }
 
 /// One link on the Cross-project tab.
@@ -1302,10 +1308,20 @@ pub(crate) struct ChatView {
     pub cross_href: String,
     pub cursor: String,
     pub feed: ChatFeed,
+    /// Every link request in the workspace that waits for its destination,
+    /// whatever project the selector shows.
+    pub pending: Vec<ChatRequest>,
     pub rooms: Vec<String>,
     pub links: Vec<ChatLinkRow>,
-    pub waiting_count: usize,
     pub has_projects: bool,
+}
+
+/// The pending-request cards alone, answered by `GET /chat/pending-links`.
+#[derive(Template)]
+#[template(path = "_chat_pending_links.html")]
+pub(crate) struct ChatPendingView {
+    pub i18n: ai_memory_core::i18n::Localizer,
+    pub pending: Vec<ChatRequest>,
 }
 
 /// The live part of `/chat` alone, answered by `GET /chat/watch`.

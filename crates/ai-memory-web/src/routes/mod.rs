@@ -127,6 +127,7 @@ pub(crate) fn build(state: Arc<WebState>) -> Router {
             .route("/chat", get(chat::handler))
             .route("/chat/watch", get(chat::watch))
             .route("/chat/post", post(chat::post))
+            .route("/chat/pending-links", get(chat::pending_links))
             .route("/chat/links", post(chat::create_link))
             .route("/chat/links/{id}/confirm", post(chat::confirm_link))
             .route("/chat/links/{id}/close", post(chat::close_link))

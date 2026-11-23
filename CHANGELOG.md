@@ -13,6 +13,14 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- Added a way to find link requests that wait for confirmation: a "Pending links
+  (N)" item in the sidebar of every page, and a card per request at the top of
+  the Agent chat page on any tab and for any selected project, with from -> to,
+  the reason as an untrusted quotation, the expiry and Confirm and Decline
+  buttons. Before, a request showed only after picking its destination project
+  in the selector. `GET /web/agent-bus/summary` gains `pending_links` and
+  `GET /web/chat/pending-links` serves the cards. Only the destination can
+  confirm and only when the root user presses the button.
 - Added links between projects. Mail to another project is still delivered but
   wakes nobody, unless a link joins the two projects: a person (the web page) or
   an agent (`memory_link_request`, `ai-memory link request`) asks, the
