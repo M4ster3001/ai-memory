@@ -128,6 +128,9 @@ struct Entry {
     project: String,
     include_shared: bool,
     wake_from: Vec<WakeFrom>,
+    /// Mail from a `wake_from` project with no recorded sender session
+    /// (`unverified`) wakes too.
+    wake_unverified: bool,
     adapter: WakeAdapter,
     program: PathBuf,
     budget: WakeBudget,
@@ -143,6 +146,7 @@ impl Entry {
             project: raw.project.trim().to_owned(),
             include_shared: raw.include_shared,
             wake_from: raw.wake_from.clone(),
+            wake_unverified: raw.wake_unverified,
             adapter: raw.adapter.adapter()?,
             program: raw.adapter.program().to_path_buf(),
             budget: WakeBudget {
@@ -288,8 +292,9 @@ fn hex(bytes: &[u8]) -> String {
 
 /// The canonical form of everything an approval covers: what runs (adapter,
 /// argv shape, program path and content, working directory, timeout) and
-/// for whom (agent, inbox, shared mail, the projects that may wake it).
-/// Budgets are left out: changing them changes how often, not what.
+/// for whom (agent, inbox, shared mail, the projects that may wake it and
+/// whether their unverified mail does). Budgets are left out: changing them
+/// changes how often, not what.
 fn approval_digest(entry: &Entry, program: &CheckedProgram, cwd: &Path) -> String {
     let mut wake_from: Vec<String> = entry
         .wake_from
@@ -298,7 +303,7 @@ fn approval_digest(entry: &Entry, program: &CheckedProgram, cwd: &Path) -> Strin
         .collect();
     wake_from.sort();
     let argv = entry.adapter.args("{wake}").join("\u{0}");
-    let parts = [
+    let mut parts = vec![
         APPROVAL_SCHEMA.to_owned(),
         entry.name.clone(),
         entry.agent.as_str().to_owned(),
@@ -313,6 +318,11 @@ fn approval_digest(entry: &Entry, program: &CheckedProgram, cwd: &Path) -> Strin
         cwd.to_string_lossy().into_owned(),
         entry.timeout.as_secs().to_string(),
     ];
+    // Appended only when on, so an entry without the option keeps the digest
+    // it was approved under; turning it on or off voids the approval.
+    if entry.wake_unverified {
+        parts.push("wake_unverified".to_owned());
+    }
     let mut hasher = Sha256::new();
     for part in &parts {
         hasher.update((part.len() as u64).to_le_bytes());
@@ -588,10 +598,16 @@ struct Candidate {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum CandidateSender {
+    SameProject,
+    SameAgent,
     Listed,
     Unverified,
     Unlisted,
     System,
+    /// A label a newer server sends that this supervisor does not know.
+    /// It never wakes.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Serialize)]
@@ -613,17 +629,24 @@ struct ReportReply {
     receipts: usize,
 }
 
-/// The messages of `candidates` that may wake `adapter`, in server order:
-/// a listed sender whose session the server recorded, or a receipt when the
-/// adapter reaches a live session (owner decision Q6).
-fn wakeable(adapter: &WakeAdapter, candidates: &[Candidate], fresh: &[String]) -> Vec<String> {
+/// The messages of `candidates` that may wake `entry`, in server order:
+/// another agent of the watched project (no authorization needed inside a
+/// project), a listed sender whose session the server recorded, a listed
+/// sender with no recorded session when the entry sets `wake_unverified`,
+/// or a receipt when the adapter reaches a live session (owner decision Q6).
+/// The agent's own mail to itself, an unlisted sender and an unknown label
+/// never wake.
+fn wakeable(entry: &Entry, candidates: &[Candidate], fresh: &[String]) -> Vec<String> {
     let fresh: HashSet<&str> = fresh.iter().map(String::as_str).collect();
     candidates
         .iter()
         .filter(|candidate| match candidate.sender {
-            CandidateSender::Listed => true,
-            CandidateSender::System => adapter.wakes_live_session(),
-            CandidateSender::Unverified | CandidateSender::Unlisted => false,
+            CandidateSender::SameProject | CandidateSender::Listed => true,
+            CandidateSender::Unverified => entry.wake_unverified,
+            CandidateSender::System => entry.adapter.wakes_live_session(),
+            CandidateSender::SameAgent | CandidateSender::Unlisted | CandidateSender::Unknown => {
+                false
+            }
         })
         .filter_map(|candidate| canonical_message_id(&candidate.id))
         .filter(|id| fresh.contains(id.as_str()))
@@ -780,7 +803,7 @@ impl Supervisor {
                 entry.name, candidates.unresolved_wake_from
             ));
         }
-        let ids = wakeable(&entry.adapter, &candidates.messages, &fresh);
+        let ids = wakeable(entry, &candidates.messages, &fresh);
         if ids.is_empty() {
             return Ok(());
         }
@@ -1113,7 +1136,7 @@ fn approve_interactive(
         .chain(std::iter::once("PATH"))
         .collect();
     let wake_from = if entry.wake_from.is_empty() {
-        "receipts only".to_owned()
+        "no other project".to_owned()
     } else {
         entry
             .wake_from
@@ -1121,6 +1144,19 @@ fn approve_interactive(
             .map(|scope| format!("{}/{}", scope.workspace, scope.project))
             .collect::<Vec<_>>()
             .join(", ")
+    };
+    let unverified = if entry.wake_unverified {
+        "  wake_unverified: true (a listed project wakes it without a recorded sender session)"
+    } else {
+        "  wake_unverified: false (a listed project wakes it only when the server recorded the \
+         sender's session)"
+    };
+    let risk = if entry.wake_unverified {
+        "  any local process with the server token can wake this agent through mail sent as \
+         its own project or a listed one; the wake text is fixed and the wake limits still apply"
+    } else {
+        "  any local process with the server token can wake this agent through mail sent as \
+         its own project; the wake text is fixed and the wake limits still apply"
     };
     let lines = [
         crate::localization::diagnostic(
@@ -1153,8 +1189,18 @@ fn approve_interactive(
         crate::localization::diagnostic(i18n, format!("  environment: {}", env_keys.join(", "))),
         crate::localization::diagnostic(
             i18n,
+            format!(
+                "  own project: other agents of {}/{} wake it with no wake_from entry or recorded session",
+                super::show::terminal_text(&entry.workspace),
+                super::show::terminal_text(&entry.project),
+            ),
+        ),
+        crate::localization::diagnostic(
+            i18n,
             format!("  woken by: {}", super::show::terminal_text(&wake_from)),
         ),
+        crate::localization::diagnostic(i18n, unverified),
+        crate::localization::diagnostic(i18n, risk),
     ];
     for line in &lines {
         writeln!(output, "{line}")?;
@@ -1302,6 +1348,7 @@ mod tests {
                 workspace: "default".into(),
                 project: "fortaleza".into(),
             }],
+            wake_unverified: false,
             adapter: WakeAdapter::CodexQueue {
                 conversation: ai_memory_core::message_wake::ConversationRef::parse(ID).unwrap(),
             },
@@ -1432,6 +1479,204 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn turning_wake_unverified_on_or_off_voids_the_approval() {
+        let tmp = tempfile::tempdir().unwrap();
+        let program = script(tmp.path(), "codex", "exit 0", 0o755);
+        let cwd = tmp.path().to_path_buf();
+        let checked = check_program(&program, None, &[]).unwrap();
+        let off = entry(&program);
+        let mut on = off.clone();
+        on.wake_unverified = true;
+        let off_digest = approval_digest(&off, &checked, &cwd);
+        let on_digest = approval_digest(&on, &checked, &cwd);
+        assert_ne!(off_digest, on_digest, "turning it on needs a new approval");
+        let config = Config::default();
+        let path = tmp.path().join("approvals.json");
+        let mut out = Vec::new();
+        assert!(
+            approve_interactive(
+                &config,
+                &on,
+                &checked,
+                &cwd,
+                &path,
+                &mut "y\n".as_bytes(),
+                &mut out,
+            )
+            .unwrap()
+        );
+        let approvals: Approvals = load_json(&config, &path);
+        assert!(approvals.approves(&on.name, &on_digest));
+        assert!(
+            !approvals.approves(&off.name, &off_digest),
+            "turning it off again needs a new approval"
+        );
+        // Off is the digest an entry without the key always had: the extra
+        // part is appended only when the option is on.
+        let mut legacy = off.clone();
+        legacy.wake_unverified = false;
+        assert_eq!(off_digest, approval_digest(&legacy, &checked, &cwd));
+    }
+
+    /// The digest of an entry that does not set `wake_unverified` is the one
+    /// the first supervisor recorded: pinned for the shape of the entry in
+    /// use (an agent woken by its own project listed in `wake_from`).
+    #[test]
+    fn an_entry_without_wake_unverified_keeps_its_recorded_digest() {
+        let entry = Entry {
+            name: "codex-linha".into(),
+            agent: AgentKind::Codex,
+            workspace: "default".into(),
+            project: "LinhaDeSucataUnity".into(),
+            include_shared: false,
+            wake_from: vec![WakeFrom {
+                workspace: "default".into(),
+                project: "LinhaDeSucataUnity".into(),
+            }],
+            wake_unverified: false,
+            adapter: WakeAdapter::CodexQueue {
+                conversation: ai_memory_core::message_wake::ConversationRef::parse(
+                    "01a1d9f4-c02a-7380-abcc-ad938cc031d2",
+                )
+                .unwrap(),
+            },
+            program: PathBuf::from("/opt/codex/bin/codex"),
+            budget: WakeBudget {
+                per_hour: 4,
+                per_day: 24,
+            },
+            timeout: Duration::from_secs(60),
+        };
+        let program = CheckedProgram {
+            path: PathBuf::from("/opt/codex/bin/codex"),
+            configured_dir: PathBuf::from("/opt/codex/bin"),
+            sha256: "0".repeat(64),
+        };
+        let cwd = Path::new("/srv/supervisor/state");
+        assert_eq!(
+            approval_digest(&entry, &program, cwd),
+            "bcf6e633fab17aaa7a47ee554f534b67a0c10d239bdad121502499bf0e362bd2"
+        );
+        let mut on = entry.clone();
+        on.wake_unverified = true;
+        assert_ne!(
+            approval_digest(&on, &program, cwd),
+            approval_digest(&entry, &program, cwd)
+        );
+    }
+
+    /// A label from a newer server is read as `Unknown` and never wakes,
+    /// so the rest of the answer still counts.
+    #[test]
+    fn an_unknown_sender_label_never_wakes() {
+        let reply: CandidatesReply = serde_json::from_str(
+            r#"{"messages":[
+                {"id":"0190f0a4-5c1e-7a2b-9c3d-4e5f60718291","sender":"from_the_future"},
+                {"id":"0190f0a4-5c1e-7a2b-9c3d-4e5f60718292","sender":"same_project"}
+            ],"unresolved_wake_from":0}"#,
+        )
+        .unwrap();
+        assert_eq!(reply.messages[0].sender, CandidateSender::Unknown);
+        let fresh: Vec<String> = reply.messages.iter().map(|m| m.id.clone()).collect();
+        assert_eq!(
+            wakeable(&entry(Path::new("/x")), &reply.messages, &fresh),
+            ["0190f0a4-5c1e-7a2b-9c3d-4e5f60718292"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_approval_prompt_shows_wake_unverified_and_its_risk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let program = script(tmp.path(), "codex", "exit 0", 0o755);
+        let checked = check_program(&program, None, &[]).unwrap();
+        let path = tmp.path().join("approvals.json");
+        let shown = |entry: &Entry, language| {
+            let config = Config {
+                i18n: ai_memory_core::i18n::Localizer::new(language),
+                ..Config::default()
+            };
+            let mut out = Vec::new();
+            approve_interactive(
+                &config,
+                entry,
+                &checked,
+                tmp.path(),
+                &path,
+                &mut "n\n".as_bytes(),
+                &mut out,
+            )
+            .unwrap();
+            String::from_utf8(out).unwrap()
+        };
+        use ai_memory_core::i18n::Language;
+        let off = entry(&program);
+        let mut on = off.clone();
+        on.wake_unverified = true;
+        let text = shown(&off, Language::English);
+        assert!(text.contains("  wake_unverified: false ("), "{text}");
+        assert!(
+            text.contains(
+                "  own project: other agents of default/linha wake it with no wake_from entry or \
+                 recorded session\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "  any local process with the server token can wake this agent through mail sent \
+                 as its own project; the wake text is fixed and the wake limits still apply\n"
+            ),
+            "{text}"
+        );
+        let text = shown(&on, Language::English);
+        assert!(
+            text.contains(
+                "  wake_unverified: true (a listed project wakes it without a recorded sender \
+                 session)\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "  any local process with the server token can wake this agent through mail sent \
+                 as its own project or a listed one; the wake text is fixed and the wake limits \
+                 still apply\n"
+            ),
+            "{text}"
+        );
+        let text = shown(&on, Language::PortugueseBrazil);
+        assert!(
+            text.contains(
+                "  qualquer processo local com o token do servidor pode acordar este agente com \
+                 mensagens enviadas como o próprio projeto ou um projeto listado; o texto do \
+                 acordar é fixo e os limites de acionamentos continuam valendo\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("  wake_unverified: true (um projeto listado o acorda"),
+            "{text}"
+        );
+        let text = shown(&off, Language::PortugueseBrazil);
+        assert!(
+            text.contains("  wake_unverified: false (um projeto listado"),
+            "{text}"
+        );
+        assert!(
+            text.contains("  próprio projeto: outros agentes de default/linha o acordam"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "pode acordar este agente com mensagens enviadas como o próprio projeto; o texto"
+            ),
+            "{text}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn approval_needs_an_explicit_yes_and_is_recorded_atomically() {
         let tmp = tempfile::tempdir().unwrap();
         let program = script(tmp.path(), "codex", "exit 0", 0o755);
@@ -1528,12 +1773,54 @@ mod tests {
             candidate("not-an-id", CandidateSender::Listed),
         ];
         let fresh: Vec<String> = ids[..4].iter().map(|id| (*id).to_owned()).collect();
-        let adapter = entry(Path::new("/x")).adapter;
+        let off = entry(Path::new("/x"));
         assert_eq!(
-            wakeable(&adapter, &candidates, &fresh),
+            wakeable(&off, &candidates, &fresh),
             [ids[0], ids[3]],
             "unverified and unlisted senders never wake; an already woken id is not fresh"
         );
+        let mut on = off.clone();
+        on.wake_unverified = true;
+        assert_eq!(
+            wakeable(&on, &candidates, &fresh),
+            [ids[0], ids[1], ids[3]],
+            "wake_unverified adds unverified senders and nothing else"
+        );
+    }
+
+    #[test]
+    fn wake_unverified_matrix() {
+        let id = "0190f0a4-5c1e-7a2b-9c3d-4e5f60718291";
+        let fresh = vec![id.to_owned()];
+        let base = entry(Path::new("/x"));
+        assert!(base.adapter.wakes_live_session());
+        for (sender, off, on) in [
+            (CandidateSender::SameProject, true, true),
+            (CandidateSender::SameAgent, false, false),
+            (CandidateSender::Listed, true, true),
+            (CandidateSender::Unverified, false, true),
+            (CandidateSender::Unlisted, false, false),
+            (CandidateSender::System, true, true),
+            (CandidateSender::Unknown, false, false),
+        ] {
+            for (wake_unverified, expected) in [(false, off), (true, on)] {
+                let mut e = base.clone();
+                e.wake_unverified = wake_unverified;
+                let woken = wakeable(
+                    &e,
+                    &[Candidate {
+                        id: id.to_owned(),
+                        sender,
+                    }],
+                    &fresh,
+                );
+                assert_eq!(
+                    !woken.is_empty(),
+                    expected,
+                    "{sender:?} with wake_unverified = {wake_unverified}"
+                );
+            }
+        }
     }
 
     #[cfg(unix)]
