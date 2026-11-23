@@ -743,6 +743,9 @@ pub(super) struct Candidate {
 #[serde(rename_all = "snake_case")]
 pub(super) enum CandidateSender {
     SameProject,
+    /// Another project joined to this one by an active link the destination
+    /// confirmed: it wakes like the project's own mail.
+    Linked,
     SameAgent,
     Listed,
     Unverified,
@@ -822,7 +825,9 @@ fn wakeable(entry: &Entry, candidates: &[Candidate], fresh: &[String]) -> Vec<St
     candidates
         .iter()
         .filter(|candidate| match candidate.sender {
-            CandidateSender::SameProject | CandidateSender::Listed => true,
+            CandidateSender::SameProject | CandidateSender::Linked | CandidateSender::Listed => {
+                true
+            }
             CandidateSender::Unverified => entry.wake_unverified,
             CandidateSender::System => entry.adapter.wakes_live_session(),
             CandidateSender::SameAgent
@@ -2839,6 +2844,7 @@ mod tests {
         assert!(base.adapter.wakes_live_session());
         for (sender, off, on) in [
             (CandidateSender::SameProject, true, true),
+            (CandidateSender::Linked, true, true),
             (CandidateSender::SameAgent, false, false),
             (CandidateSender::Listed, true, true),
             (CandidateSender::Unverified, false, true),

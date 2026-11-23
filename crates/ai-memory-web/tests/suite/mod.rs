@@ -3,6 +3,7 @@
 //! no extra binary; a new file must be declared below.
 
 mod agent_bus_page;
+mod chat_page;
 mod documentation;
 mod graph;
 mod health;

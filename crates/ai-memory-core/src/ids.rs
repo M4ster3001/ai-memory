@@ -99,6 +99,7 @@ id_newtype!(pub PageId, "Identifier for a single wiki page version.");
 id_newtype!(pub EntityId, "Identifier for one project-scoped entity.");
 id_newtype!(pub HandoffId, "Identifier for a cross-agent handoff record.");
 id_newtype!(pub MessageId, "Identifier for one cross-project agent message (inbox/queue).");
+id_newtype!(pub AgentLinkId, "Identifier for one link between two projects (`docs/agent-bus/CROSS_PROJECT.md`).");
 id_newtype!(pub WorkstreamId, "Identifier for a managed cross-harness workstream.");
 id_newtype!(pub ManagedRunId, "Identifier for one `ai-memory run` invocation.");
 id_newtype!(pub UserId, "Identifier for a registered user (multi-user attribution; see [`crate::actor`]).");

@@ -355,6 +355,12 @@ mod slow {
     }
 
     async fn fixture() -> Fixture {
+        fixture_with(&[]).await
+    }
+
+    /// [`fixture`] with extra `serve` arguments (the link test serves the
+    /// web dashboard, whose buttons are the root user's confirmation).
+    async fn fixture_with(extra: &[&str]) -> Fixture {
         let data_dir = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
         // Not under /tmp: the supervisor refuses programs in temporary
@@ -379,6 +385,7 @@ mod slow {
                 SENDER,
                 "--no-watcher",
             ])
+            .args(extra)
             .env("AI_MEMORY_DATA_DIR", data_dir.path())
             .env("AI_MEMORY_HOME", home.path())
             .env("AI_MEMORY_EMBEDDING_PROVIDER", "none");
@@ -1585,5 +1592,189 @@ mod slow {
             read(".config/systemd/user/ai-memory-supervisor.service"),
         );
         assert_eq!(before, after, "a second install changed the files");
+    }
+
+    /// Links between projects through the real server, the CLI and the
+    /// supervisor: mail from another project waits until a link joins the
+    /// two; a request opens nothing; an agent cannot confirm what it was not
+    /// shown; the destination's web page confirms; the mail then wakes the
+    /// discovered Codex once, and not again after the link expires (the
+    /// clock, with no sweep) or is closed. The text never reaches the
+    /// adapter.
+    #[tokio::test]
+    async fn a_link_between_two_projects_wakes_until_it_expires_or_is_closed() {
+        let f = fixture_with(&["--enable-web"]).await;
+        std::fs::write(f.dd().join("config.toml"), "[messaging.supervisor]\n").unwrap();
+        let state = f.dd().join("supervisor-link");
+
+        // 1. No link: delivered, not woken.
+        let first = f
+            .send(SENDER, Some(SENDER_SESSION), "BODY-CANARY before the link")
+            .await;
+        f.supervise_once(&state);
+        assert_eq!(f.calls(), 0, "mail from another project woke the agent");
+        assert_eq!(f.status(&first)["delivery"]["state"], "queued");
+
+        // 2. A request, filed by the sender's agent, opens nothing.
+        let filed: Value = serde_json::from_str(&f.cli(&[
+            "link",
+            "request",
+            "--workspace",
+            WORKSPACE,
+            "--project",
+            SENDER,
+            "--to-workspace",
+            WORKSPACE,
+            "--to-project",
+            INBOX,
+            "--reason",
+            "review the schema together",
+            "--agent",
+            "claude-code",
+            "--session",
+            SENDER_SESSION,
+        ]))
+        .unwrap();
+        assert_eq!(filed["link"]["state"], "requested", "{filed}");
+        let id = filed["link"]["id"].as_str().unwrap().to_owned();
+        f.supervise_once(&state);
+        assert_eq!(f.calls(), 0, "a request woke the agent");
+
+        // 3. The destination's agent, never shown the request, cannot
+        //    confirm it; the requester's project never can.
+        let confirm = |project: &str, agent: &str, session: &str| {
+            let client = f.client.clone();
+            let url = format!("{}/admin/links/confirm", f.base);
+            let body = json!({"id": id, "workspace": WORKSPACE, "project": project,
+                              "agent": agent, "session": session});
+            async move {
+                let response = client.post(url).json(&body).send().await.unwrap();
+                let status = response.status();
+                (status, response.json::<Value>().await.unwrap())
+            }
+        };
+        let (status, refused) = confirm(INBOX, "codex", CODEX_SESSION).await;
+        assert_eq!(status, 409, "{refused}");
+        assert_eq!(refused["code"], "not_presented", "{refused}");
+        let (_, refused) = confirm(SENDER, "claude-code", SENDER_SESSION).await;
+        assert_eq!(refused["code"], "not_destination", "{refused}");
+        f.supervise_once(&state);
+        assert_eq!(f.calls(), 0);
+
+        // 4. The root user presses Confirm on the destination's page. The
+        //    sender's page is the wrong one.
+        let web = |project: &str| {
+            let client = f.client.clone();
+            let url = format!("{}/web/chat/links/{id}/confirm", f.base);
+            let body = json!({"workspace": WORKSPACE, "project": project});
+            async move {
+                client
+                    .post(url)
+                    .header("x-ai-memory-ui", "1")
+                    .json(&body)
+                    .send()
+                    .await
+                    .unwrap()
+                    .status()
+            }
+        };
+        assert_eq!(web(SENDER).await, 409);
+        assert_eq!(web(INBOX).await, 200);
+
+        // 5. The waiting mail and a new one wake the discovered Codex once,
+        //    through its own thread, with the fixed text.
+        let second = f
+            .send(SENDER, Some(SENDER_SESSION), "BODY-CANARY during the link")
+            .await;
+        supervise_until(&f, &state, || f.calls() >= 1).await;
+        assert_eq!(f.calls(), 1);
+        let args = f.last_args();
+        assert_eq!(args[..3], ["queue", "--thread", CODEX_SESSION], "{args:?}");
+        assert!(!args[4].contains("CANARY"), "mail text reached the adapter");
+        assert_eq!(f.status(&second)["delivery"]["state"], "wake_attempted");
+        pop_as(&f, "codex", &first);
+        pop_as(&f, "codex", &second);
+
+        // 6. The clock ends the link, with no sweep in between.
+        {
+            let conn = rusqlite::Connection::open(f.dd().join("db").join("memory.sqlite"))
+                .expect("open store");
+            conn.busy_timeout(Duration::from_secs(10)).unwrap();
+            let uuid = uuid::Uuid::parse_str(&id).unwrap();
+            let changed = conn
+                .execute(
+                    "UPDATE agent_links SET expires_at = 1 WHERE id = ?1",
+                    [uuid.as_bytes().to_vec()],
+                )
+                .expect("move the clock");
+            assert_eq!(changed, 1);
+        }
+        let third = f
+            .send(SENDER, Some(SENDER_SESSION), "BODY-CANARY after expiry")
+            .await;
+        f.supervise_once(&state);
+        assert_eq!(f.calls(), 1, "an expired link woke the agent");
+        assert_eq!(f.status(&third)["delivery"]["state"], "queued");
+        pop_as(&f, "codex", &third);
+
+        // 7. A new link, closed by either side, stops waking too.
+        let again: Value = serde_json::from_str(&f.cli(&[
+            "link",
+            "request",
+            "--workspace",
+            WORKSPACE,
+            "--project",
+            SENDER,
+            "--to-workspace",
+            WORKSPACE,
+            "--to-project",
+            INBOX,
+            "--reason",
+            "one more round",
+            "--agent",
+            "claude-code",
+            "--session",
+            SENDER_SESSION,
+        ]))
+        .unwrap();
+        let second_id = again["link"]["id"].as_str().unwrap().to_owned();
+        assert_ne!(second_id, id, "an expired link is not reused");
+        let confirmed = f
+            .client
+            .post(format!("{}/web/chat/links/{second_id}/confirm", f.base))
+            .header("x-ai-memory-ui", "1")
+            .json(&json!({"workspace": WORKSPACE, "project": INBOX}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(confirmed.status(), 200);
+        let closed: Value = serde_json::from_str(&f.cli(&["link", "close", &second_id])).unwrap();
+        assert_eq!(closed["closed"], true, "{closed}");
+        let fourth = f
+            .send(SENDER, Some(SENDER_SESSION), "BODY-CANARY after close")
+            .await;
+        f.supervise_once(&state);
+        assert_eq!(f.calls(), 1, "a closed link woke the agent");
+        pop_as(&f, "codex", &fourth);
+        let listed: Value = serde_json::from_str(&f.cli(&[
+            "link",
+            "list",
+            "--workspace",
+            WORKSPACE,
+            "--project",
+            INBOX,
+            "--all",
+        ]))
+        .unwrap();
+        let states: Vec<&str> = listed["links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|link| link["state"].as_str().unwrap())
+            .collect();
+        assert!(
+            states.contains(&"expired") && states.contains(&"closed"),
+            "{states:?}"
+        );
     }
 }

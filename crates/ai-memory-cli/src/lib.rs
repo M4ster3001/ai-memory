@@ -189,6 +189,7 @@ async fn dispatch(
             Ok(())
         }
         Command::Room(args) => commands::room::run(&config, args).await,
+        Command::Link(args) => commands::link::run(&config, args).await,
         Command::AgentBus(args) => {
             let exit_code = commands::agent_bus::run(&config, args, config_path.as_deref()).await?;
             if exit_code != 0 {

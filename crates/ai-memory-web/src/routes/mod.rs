@@ -11,6 +11,7 @@ use crate::state::WebState;
 mod agent_bus;
 mod agents;
 mod api;
+mod chat;
 mod documentation;
 mod graph;
 mod health;
@@ -123,6 +124,12 @@ pub(crate) fn build(state: Arc<WebState>) -> Router {
             .route("/docs", get(documentation::index))
             .route("/docs/{slug}", get(documentation::page))
             .route("/inbox", get(inbox::handler))
+            .route("/chat", get(chat::handler))
+            .route("/chat/watch", get(chat::watch))
+            .route("/chat/post", post(chat::post))
+            .route("/chat/links", post(chat::create_link))
+            .route("/chat/links/{id}/confirm", post(chat::confirm_link))
+            .route("/chat/links/{id}/close", post(chat::close_link))
             .route("/rooms", get(rooms::handler))
             .route("/agent-bus", get(agent_bus::handler))
             .route("/agent-bus/resume", post(agent_bus::resume))

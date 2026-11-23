@@ -824,7 +824,7 @@ Additional boundary rules:
 - **MCP tool surface changes** require updating `MEMORY_INSTRUCTIONS`,
   `ai_memory_core::SNIPPET_BODY`, README/docs tool references, and the
   regression tests asserting every tool appears in both prompt surfaces.
-  The tool count is currently 32 (see `docs/ARCHITECTURE.md`). They also
+  The tool count is currently 36 (see `docs/ARCHITECTURE.md`). They also
   update the TypeScript SDK in `companions/ai-memory-ts` in the same change:
   the schema snapshot (`npm run schema:update`), the wrapper or its
   classification in `src/coverage.ts`, types, tests and docs. The SDK's

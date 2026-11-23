@@ -193,7 +193,7 @@ async fn the_agents_menu_is_in_every_page_and_selects_follow_the_design_system()
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     for needle in [
-        "href=\"rooms\" data-nav=\"rooms\" data-nav-agents hidden",
+        "href=\"chat\" data-nav=\"chat\" data-nav-also=\"rooms\" data-nav-agents hidden",
         "href=\"agent-bus\" data-nav=\"agent-bus\" data-nav-agents hidden",
         "agent-bus/summary",
     ] {

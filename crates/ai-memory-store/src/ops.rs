@@ -8471,6 +8471,16 @@ pub fn purge_project(
     // Must run before the cascade removes the sessions it matches against.
     delete_query_signals_of_sessions(&tx, "project_id = ?1", &pid[..])?;
 
+    // A link to this project ends here, audited, before its rows cascade.
+    crate::agent_links::close_for_project_in_tx(
+        &tx,
+        crate::agent_links::ProjectKey {
+            workspace_id: *workspace_id,
+            project_id: *project_id,
+        },
+        now,
+    )?;
+
     // Cascade handles pages / sessions / observations / handoffs /
     // page_embeddings. The workspace row is intentionally left intact —
     // other projects may still live there.
@@ -8725,6 +8735,11 @@ pub fn delete_workspace(
     // Same cross-scope query-signal cleanup as `purge_project`, before the
     // cascade removes the sessions it matches against.
     delete_query_signals_of_sessions(&tx, "workspace_id = ?1", &wid[..])?;
+    crate::agent_links::close_for_workspace_in_tx(
+        &tx,
+        *workspace_id,
+        Timestamp::now().as_microsecond(),
+    )?;
     let removed = tx.execute(
         "DELETE FROM workspaces WHERE id = ?1",
         rusqlite::params![&wid[..]],

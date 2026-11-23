@@ -1192,6 +1192,130 @@ pub(crate) struct AgentBusView {
     pub programs: Vec<BusProgramRow>,
 }
 
+/// One bubble of the chat timeline: addressed mail or a room post. Every
+/// string is shown through the template's escaping; nothing here is HTML.
+pub(crate) struct ChatBubble {
+    /// `mail` or `post`.
+    pub kind: &'static str,
+    /// Stable id for the DOM: the message id, or `room#seq`.
+    pub key: String,
+    /// `end` for the human (right side), `start` for an agent.
+    pub side: &'static str,
+    /// `claude`, `codex`, `gemini`, `human` or `other`: picks the colour.
+    pub tone: &'static str,
+    /// Two or three letters in the avatar.
+    pub badge: String,
+    /// Who wrote it.
+    pub sender: String,
+    /// `claude-code → codex`, or `#room`.
+    pub route: String,
+    /// The other project (`workspace/project`) when the mail crosses a
+    /// project line, else empty.
+    pub other_project: String,
+    /// Whether the mail crossed a link or was hidden.
+    pub cross: bool,
+    /// The text is not shown: mail with a project that has no link.
+    pub redacted: bool,
+    pub subject: String,
+    pub body: String,
+    pub truncated: bool,
+    pub when: String,
+    pub when_full: String,
+    /// `queued`, `wake_attempted`, `delivered`, `wake_failed/session_busy`...
+    pub delivery: String,
+    /// `ok`, `bad`, `wait` or `plain`.
+    pub delivery_tone: &'static str,
+    /// The recipient collected it.
+    pub read: bool,
+    /// Folded receipts, `outcome` or `outcome/reason`.
+    pub receipts: Vec<String>,
+    /// Harnesses a post mentioned, comma-separated.
+    pub mentions: String,
+}
+
+/// A paused pair of agents with the project on the page.
+pub(crate) struct ChatPause {
+    pub a: String,
+    pub b: String,
+    pub reason: String,
+    pub paused_at: String,
+    /// The JSON body the Resume button posts.
+    pub key: String,
+}
+
+/// A request waiting for the project on the page to confirm.
+pub(crate) struct ChatRequest {
+    pub id: String,
+    pub from: String,
+    pub reason: String,
+    pub asked_by: String,
+    pub valid_hours: String,
+    pub expires: String,
+}
+
+/// What the live part of `/chat` shows: the same data renders the page and
+/// each long-poll answer.
+pub(crate) struct ChatFeed {
+    pub items: Vec<ChatBubble>,
+    pub pauses: Vec<ChatPause>,
+    pub requests: Vec<ChatRequest>,
+}
+
+/// One link on the Cross-project tab.
+pub(crate) struct ChatLinkRow {
+    pub id: String,
+    /// `workspace/project` of the side that asked.
+    pub from: String,
+    pub to: String,
+    pub state: String,
+    pub reason: String,
+    pub asked_by: String,
+    pub ends: String,
+    pub confirmed_via: String,
+    /// The root user may confirm here: the project on the page is the
+    /// destination and the request is waiting.
+    pub can_confirm: bool,
+    /// The link is live and may be closed.
+    pub can_close: bool,
+    /// Where the destination's page is, for a request that waits for it.
+    pub destination_href: String,
+}
+
+/// A project in a selector.
+pub(crate) struct ChatProjectOption {
+    pub workspace: String,
+    pub project: String,
+    pub selected: bool,
+}
+
+/// View-model for the root-only `GET /chat`.
+#[derive(Template)]
+#[template(path = "chat.html")]
+pub(crate) struct ChatView {
+    pub i18n: ai_memory_core::i18n::Localizer,
+    /// `chat` or `cross`.
+    pub tab: &'static str,
+    pub workspace: String,
+    pub project: String,
+    pub projects: Vec<ChatProjectOption>,
+    pub chat_href: String,
+    pub cross_href: String,
+    pub cursor: String,
+    pub feed: ChatFeed,
+    pub rooms: Vec<String>,
+    pub links: Vec<ChatLinkRow>,
+    pub waiting_count: usize,
+    pub has_projects: bool,
+}
+
+/// The live part of `/chat` alone, answered by `GET /chat/watch`.
+#[derive(Template)]
+#[template(path = "_chat_feed.html")]
+pub(crate) struct ChatFeedView {
+    pub i18n: ai_memory_core::i18n::Localizer,
+    pub feed: ChatFeed,
+}
+
 /// View-model for a non-root session that opens a root-only page.
 #[derive(Template)]
 #[template(path = "admin_required.html")]

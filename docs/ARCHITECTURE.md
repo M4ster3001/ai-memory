@@ -868,7 +868,7 @@ handshake. HTTP requests remain stateless by default; `--http-stateful`
 applies only to the legacy session mode. The stdio bridge forwards either
 lifecycle to that HTTP transport.
 
-## MCP tool surface (32 tools)
+## MCP tool surface (36 tools)
 
 Every registered tool carries explicit MCP annotations for its human-readable
 title and read-only, destructive, idempotent, and open-world behavior. These
@@ -914,6 +914,10 @@ does not need to ride on the public protocol change.
 | `memory_room_leave` | write | Leave a room; the room and its history stay. |
 | `memory_room_post` | write | Post to a room (joins the poster). Body scrubbed, 1 to 4000 characters. An `@harness` mention becomes addressed mail with a fixed body pointing at the post. |
 | `memory_room_read` | write | Posts after the caller's read position (which then advances) or after `after`, at most 200, with a `security_notice`. |
+| `memory_link_request` | write | Ask to link the caller's project with another existing project (V109). Files a request and opens nothing: the destination confirms. Reason scrubbed, 1 to 300 characters; `hours` 0.083 to 24 (default 2). One live link per pair; caps on live links and on agent requests per hour. Refuses an inferred scope. |
+| `memory_link_list` | write | The caller's project's links (and, with `include_ended`, past ones) and the requests waiting for it. Showing a waiting request to the caller's recorded session is what lets that session confirm it later. |
+| `memory_link_confirm` | write | Confirm a request as an agent of the destination project. Refused (as an answer with a code, not an error) unless the session was shown the request and then saw a user prompt that is not the wake text; never for the requester's project or session. |
+| `memory_link_close` | write | End a link or decline a request; either project's agent may. |
 
 `memory_handoff_list` is the inspect-without-claim path for clients that cannot inject SessionStart stdout. `memory_handoff_cancel` needs an exact id. `ai-memory handoffs` lists the open
 handoffs for a project, oldest first, with their ids. It is read-only and
@@ -1139,6 +1143,7 @@ message                     doctor               backfill
 project                     reclaim-ledger-versions  repair-split
 repair-backfill-timestamps  server               backup-agents
 restore-agents              profile              setup
+agent-bus                   room                 link
 ```
 
 Run `ai-memory --help` for the full tree.

@@ -13,6 +13,31 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- Added links between projects. Mail to another project is still delivered but
+  wakes nobody, unless a link joins the two projects: a person (the web page) or
+  an agent (`memory_link_request`, `ai-memory link request`) asks, the
+  destination project confirms (the root user on its page, or an agent whose
+  session was shown the request and then saw a user prompt), and the link ends
+  at its clock (2 hours by default, 24 at most), when either side closes it, or
+  when a project is purged. While it is active the server labels mail between
+  exactly those two projects `linked` and the supervisor, the Claude Code `Stop`
+  hook and the mid-turn notice treat it like mail inside one project. A request
+  never wakes anyone and the requester never confirms its own request. Migration
+  V109 adds `agent_links` and `agent_link_events`; the MCP tools
+  `memory_link_request`, `memory_link_list`, `memory_link_confirm` and
+  `memory_link_close` (the tool count is now 36), the root-only
+  `/admin/links*` routes and `ai-memory link request|confirm|close|list` are
+  new. See [`docs/agent-bus/CROSS_PROJECT.md`](docs/agent-bus/CROSS_PROJECT.md).
+- Added the root-only `/web/chat`, the Agent chat, and pointed the sidebar's
+  "Agent chat" at it (`/web/rooms` stays one tab away). It shows one project's
+  mail between agents and room posts as chat bubbles with a colour per harness
+  (Claude Code, Codex, Gemini CLI, human), the delivery state of each mail and
+  its receipts, a Resume button for a paused pair, and updates by itself through
+  `GET /web/chat/watch` (no model call). A composer posts as human; a mention
+  mails and wakes that agent, and the post resumes the project's paused pairs.
+  Text from agents is escaped and bounded, and another project's text shows only
+  for mail sent while a link was active. The Cross-project tab lists links and
+  connects projects; Confirm appears on the destination project's page.
 - `ai-memory agent-bus install` now writes the native hooks of every agent it
   finds (`~/.claude`, `~/.codex` or `$CODEX_HOME`, `~/.gemini`) by running
   `install-hooks --agent <agent> --apply` for each, so one command wires

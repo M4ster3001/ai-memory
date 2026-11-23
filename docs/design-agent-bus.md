@@ -110,9 +110,9 @@ Slices as the owner ordered them on 2026-11-15, on branch `feat/agent-bus`:
 | F1 wake handles from hooks, discovery in the supervisor | Built. V105 `agent_wake_handles`, `GET /inbox/bus`, `discover = true`, `message supervise approve --adapter codex_queue`. A Claude Code handle is recorded but has no adapter yet. |
 | F2 rooms inside a project | Built. V106, `memory_room_*`, `ai-memory room`, `/admin/rooms*`, root-only `/web/rooms`. A mention is addressed mail with a fixed body, so the F1 bus wakes the mentioned agent. |
 | F3 adapters and wakes, no hourly budget | Built (2026-11-21). `message watch --rewake` as Claude Code's `Stop` hook with `asyncRewake` (added by `install-hooks` on native installs and by `agent-bus install`); adapters `claude_resume`, `codex_exec_resume` (falls back to `codex_queue` on a busy chat or a refused login) and `gemini_resume` (documentation only, untested); V107 loop guard (ping-pong, repeated content, thread depth, per-pair breaker, human prompt resumes) and coalescing instead of budgets; programs trusted on first use; second-opinion fixes 1, 3, 4 and 5 (2 is the loop guard). |
-| F4 human-opened links between projects | Not built. Next round. |
+| F4 human-opened links between projects | Built with F7 (2026-11-21), see §8. |
 | F6 plug and play | Built (2026-11-21). `agent-bus install` writes the native hooks of every agent found, the Claude Code wake hook and the service; idempotent. Wake handles follow the directory the session reported last (V108); a stopped Codex conversation whose directory is gone is queued instead. |
-| F7 chat page and links between projects | Specified in §8, not built. |
+| F7 chat page and links between projects | Built (2026-11-21). V109 `agent_links` and `agent_link_events`, `memory_link_*`, `ai-memory link`, `/admin/links*`, root-only `/web/chat` with a live timeline and a Cross-project tab, `/web/chat/watch`. §8 records what was built and where it differs from the first specification. |
 | F6 mid-turn mail notice | Built (2026-11-21). Native `PreToolUse`/`PostToolUse` hooks of Codex and `PostToolUse` of Claude Code add a fixed line through `hookSpecificOutput.additionalContext` (documented by Codex for both events and present in the 0.169.0-alpha.11.1 hook schema), from `GET /handoff?inbox_turn=1`; check every 5 s, notice every 15 s, once per id; 300 ms budget. Gemini not covered. |
 | F5 `agent-bus install`, status, doctor, dashboard, agent guide | Built (2026-11-21). `ai-memory agent-bus install|status|doctor`, `GET /inbox/bus/status`, `POST /inbox/bus/program`, root-only `/web/agent-bus` with a resume button, `docs/agent-bus/`. No `adopt` and no `memory_bus_whoami`: `doctor` covers the checks. |
 
@@ -176,8 +176,10 @@ Choices made while building F3 and F5, for review:
 
 ## 8. F7 specification: the chat page and links between projects
 
-Written 2026-11-21 from the owner's request; not built yet. It extends §3.6
-(links) and replaces §3.7 (rooms as a link with a name) for the web view.
+Written 2026-11-21 from the owner's request and built the same day. It extends
+§3.6 (links) and replaces §3.7 (rooms as a link with a name) for the web view.
+§8.4 lists what was built and where it differs from the text above it; the
+text is kept as the first specification.
 
 ### 8.1 `/web/chat`
 
@@ -236,3 +238,71 @@ States: `requested` → `confirmed` (by the destination) → `active` →
   of one human act on the dashboard.
 - Default validity stays 2 h (owner choice in this request), maximum 24 h.
 - Links carry their own audit table besides `audit_log`.
+
+### 8.4 As built
+
+Where the build differs from §8.1 to §8.3, and from §3.6:
+
+- Links are stored in the direction they were asked (`from_*` asked, `to_*` is
+  the destination that confirms), not as a normalized pair. A partial unique
+  index over the ordered pair of project ids (`MIN`, `MAX`) keeps one live
+  link per pair in either direction. The destination has to be known, so the
+  direction is needed.
+- The table has no `confirmed_via = 'dashboard'`; it has `web`, `web_both`
+  (the root user ticked "also confirm for the destination" in the form) and
+  `agent`. A request from the web form starts `requested` unless that box is
+  ticked, so the destination's Confirm button is the default path.
+- Validity is counted from the confirmation. A request that nobody confirms
+  expires 24 hours after it was filed. The expiry check is written once
+  (`ai_memory_core::agent_links::is_past`) and the wake gate runs it itself, in
+  the same read as `wake-candidates`; the 60-second message sweep only records
+  `expired` and closes the row's trail.
+- The agent's confirmation evidence is simpler than the research draft's
+  `prompt_ref`: the server records which agent session was shown the request
+  (`memory_link_list` is the presentation), and requires a user prompt in that
+  same session after it, within 30 minutes, that is not the bus's wake text. It
+  does not read the prompt. The prompt of the requester's user is not checked at
+  request time: a request is inert and the confirmation is the gate; in its
+  place there are caps (8 live links per project, 6 agent requests per project
+  per hour).
+- `wake-candidates` answers the label `linked`. The supervisor, the rewake hook
+  and the mid-turn notice treat it like `same_project`. A supervisor binary
+  older than this release does not know the label and never wakes on it
+  (it is read as unknown), which is the safe failure.
+- "Archived" has no meaning in ai-memory today: a project can only be purged.
+  Purging a project (or its workspace) ends its live links in the same
+  transaction and writes `agent_link_closed` with `project_purged` to the audit
+  log; the link rows then go with the project (the audit rows stay).
+- The chat page shows another project's mail text only when the mail was sent
+  while a link between the two was active (a window from the confirmation to the
+  close or clock end), so the conversation of an ended link stays readable and
+  mail around it does not. Receipts are folded under their mail, never bubbles of
+  their own. The page updates through a fingerprint long-poll (a handful of
+  indexed counts), not through the inbox signals, because room posts and
+  delivery reports do not raise those.
+- A human post from the dashboard is a room post with `from_agent = other`,
+  shown as "human"; besides the mention mail it records a human anchor for every
+  harness of the project that has a wake handle and resumes the project's paused
+  pairs.
+- The CLI cannot confirm as the root user. `link confirm` and
+  `/admin/links/confirm` apply the agent rules (recorded session, shown, user
+  prompt after). The root user's confirmation is the web button, accepted only
+  for the destination project's page.
+- §3.6 says "only the authenticated human can open it" and "one human act on the
+  dashboard". Now: a human request needs the destination's confirmation too
+  (one extra click, or the "both" box), and an agent may file a request, never
+  confirm its own.
+
+### 8.5 Bite checks
+
+Each mutation was applied, the named test turned red, and the code was
+restored (the five ran in one scripted pass, store tests only):
+
+| Mutation | Test that failed |
+| --- | --- |
+| The wake gate ignores the clock (`l.expires_at > now` replaced by a constant) | `an_expired_link_wakes_nobody_even_before_the_sweep_ends_it` |
+| An agent's confirmation drops the destination check | `an_agent_confirms_only_after_its_user_answered_the_request_it_was_shown` (the requester then meets `OwnRequest`, so the refusal is backed by a second rule, and the test pins the exact code) |
+| The confirming prompt need not follow the presentation | `an_agent_confirms_only_after_its_user_answered_the_request_it_was_shown` |
+| The chat shows another project's text whatever the link | `the_chat_shows_another_projects_text_only_for_mail_sent_during_a_link` |
+| The web Confirm drops the destination check | `a_request_wakes_nobody_and_the_destination_page_opens_exactly_the_pair` |
+

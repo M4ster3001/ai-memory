@@ -532,6 +532,15 @@ pub(crate) fn record_wake_report(
         }
         result.updated += 1;
         record_event(tx, &source.id, now, event, reason)?;
+        crate::agent_links::note_wake_in_tx(
+            tx,
+            &source.id,
+            &match reason {
+                Some(reason) => format!("{}/{}", state.as_str(), reason.as_str()),
+                None => state.as_str().to_owned(),
+            },
+            now,
+        )?;
         if let Some(receipt) = receipt {
             match queue_receipt(tx, &source, receipt, reason, retry_after, now)? {
                 ReceiptResult::Queued(row) => {

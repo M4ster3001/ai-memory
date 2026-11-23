@@ -201,6 +201,9 @@ pub enum Command {
     Message(MessageArgs),
     /// Rooms: named chats among the agents of one project. Prints JSON.
     Room(RoomArgs),
+    /// Links between two projects: ask for one, confirm one for your
+    /// project, end one, list them. Prints JSON.
+    Link(LinkArgs),
     /// The agent bus: install the host service that wakes agents when mail
     /// arrives, and check it.
     AgentBus(AgentBusArgs),
@@ -965,6 +968,109 @@ pub struct RoomReadArgs {
     #[arg(long)]
     pub workspace: Option<String>,
     /// Project of the room (defaults to the resolved scope).
+    #[arg(long)]
+    pub project: Option<String>,
+}
+
+/// Arguments for `link`.
+#[derive(Debug, Args)]
+pub struct LinkArgs {
+    /// Link action to run.
+    #[command(subcommand)]
+    pub command: LinkCommand,
+}
+
+/// Subcommands for `link`.
+#[derive(Debug, Subcommand)]
+pub enum LinkCommand {
+    /// Ask to link this project with another one. Opens nothing: the other
+    /// project must confirm.
+    Request(LinkRequestArgs),
+    /// Confirm, as an agent of the destination project, a request its user
+    /// answered. The server checks that this session was shown the request
+    /// and then saw a user prompt. The root user confirms on the web page.
+    Confirm(LinkConfirmArgs),
+    /// End a link, or decline a request.
+    Close(LinkCloseArgs),
+    /// List the links of the project and the requests waiting for it.
+    List(LinkListArgs),
+}
+
+/// Arguments for `link request`.
+#[derive(Debug, Args)]
+pub struct LinkRequestArgs {
+    /// Workspace of the project you want to talk to.
+    #[arg(long)]
+    pub to_workspace: String,
+    /// The project you want to talk to; it must already exist.
+    #[arg(long)]
+    pub to_project: String,
+    /// Why the two projects need to talk, one short line (up to 300
+    /// characters).
+    #[arg(long)]
+    pub reason: String,
+    /// How long the link lasts once confirmed, in hours (default 2, at most
+    /// 24).
+    #[arg(long)]
+    pub hours: Option<f64>,
+    /// The harness that asks (for example codex or claude-code).
+    #[arg(long)]
+    pub agent: String,
+    /// The hook session of the agent that asks, when it knows it.
+    #[arg(long)]
+    pub session: Option<String>,
+    /// Workspace of your own project (defaults to the resolved scope).
+    #[arg(long)]
+    pub workspace: Option<String>,
+    /// Your own project (defaults to the resolved scope).
+    #[arg(long)]
+    pub project: Option<String>,
+}
+
+/// Arguments for `link confirm`.
+#[derive(Debug, Args)]
+pub struct LinkConfirmArgs {
+    /// The link id, from `link list`.
+    pub link_id: String,
+    /// The harness that confirms (for example codex or claude-code).
+    #[arg(long)]
+    pub agent: String,
+    /// The hook session of the confirming agent. Without it the server
+    /// refuses: only a recorded session can confirm.
+    #[arg(long)]
+    pub session: Option<String>,
+    /// Workspace of the destination project (defaults to the resolved scope).
+    #[arg(long)]
+    pub workspace: Option<String>,
+    /// The destination project (defaults to the resolved scope).
+    #[arg(long)]
+    pub project: Option<String>,
+}
+
+/// Arguments for `link close`.
+#[derive(Debug, Args)]
+pub struct LinkCloseArgs {
+    /// The link id, from `link list`.
+    pub link_id: String,
+}
+
+/// Arguments for `link list`.
+#[derive(Debug, Args)]
+pub struct LinkListArgs {
+    /// Your harness; with `--session` the waiting requests are shown to that
+    /// session, which an agent needs before it can confirm one.
+    #[arg(long)]
+    pub agent: Option<String>,
+    /// The hook session of the agent that lists.
+    #[arg(long)]
+    pub session: Option<String>,
+    /// Also list links that already ended.
+    #[arg(long)]
+    pub all: bool,
+    /// Workspace of the project (defaults to the resolved scope).
+    #[arg(long)]
+    pub workspace: Option<String>,
+    /// Project whose links to list (defaults to the resolved scope).
     #[arg(long)]
     pub project: Option<String>,
 }

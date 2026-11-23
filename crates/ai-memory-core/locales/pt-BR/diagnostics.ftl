@@ -1105,3 +1105,4 @@ diag-supervisor-budget-range = wakes_per_hour precisa estar entre 1 e 60 e wakes
 diag-supervisor-timeout-range = timeout_secs precisa estar entre 5 e 300
 diag-supervisor-program-absolute = o programa do adaptador precisa ser um caminho absoluto
 diag-response-exceeded-bytes-post = a resposta de POST { $url } excedeu { $max_body_bytes } bytes
+diag-hours-must-be-a-positive-number-up-to = --hours deve ser um número positivo de até 24

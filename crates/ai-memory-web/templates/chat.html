@@ -1,0 +1,168 @@
+{% extends "base.html" %}
+
+{% block title %}{{ i18n.text("web-chat-ai-memory") }}{% endblock %}
+
+{% block content %}
+<div class="page-heading"><div><p class="eyebrow">{{ i18n.text("web-chat-eyebrow") }}</p><h1>{{ i18n.text("web-chat-heading") }}</h1><p>{{ i18n.text("web-chat-intro") }}</p></div></div>
+<div class="project-navigation chat-navigation">
+  <nav class="project-tabs" aria-label="{{ i18n.text("web-chat-tabs") }}">
+    <a href="{{ chat_href }}" data-chat-tab="chat" {% if tab == "chat" %}aria-selected="true" aria-current="page"{% endif %}>{{ i18n.text("web-chat-tab-chat") }}</a>
+    <a href="{{ cross_href }}" data-chat-tab="cross" {% if tab == "cross" %}aria-selected="true" aria-current="page"{% endif %}>{{ i18n.text("web-chat-tab-cross") }}{% if waiting_count > 0 %} <span class="nav-message-count" data-waiting="{{ waiting_count }}">{{ waiting_count }}</span>{% endif %}</a>
+    <a href="rooms" data-chat-tab="rooms">{{ i18n.text("web-chat-tab-rooms") }}</a>
+  </nav>
+  {% if has_projects %}<div class="chat-project-picker"><label class="sr-only" for="chat-project">{{ i18n.text("web-chat-project") }}</label><select id="chat-project" class="field-input">{% for option in projects %}<option data-workspace="{{ option.workspace }}" data-project="{{ option.project }}" {% if option.selected %}selected{% endif %}>{{ option.workspace }} / {{ option.project }}</option>{% endfor %}</select></div>{% endif %}
+</div>
+{% if !has_projects %}
+<div class="empty-state" data-chat="no-projects"><span aria-hidden="true">✦</span><h2>{{ i18n.text("web-chat-no-projects-title") }}</h2><p>{{ i18n.text("web-chat-no-projects-body") }}</p></div>
+{% else if tab == "chat" %}
+<div class="chat-layout">
+  <section class="surface chat-surface" aria-labelledby="chat-title">
+    <div class="panel-heading section-heading"><div><h2 id="chat-title">{{ workspace }} / {{ project }}</h2><p>{{ i18n.text("web-chat-timeline-note") }}</p></div><span class="subtle-pill" id="chat-live" data-state="connecting" role="status">{{ i18n.text("web-chat-connecting") }}</span></div>
+    <div id="chat-feed" class="chat-feed" role="log" aria-live="polite" aria-label="{{ i18n.text("web-chat-timeline") }}" tabindex="0" data-cursor="{{ cursor }}" data-workspace="{{ workspace }}" data-project="{{ project }}">{% include "_chat_feed.html" %}</div>
+  </section>
+  <aside id="compose" class="surface composer" aria-labelledby="chat-compose-title">
+    <div class="composer-heading"><span class="compose-icon" aria-hidden="true">↗</span><div><p class="eyebrow">{{ i18n.text("web-chat-compose-eyebrow") }}</p><h2 id="chat-compose-title">{{ i18n.text("web-chat-compose-title") }}</h2></div></div>
+    <form id="chat-composer" action="chat/post" method="post">
+      <label class="field-label" for="chat-room">{{ i18n.text("web-chat-room") }}</label>
+      <input id="chat-room" class="field-input" list="chat-rooms" value="general" maxlength="40" required autocomplete="off" spellcheck="false">
+      <datalist id="chat-rooms">{% for room in rooms %}<option value="{{ room }}"></option>{% endfor %}</datalist>
+      <label class="field-label" for="chat-body">{{ i18n.text("web-chat-message") }}</label>
+      <textarea id="chat-body" class="field-input" rows="6" maxlength="4000" required placeholder="{{ i18n.text("web-chat-placeholder") }}"></textarea>
+      <div class="chat-mentions" role="group" aria-label="{{ i18n.text("web-chat-mention") }}"><span class="field-hint">{{ i18n.text("web-chat-mention") }}</span><button type="button" class="secondary-button" data-mention="@codex">@codex</button><button type="button" class="secondary-button" data-mention="@claude-code">@claude</button><button type="button" class="secondary-button" data-mention="@gemini-cli">@gemini</button></div>
+      <div class="composer-meta"><span>{{ i18n.text("web-chat-scrubbed") }}</span><span id="chat-count">0 / 4,000</span></div>
+      <div class="delivery-note"><span aria-hidden="true">◷</span><p>{{ i18n.text("web-chat-human-note") }}</p></div>
+      <button class="primary-button send-button" type="submit">{{ i18n.text("web-chat-send") }} <span aria-hidden="true">↗</span></button>
+      <p id="chat-result" role="status" aria-live="polite" tabindex="-1"></p>
+    </form>
+  </aside>
+</div>
+{% else %}
+<div class="chat-layout chat-cross">
+  <section class="surface" aria-labelledby="links-title">
+    <div class="panel-heading section-heading"><div><h2 id="links-title">{{ i18n.text("web-chat-links-title") }}</h2><p>{{ i18n.text("web-chat-links-note") }} <strong>{{ workspace }} / {{ project }}</strong></p></div></div>
+    {% if links.is_empty() %}<div class="empty-state mail-empty" data-links="none"><span aria-hidden="true">⇄</span><h2>{{ i18n.text("web-chat-links-none-title") }}</h2><p>{{ i18n.text("web-chat-links-none-body") }}</p></div>{% else %}
+    <div class="table-scroll"><table class="ops-table chat-links"><thead><tr><th scope="col">{{ i18n.text("web-chat-col-projects") }}</th><th scope="col">{{ i18n.text("web-chat-col-state") }}</th><th scope="col">{{ i18n.text("web-chat-col-ends") }}</th><th scope="col">{{ i18n.text("web-chat-col-asked-by") }}</th><th scope="col">{{ i18n.text("web-chat-col-reason") }}</th><th scope="col"><span class="sr-only">{{ i18n.text("web-chat-col-actions") }}</span></th></tr></thead><tbody>
+    {% for link in links %}<tr data-link="{{ link.id }}" data-state="{{ link.state }}"><td class="mono">{{ link.from }} → {{ link.to }}</td><td><span class="status-pill chat-link-state" data-state="{{ link.state }}">{{ link.state }}</span>{% if !link.confirmed_via.is_empty() %} <span class="subtle-pill">{{ link.confirmed_via }}</span>{% endif %}</td><td>{{ link.ends }}</td><td>{{ link.asked_by }}</td><td class="chat-link-reason">{{ link.reason }}</td><td>{% if link.can_confirm %}<button type="button" class="secondary-button" data-link-confirm="{{ link.id }}">{{ i18n.text("web-chat-confirm") }}</button> {% else if link.state == "requested" && !link.destination_href.is_empty() %}<a class="quiet-button" href="{{ link.destination_href }}">{{ i18n.text("web-chat-open-destination") }}</a> {% endif %}{% if link.can_close %}<button type="button" class="quiet-button" data-link-close="{{ link.id }}">{% if link.state == "requested" %}{{ i18n.text("web-chat-decline") }}{% else %}{{ i18n.text("web-chat-close") }}{% endif %}</button>{% endif %}</td></tr>{% endfor %}
+    </tbody></table></div>{% endif %}
+  </section>
+  <aside id="connect" class="surface composer" aria-labelledby="connect-title">
+    <div class="composer-heading"><span class="compose-icon" aria-hidden="true">⇄</span><div><p class="eyebrow">{{ i18n.text("web-chat-connect-eyebrow") }}</p><h2 id="connect-title">{{ i18n.text("web-chat-connect-title") }}</h2></div></div>
+    <form id="link-form" action="chat/links" method="post">
+      <div class="chat-field"><label class="field-label" for="link-from">{{ i18n.text("web-chat-connect-from") }}</label>
+      <select id="link-from" class="field-input" required>{% for option in projects %}<option data-workspace="{{ option.workspace }}" data-project="{{ option.project }}" {% if option.selected %}selected{% endif %}>{{ option.workspace }} / {{ option.project }}</option>{% endfor %}</select></div>
+      <div class="chat-field"><label class="field-label" for="link-to">{{ i18n.text("web-chat-connect-to") }}</label>
+      <select id="link-to" class="field-input" required><option value="">{{ i18n.text("web-chat-connect-choose") }}</option>{% for option in projects %}<option data-workspace="{{ option.workspace }}" data-project="{{ option.project }}">{{ option.workspace }} / {{ option.project }}</option>{% endfor %}</select></div>
+      <div class="chat-field chat-field-wide"><label class="field-label" for="link-reason">{{ i18n.text("web-chat-connect-reason") }}</label>
+      <input id="link-reason" class="field-input" maxlength="300" required placeholder="{{ i18n.text("web-chat-connect-reason-hint") }}"></div>
+      <div class="chat-field"><label class="field-label" for="link-hours">{{ i18n.text("web-chat-connect-valid") }}</label>
+      <select id="link-hours" class="field-input"><option value="0.5">30 min</option><option value="1">1 h</option><option value="2" selected>2 h</option><option value="6">6 h</option><option value="12">12 h</option><option value="24">24 h</option></select></div>
+      <label class="chat-check"><input id="link-both" type="checkbox"> <span>{{ i18n.text("web-chat-connect-both") }}</span></label>
+      <div class="delivery-note"><span aria-hidden="true">◷</span><p>{{ i18n.text("web-chat-connect-note") }}</p></div>
+      <button class="primary-button send-button" type="submit">{{ i18n.text("web-chat-connect-submit") }} <span aria-hidden="true">⇄</span></button>
+      <p id="link-result" role="status" aria-live="polite" tabindex="-1"></p>
+    </form>
+  </aside>
+</div>
+{% endif %}
+<script>
+(function(){
+{% include "_js_api_errors.html" %}
+{% include "_js_cookie.html" %}
+  var select=document.getElementById("chat-project");
+  function pageUrl(name,option){var url=new URL(name,document.baseURI);url.searchParams.set("workspace",option.dataset.workspace);url.searchParams.set("project",option.dataset.project);return url;}
+  if(select){select.addEventListener("change",function(){var url=pageUrl("chat",select.selectedOptions[0]);{% if tab == "cross" %}url.searchParams.set("tab","cross");{% endif %}location.assign(url.href);});}
+  function headers(){return {"Content-Type":"application/json","X-Ai-Memory-UI":"1","X-CSRF-Token":decodeURIComponent(cookie("ai_memory_csrf")||"")};}
+  async function post(path,payload){
+    var response=await fetch(new URL(path,document.baseURI),{method:"POST",credentials:"same-origin",headers:headers(),body:JSON.stringify(payload)});
+    if(response.redirected)throw new Error({{ i18n.js("web-your-session-expired-sign-in-again-before-sending")|safe }});
+    var data={};try{data=await response.json();}catch(error){}
+    if(!response.ok)throw new Error(apiError(data,{{ i18n.js("web-chat-action-failed")|safe }}));
+    return data;
+  }
+  var feed=document.getElementById("chat-feed");
+  var live=document.getElementById("chat-live");
+  var workspace=feed?feed.dataset.workspace:select&&select.selectedOptions[0].dataset.workspace;
+  var projectName=feed?feed.dataset.project:select&&select.selectedOptions[0].dataset.project;
+  var refreshNow=function(){};
+  // Buttons inside the feed and the links table: resume, confirm, decline.
+  document.addEventListener("click",async function(event){
+    var button=event.target.closest("[data-resume],[data-link-confirm],[data-link-close]");
+    if(!button||button.disabled)return;
+    button.disabled=true;
+    try{
+      if(button.dataset.resume){await post("agent-bus/resume",JSON.parse(button.dataset.resume));refreshNow();}
+      else if(button.dataset.linkConfirm){await post("chat/links/"+encodeURIComponent(button.dataset.linkConfirm)+"/confirm",{workspace:workspace,project:projectName});location.reload();}
+      else if(button.dataset.linkClose){await post("chat/links/"+encodeURIComponent(button.dataset.linkClose)+"/close",{});location.reload();}
+    }catch(error){button.disabled=false;window.alert(error.message);}
+  });
+  var form=document.getElementById("chat-composer");
+  if(form){
+    var body=document.getElementById("chat-body"),room=document.getElementById("chat-room"),result=document.getElementById("chat-result"),sending=false;
+    body.addEventListener("input",function(){document.getElementById("chat-count").textContent=Array.from(body.value).length+" / 4,000";});
+    form.querySelectorAll("[data-mention]").forEach(function(button){button.addEventListener("click",function(){var text=button.dataset.mention+" ";var start=body.selectionStart||body.value.length;body.setRangeText(text,start,body.selectionEnd||start,"end");body.focus();body.dispatchEvent(new Event("input"));});});
+    body.addEventListener("keydown",function(event){if(event.key==="Enter"&&(event.ctrlKey||event.metaKey)){event.preventDefault();form.requestSubmit();}});
+    form.addEventListener("submit",async function(event){
+      event.preventDefault();if(sending||!form.reportValidity())return;
+      sending=true;result.className="";result.textContent={{ i18n.js("web-chat-sending")|safe }};
+      try{
+        var data=await post("chat/post",{workspace:workspace,project:projectName,room:room.value,body:body.value});
+        body.value="";document.getElementById("chat-count").textContent="0 / 4,000";
+        result.className="send-success";result.textContent={{ i18n.js("web-chat-posted")|safe }}+" #"+room.value+" · "+data.seq;
+        refreshNow();
+      }catch(error){result.className="send-error";result.textContent=error.message;}
+      sending=false;
+    });
+  }
+  var link=document.getElementById("link-form");
+  if(link){
+    var linkResult=document.getElementById("link-result");
+    link.addEventListener("submit",async function(event){
+      event.preventDefault();if(!link.reportValidity())return;
+      var from=document.getElementById("link-from").selectedOptions[0],to=document.getElementById("link-to").selectedOptions[0];
+      if(!to||!to.dataset.project)return;
+      linkResult.className="";linkResult.textContent={{ i18n.js("web-chat-sending")|safe }};
+      try{
+        await post("chat/links",{from_workspace:from.dataset.workspace,from_project:from.dataset.project,to_workspace:to.dataset.workspace,to_project:to.dataset.project,reason:document.getElementById("link-reason").value,hours:parseFloat(document.getElementById("link-hours").value),confirm_now:document.getElementById("link-both").checked});
+        location.reload();
+      }catch(error){linkResult.className="send-error";linkResult.textContent=error.message;}
+    });
+  }
+  // Near real time without a model: the server holds this request until
+  // something in the project changes, then answers with the fresh timeline.
+  if(feed){
+    var cursor=feed.dataset.cursor,running=false,stopped=false,failures=0,wake=null,first=true;
+    function setLive(state,text){live.dataset.state=state;live.textContent=text;}
+    function show(html){
+      var atEnd=feed.scrollHeight-feed.scrollTop-feed.clientHeight<80;
+      var template=document.createElement("template");template.innerHTML=html;
+      feed.replaceChildren(template.content);
+      if(atEnd)feed.scrollTop=feed.scrollHeight;
+    }
+    feed.scrollTop=feed.scrollHeight;
+    async function poll(wait){
+      var url=new URL("chat/watch",document.baseURI);
+      url.searchParams.set("workspace",workspace);url.searchParams.set("project",projectName);url.searchParams.set("after",cursor);url.searchParams.set("wait_ms",String(wait));
+      var response=await fetch(url,{credentials:"same-origin",cache:"no-store",headers:{"Accept":"application/json","X-Ai-Memory-UI":"1"}});
+      if(!response.ok)throw new Error("watch "+response.status);
+      var data=await response.json();
+      cursor=data.cursor;
+      if(typeof data.html==="string")show(data.html);
+      setLive("live",{{ i18n.js("web-chat-live")|safe }});
+    }
+    async function loop(){
+      if(running)return;running=true;
+      while(!stopped){
+        if(document.hidden){await new Promise(function(resolve){wake=resolve;});wake=null;continue;}
+        try{await poll(first?0:20000);first=false;failures=0;}
+        catch(error){failures+=1;setLive("offline",{{ i18n.js("web-chat-offline")|safe }});await new Promise(function(resolve){setTimeout(resolve,Math.min(15000,1000*failures*failures));});}
+      }
+      running=false;
+    }
+    refreshNow=function(){poll(0).catch(function(){});};
+    document.addEventListener("visibilitychange",function(){if(!document.hidden&&wake)wake();});
+    window.addEventListener("pagehide",function(){stopped=true;});
+    loop();
+  }
+})();
+</script>
+{% endblock %}

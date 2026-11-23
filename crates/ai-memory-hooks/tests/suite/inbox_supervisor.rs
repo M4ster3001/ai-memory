@@ -237,6 +237,100 @@ async fn candidates_label_mail_of_a_paused_pair() {
     assert!(!body.contains("CANARY"), "{body}");
 }
 
+/// A link joins the sender's project to the watched one: its mail is
+/// labelled `linked` only while the link is active, a request does not count,
+/// the label is checked after `paused`, and the mid-turn notice filter treats
+/// it like the project's own mail.
+#[tokio::test]
+async fn candidates_label_mail_of_a_linked_project_only_while_the_link_is_active() {
+    let h = harness().await;
+    let label_of = |body: &str, id: &str| -> String {
+        let json: Value = serde_json::from_str(body).unwrap();
+        json["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == id)
+            .map(|m| m["sender"].as_str().unwrap().to_owned())
+            .unwrap_or_default()
+    };
+    let candidates = |h: &Harness| {
+        let app = h.app.clone();
+        async move {
+            let (status, body) = call(
+                &app,
+                post("/inbox/wake-candidates", &candidates_body(&[]), None, true),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            body
+        }
+    };
+    let outsider = send(&h, true, Some(AgentKind::Codex)).await;
+    assert_eq!(label_of(&candidates(&h).await, &outsider), "unlisted");
+
+    let key = |at: (ai_memory_core::WorkspaceId, ai_memory_core::ProjectId)| {
+        ai_memory_store::ProjectKey {
+            workspace_id: at.0,
+            project_id: at.1,
+        }
+    };
+    let link = h
+        .state
+        .writer
+        .link_request(ai_memory_store::NewLinkRequest {
+            from: key(h.sender),
+            to: key(h.inbox),
+            reason: "review together".into(),
+            valid_secs: 3_600,
+            by: ai_memory_store::LinkRequester::Human,
+            confirm_now: false,
+        })
+        .await
+        .unwrap();
+    let ai_memory_store::LinkRequestOutcome::Created(id, _) = link else {
+        panic!("{link:?}");
+    };
+    assert_eq!(
+        label_of(&candidates(&h).await, &outsider),
+        "unlisted",
+        "a request wakes nobody"
+    );
+
+    h.state
+        .writer
+        .link_confirm_web(id, key(h.inbox))
+        .await
+        .unwrap();
+    let body = candidates(&h).await;
+    assert_eq!(label_of(&body, &outsider), "linked", "{body}");
+    assert!(!body.contains("CANARY"), "{body}");
+
+    // The turn notice filter lets a linked project's mail interrupt a turn.
+    let rows = h
+        .state
+        .reader
+        .wake_candidates(h.inbox.0, h.inbox.1, AgentKind::Codex, false, 100)
+        .await
+        .unwrap();
+    let ids = crate::turn_notice_ids(&rows, h.inbox.0, h.inbox.1, AgentKind::Codex);
+    assert_eq!(ids.len(), 1);
+
+    h.state
+        .writer
+        .link_close(id, ai_memory_store::LinkCloser::Human)
+        .await
+        .unwrap();
+    assert_eq!(label_of(&candidates(&h).await, &outsider), "unlisted");
+    let rows = h
+        .state
+        .reader
+        .wake_candidates(h.inbox.0, h.inbox.1, AgentKind::Codex, false, 100)
+        .await
+        .unwrap();
+    assert!(crate::turn_notice_ids(&rows, h.inbox.0, h.inbox.1, AgentKind::Codex).is_empty());
+}
+
 #[tokio::test]
 async fn reports_set_delivery_and_refuse_anything_outside_the_vocabulary() {
     let h = harness().await;

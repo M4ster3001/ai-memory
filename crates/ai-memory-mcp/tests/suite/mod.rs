@@ -31,6 +31,7 @@ mod dual_key_scope;
 mod handoff_admission;
 mod handoff_identity;
 mod launch_scope_fallback;
+mod link_tools;
 mod mcp_stateless_http;
 mod query_answer;
 mod query_observation_stream;

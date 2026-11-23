@@ -19,6 +19,7 @@ pub mod i18n;
 pub mod ids;
 pub mod latency;
 pub use latency::{LATENCY_BUCKET_BOUNDS_US, LatencyHistogram, LatencySnapshot, LatencyTimer};
+pub mod agent_links;
 pub mod log_ledger;
 pub mod message;
 pub mod message_delivery;
@@ -79,9 +80,9 @@ pub use handoff::{
     HandoffState, NewHandoff,
 };
 pub use ids::{
-    AgentKind, ApiCredentialId, AutoImproveProposalId, AutoImproveRunId, EntityId, HandoffId,
-    ManagedRunId, MessageId, ObservationId, PageFeedbackId, PageId, PagePath, ProjectId, SessionId,
-    UserId, WorkspaceId, WorkstreamId, is_dos_device_name, is_git_reserved_component,
+    AgentKind, AgentLinkId, ApiCredentialId, AutoImproveProposalId, AutoImproveRunId, EntityId,
+    HandoffId, ManagedRunId, MessageId, ObservationId, PageFeedbackId, PageId, PagePath, ProjectId,
+    SessionId, UserId, WorkspaceId, WorkstreamId, is_dos_device_name, is_git_reserved_component,
     portable_page_key,
 };
 pub use message::{

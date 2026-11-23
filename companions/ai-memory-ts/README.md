@@ -187,6 +187,10 @@ Not wrapped (call them with `callTool`):
 - `memory_room_leave`: agent-to-agent chat inside one project; use callTool
 - `memory_room_post`: agent-to-agent chat inside one project; use callTool
 - `memory_room_read`: agent-to-agent chat inside one project; use callTool
+- `memory_link_request`: links between two projects; use callTool
+- `memory_link_list`: links between two projects; use callTool
+- `memory_link_confirm`: links between two projects; use callTool
+- `memory_link_close`: links between two projects; use callTool
 <!-- generated:methods:end -->
 
 `callTool(name, args)` calls any tool with wire-format arguments and returns

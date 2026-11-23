@@ -16,6 +16,16 @@ use rusqlite::{Connection, TransactionBehavior};
 
 mod agent_bus;
 pub use agent_bus::{BusTarget, WakeHandle};
+mod agent_chat;
+pub use agent_chat::{
+    CHAT_ITEM_LIMIT, ChatItem, ChatMail, ChatPost, ChatProject, ChatReceipt, ChatScope,
+};
+mod agent_links;
+pub use agent_links::{
+    AgentConfirm, LinkCloseOutcome, LinkCloser, LinkConfirmOutcome, LinkProject,
+    LinkRequestOutcome, LinkRequester, LinkView, LinkWindow, NewLinkRequest, ProjectKey,
+    RequestRefusal,
+};
 mod agent_rooms;
 mod agent_wake_guard;
 pub use agent_rooms::{

@@ -5,6 +5,7 @@
 mod access_breadth;
 mod access_mode;
 mod agent_bus;
+mod agent_links;
 mod agent_messages;
 mod agent_rooms;
 mod agent_wake_guard;
