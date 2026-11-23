@@ -347,8 +347,8 @@ never free text:
 | `expired` | the time to live passed while it waited (reason `ttl`) | yes |
 | `cancelled` | the sender cancelled it (reason `sender_cancelled`) | yes |
 | `wake_attempted` | the [wake supervisor](#the-wake-supervisor) ran the recipient's adapter and the adapter accepted the wake | no |
-| `wake_failed` | the supervisor's wake failed or was not run (reason `adapter_exit_nonzero`, `adapter_timeout`, `session_busy`, `not_approved` or `budget_exhausted`) | no |
-| `agent_unavailable` | the adapter's program could not be started (reason `binary_missing`) | no |
+| `wake_failed` | the supervisor's wake failed or was not run (reason `adapter_exit_nonzero`, `adapter_timeout`, `session_busy`, `session_not_found`, `not_approved`, `loop_suspected`, or `budget_exhausted` from a supervisor older than the loop guard) | no |
+| `agent_unavailable` | the adapter's program could not be started (reason `binary_missing`), or the harness login refused the run (reason `auth_failed`) | no |
 | `quota_exhausted` | the recipient's harness reported exhausted quota (reason `quota_marker`); `retry_after` says when it resets, when the harness said so | no |
 
 `dead` is reserved for delivery leases described in
@@ -834,15 +834,23 @@ Every key, default and bound is in
 
 #### Adapters
 
-The set is closed and typed. Today it has one entry,
-`codex_queue`, which runs
-`<program> queue --thread <thread> --message <wake text>` without a shell and
-never with `--resume` (against a running Codex chat, `--resume` fails with
-`already has an active writer`). `thread` is a lowercase UUID or a name of
-letters, digits, `.`, `_` and `-` that starts with a letter or digit. There is
-no field for a command of your own; `message watch --exec` remains for manual
-use. The wake text is fixed: the message count, the newest message id, the
-agent and the inbox from the configuration. No subject, body or sender name.
+The set is closed and typed. A configured entry can use `codex_queue`;
+discovered agents (below) use all four:
+
+| Adapter | Runs | Used for |
+| --- | --- | --- |
+| `codex_queue` | `codex queue --thread <id> --message <wake text>` | An open Codex conversation, and the fallback for a stopped one. The desktop app or daemon that has the conversation loaded starts the turn within about ten seconds; the desktop app may not show that turn on screen until the conversation is reloaded. A conversation nobody has open runs the item when it is opened. Never `--resume`, which fails with `already has an active writer` against a running chat. |
+| `codex_exec_resume` | `codex exec resume --skip-git-repo-check -c sandbox_mode="read-only" <id> <wake text>`, in the conversation's own directory (checked like a Claude Code one; when it fails the check the turn is queued instead) | A Codex conversation whose session ended. A Codex CLI signed in with an API key whose organization is in the API credits promotion is refused (`codex_byok_restricted_by_api_credit_promo`): that is reported `agent_unavailable/auth_failed`, the adapter is not tried again for six hours, and the turn is queued with `codex_queue` instead. Sign the CLI in with `codex login` to allow headless turns. |
+| `claude_resume` | `claude -p <wake text> --resume <id> --output-format json --max-turns 12 --permission-mode dontAsk --tools "" --allowedTools mcp__ai-memory`, in the session's own directory | A Claude Code session whose session ended. Only the ai-memory MCP tools are allowed. It runs only after `claude agents --json` lists no live process for the session; two processes on one session would fork its transcript. The directory must exist, belong to you, not be world-writable and not be under a temporary directory, or the mail is reported `wake_failed/session_not_found`. |
+| `gemini_resume` | `gemini --resume <id> --prompt <wake text> --output-format json --approval-mode default`, in the session's own directory | A Gemini CLI session whose session ended. Built from the Gemini CLI documentation and not yet run against a real Gemini CLI. An open Gemini CLI session hears of its mail through the notice at its next prompt. |
+
+`thread` is a lowercase UUID or a name of letters, digits, `.`, `_` and `-`
+that starts with a letter or digit; a discovered handle is always a canonical
+UUID. There is no field for a command of your own; `message watch --exec`
+remains for manual use. The wake text is fixed: the message count, the newest
+message id, the agent and the inbox. No subject, body or sender name. An open
+Claude Code session is woken by its own hook instead (see
+[Waking an open Claude Code session](#waking-an-open-claude-code-session)).
 
 #### Who may wake an agent
 
@@ -880,9 +888,9 @@ runs as the same user and can read the bearer token can name one too.
 Same-project mail needs neither, so any local process that holds the server
 token can wake a supervised agent by sending mail as its project. What that
 process can do stays bounded: the wake text is the fixed template above, so
-nothing it writes reaches the adapter, and the per-agent and global budgets,
-the backoff and the quota circuit apply to these wakes as to any other. Run
-the supervisor only on a host where the token is readable by you alone.
+nothing it writes reaches the adapter, and the loop guard, the coalescing, the
+backoff and the quota circuit apply to these wakes as to any other. Run the
+supervisor only on a host where the token is readable by you alone.
 
 A client that does not forward its hook session id with the send, such as a
 static MCP client, always sends `unverified` mail. For an entry that should be
@@ -957,19 +965,55 @@ and then dropped. Nothing of the output is logged, stored or sent.
 
 #### Limits
 
-Per agent, 4 wakes an hour and 24 a day; across agents, 20 an hour.
-One wake covers every new message for the agent at that moment, and each
-message wakes its agent at most once, so a message the agent already popped,
-or one it was woken for before a restart, is not announced again. Past a
-budget, the message is reported `wake_failed/budget_exhausted` once and woken
-when the window rolls. After a failed wake the supervisor waits 1 minute, then
-5, 30 and 120 minutes before the next attempt. A quota failure stops wakes for
-that agent until `retry_after`, or 15 minutes when the harness did not say;
-mail that arrives meanwhile is reported `quota_exhausted` without running the
-adapter. At most 2 adapters run at once, each for a different agent, and one
-agent never has two wakes in flight; `max_concurrent_wakes` raises the first
-limit when you ask for it. Budgets, backoff and woken ids are saved in
-`ledger.json`, so a restart does not reset them.
+Wakes are not counted per hour. `max_wakes_per_hour`, `wakes_per_hour` and
+`wakes_per_day` are still accepted in `config.toml` and ignored. What keeps the
+supervisor quiet instead:
+
+- One wake covers every new message for the agent at that moment, and each
+  message wakes its agent at most once, so a message the agent already popped,
+  or one it was woken for before a restart, is not announced again.
+- Coalescing: while mail the agent was woken for is still unread, new mail
+  joins it instead of waking the agent again, for up to 10 minutes. Once the
+  agent pops what it was woken for, the next message wakes it at once.
+- The [loop guard](#the-loop-guard) pauses a pair of agents that wake each
+  other in a loop.
+- After a failed wake the supervisor waits 1 minute, then 5, 30 and 120
+  minutes before the next attempt. A quota failure stops wakes for that agent
+  until `retry_after`, or 15 minutes when the harness did not say; mail that
+  arrives meanwhile is reported `quota_exhausted` without running the adapter.
+- At most 2 adapters run at once, each for a different agent, and one agent
+  never has two wakes in flight; `max_concurrent_wakes` raises the first limit
+  when you ask for it.
+
+Backoff, circuits and woken ids are saved in `ledger.json`, so a restart does
+not reset them.
+
+#### The loop guard
+
+The server pauses wakes between two agents (a harness in a project, the pair
+taken in either direction) when their mail shows a loop, computed without a
+model when each message is sent:
+
+- ping-pong: the pair's addressed mail changed direction 20 times since a
+  human last prompted either side;
+- repeated content: the same body three times in the pair within 30 minutes,
+  compared after lowercasing, collapsing spaces and replacing numbers and ids;
+- thread depth: the message ends a chain of more than 40 agent turns, each
+  woken by mail, with no human prompt to its sender in between. This catches
+  a loop among three or more agents that no single pair shows.
+
+Mail is read from the last two hours when no human prompt was recorded more
+recently. A paused pair's mail is still delivered and can be popped; it only
+stops waking either side. `POST /inbox/wake-candidates` labels it `paused`, the
+supervisor and the Claude Code wake hook report it once as
+`wake_failed/loop_suspected`, and the sender gets the receipt it asked for.
+Other agents keep waking both sides. A prompt a human types in a session of
+either side resumes the pair; a prompt that is only the wake text does not
+count. The root-only `/web/agent-bus` page lists paused pairs with a resume
+button. Every pause and resume is written to the audit log without message
+text (`agent_pair_paused`, `agent_pair_resumed`). Prompts reach the server
+through the hook spool, so a resume by prompt takes effect when that prompt is
+ingested.
 
 #### Running it
 
@@ -981,8 +1025,11 @@ logs one line per wake or report to stderr: entry names, adapter ids, message
 ids, counts and outcomes, never argv, thread ids or output. Set
 `idle_exit_minutes` to stop after a quiet period; by default it never stops.
 
-To keep it running across logins, print a per-user service unit and install it
-yourself. Nothing is installed by the command:
+To keep it running across logins, `ai-memory agent-bus install` writes and
+starts the per-user service and adds the Claude Code wake hook after one
+question (see [the agent bus guide](agent-bus/QUICKSTART.md)). To do it by
+hand instead, print the unit and install it yourself; nothing is installed by
+this command:
 
 ```bash
 ai-memory message supervise unit > ~/.config/systemd/user/ai-memory-supervisor.service
@@ -1017,27 +1064,102 @@ entries running.
 
 A discovered agent is woken only by mail from another agent of its own
 project, through the same `POST /inbox/wake-candidates` gate with an empty
-`wake_from`. Mail from any other project stays in the inbox. Its budgets are the
-defaults of a configured entry (4 wakes an hour, 24 a day) and the global
-limits apply. An inbox and harness that a configured entry already supervises
-is left to that entry.
+`wake_from`. Mail from any other project stays in the inbox. An inbox and
+harness that a configured entry already supervises is left to that entry.
 
-Today only `codex_queue` has a handle it can target, so a discovered Codex
-session is woken and a discovered Claude Code session is recorded but not yet
-woken. The program is approved once per adapter, for every discovered agent:
+The bus answer says whether the newest session is still open and the
+directory it reported last (every hook event refreshes it, so a session that
+moved, or whose first directory was deleted, is repaired by its next prompt), and the supervisor picks the adapter from that: an open
+Codex conversation gets `codex_queue`; a stopped one `codex_exec_resume`
+(falling back to `codex_queue`); a stopped Claude Code session `claude_resume`;
+a stopped Gemini CLI session `gemini_resume`. An open Claude Code session is
+left to its `Stop` hook, and an open Gemini CLI session to the notice at its
+next prompt. Gemini CLI sessions get a handle from this release on.
+
+The program of a known adapter is trusted on first use: the first time a
+discovered agent needs `codex`, `claude` or `gemini`, the supervisor looks for
+it on its `PATH`, then in `~/.local/bin`, `~/bin`, `~/.npm-global/bin`,
+`~/.bun/bin`, `/opt/homebrew/bin`, `/usr/local/bin` and `/usr/bin`, applies the
+file checks of a configured entry, and records its canonical path and SHA-256
+under `programs` in `approvals.json` (`"trusted": "first_use"`). When the
+binary at that path changes, as an upgrade does, and the checks still pass, it
+trusts the new one (`"trusted": "changed"`, with the previous hash), logs it,
+and reports it to the server, which writes `agent_bus_program_trusted` to the
+audit log and shows it on `/web/agent-bus`. A program that fails the checks is
+reported `wake_failed/not_approved`; none found, `agent_unavailable/binary_missing`.
+
+For an explicit approval instead, set `trust_on_first_use = false` under
+`[messaging.supervisor]` and approve each adapter on a terminal:
 
 ```bash
 ai-memory message supervise approve --adapter codex_queue
 ```
 
-It looks for `codex` on your `PATH` (or takes `--program /absolute/path`),
-applies the same file checks as a configured entry, and shows the program's
-canonical path and SHA-256, the argv shape with a placeholder session id, the
-working directory, the environment variable names and the risk line. The
-approval is stored under `programs` in `approvals.json` and covers the adapter,
-the argv shape, the program's path and content, the working directory and the
-timeout. A changed binary voids it, and until a program is approved the mail
-is reported `wake_failed/not_approved` once.
+It looks for the program on your `PATH` (or takes `--program /absolute/path`),
+applies the same checks, and shows the program's canonical path and SHA-256,
+the argv shape with a placeholder session id, the working directory, the
+environment variable names and the risk line before asking `[y/N]`. With the
+option off, a changed binary voids the approval, and until a program is
+approved the mail is reported `wake_failed/not_approved` once.
+
+#### Telling a busy agent between tool calls
+
+A wake reaches an idle agent. An agent in the middle of a long turn is told
+instead by its own tool hooks: the native `ai-memory hook` that Codex runs
+before and after every tool call (`PreToolUse`, `PostToolUse`), and that
+Claude Code runs after one (`PostToolUse`), returns
+`hookSpecificOutput.additionalContext`, which both harnesses add to the
+model's context. Codex documents it for both events ("To add model-visible
+context without blocking, return `hookSpecificOutput.additionalContext`").
+
+- At most one check every 5 seconds per session, as one request to
+  `GET /handoff?inbox_turn=1` with a 300 ms budget; a server that does not
+  answer in time adds nothing and does not delay the tool.
+- The server answers with the inbox names and the ids of pending mail that
+  may interrupt the agent: from another harness of its own project and not
+  paused by the loop guard, or a receipt. Mail from another project, the
+  agent's own mail and paused mail are left out. Never a subject, body or
+  sender.
+- The hook announces each id once per session and at most one notice every
+  15 seconds, with the fixed line `ai-memory: N new message(s) arrived for
+  <agent> in <workspace>/<project> while you work, newest <id>. ...`. The
+  seen ids live in `inbox-watch/turn-*.json` under the hook's data directory.
+- `agent-bus install` writes these native hooks for every agent it finds
+  (it runs `install-hooks --agent <agent> --apply` for each); the shell
+  scripts of the Docker wrapper do not send the notice. `agent-bus doctor`
+  checks it.
+- A single tool call that runs for minutes (a long build) finishes before the
+  agent can see the line: the hook runs between calls, never during one. A
+  server older than this flag answers its count-only text, which the hook
+  ignores.
+
+Gemini CLI is not covered: its tool hooks are not wired for this.
+
+#### Waking an open Claude Code session
+
+A Claude Code session that is open and idle is woken by a second `Stop` hook,
+marked `asyncRewake`, that `install-hooks` (native installs) and
+`ai-memory agent-bus install` add to `~/.claude/settings.json`:
+
+```json
+{"type": "command", "asyncRewake": true, "timeout": 43200,
+ "command": "AI_MEMORY_SERVER_URL=... AI_MEMORY_AUTH_TOKEN=... /path/to/ai-memory message watch --rewake --agent claude-code"}
+```
+
+Claude Code runs it in the background each time a turn ends. It reads the
+session id from the hook's stdin, long-polls `GET /inbox/watch` for
+`claude-code` in the session's project, and exits with code 2 when mail
+arrives that may wake the session and that the session was not told about
+yet. Claude Code then wakes the session at once and shows the fixed wake text
+(on stderr) to the model, which reads its mail with `memory_message_pop`. The
+gate is the server's, as for the supervisor: mail from another agent of the
+project or a receipt wakes it; its own mail, mail from another project and a
+paused pair's mail do not. It reports `wake_attempted` (or `loop_suspected`)
+for the sender. With no mail it exits 0 after 12 hours, and the next turn's
+hook waits again; a session idle for longer hears of its mail at its next
+prompt. The server URL and token are in the command's environment, never in
+its argv, and nothing but the wake text is printed. Each waiting hook holds
+one of the server's 64 long-poll slots.
 
 Set `discover = false` under `[messaging.supervisor]` to supervise only the
 configured entries.

@@ -26,6 +26,7 @@ pub(crate) fn is_scope_ambiguous(error: &anyhow::Error) -> bool {
         })
 }
 
+pub(crate) mod agent_bus;
 pub(crate) mod agent_plugins;
 pub(crate) mod agentmemory_residue;
 pub mod api_key;
@@ -75,6 +76,7 @@ mod managed_project;
 pub mod mcp_bridge;
 pub mod merge_project;
 pub mod message;
+pub(crate) mod message_rewake;
 pub(crate) mod message_supervise;
 pub(crate) mod message_watch;
 pub mod move_project;
@@ -123,6 +125,7 @@ pub(crate) mod setup_web;
 pub mod show;
 pub mod status;
 pub mod transcript_capture;
+pub(crate) mod turn_notice;
 pub mod uninstall;
 pub mod upgrade;
 pub mod user;

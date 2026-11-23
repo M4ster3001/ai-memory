@@ -2537,6 +2537,9 @@ pub struct WakeCandidate {
     /// Whether the server recorded the sender's hook session in the sending
     /// project at send time (`from_session_id`).
     pub sender_session_recorded: bool,
+    /// Whether the loop guard paused wakes between the sender and the
+    /// recipient (`agent_pair_pauses`). Always false for a receipt.
+    pub pair_paused: bool,
 }
 
 /// One workspace scope with the id + name needed to write its
@@ -9909,16 +9912,35 @@ impl ReaderPool {
                     ))
                 },
             )?;
+            let rows: Vec<_> = rows.collect::<Result<_, _>>()?;
+            let partners = crate::agent_wake_guard::paused_partners(
+                conn,
+                crate::agent_wake_guard::AgentSide {
+                    workspace_id,
+                    project_id,
+                    agent,
+                },
+            )?;
             let mut out = Vec::new();
-            for row in rows {
-                let (id, kind, from_ws, from_pj, recorded, from_agent) = row?;
+            for (id, kind, from_ws, from_pj, recorded, from_agent) in rows {
+                let kind: ai_memory_core::MessageKind = kind.parse().map_err(StoreError::from)?;
+                let from_workspace_id = WorkspaceId::from_slice(&from_ws)?;
+                let from_project_id = ProjectId::from_slice(&from_pj)?;
+                let from_agent = AgentKind::from_wire(&from_agent);
+                let pair_paused = kind == ai_memory_core::MessageKind::Message
+                    && partners.contains(&crate::agent_wake_guard::AgentSide {
+                        workspace_id: from_workspace_id,
+                        project_id: from_project_id,
+                        agent: from_agent,
+                    });
                 out.push(WakeCandidate {
                     id: MessageId::from_slice(&id)?,
-                    kind: kind.parse().map_err(StoreError::from)?,
-                    from_workspace_id: WorkspaceId::from_slice(&from_ws)?,
-                    from_project_id: ProjectId::from_slice(&from_pj)?,
-                    from_agent: AgentKind::from_wire(&from_agent),
+                    kind,
+                    from_workspace_id,
+                    from_project_id,
+                    from_agent,
                     sender_session_recorded: recorded,
+                    pair_paused,
                 });
             }
             Ok(out)

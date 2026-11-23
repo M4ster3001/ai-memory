@@ -1800,13 +1800,14 @@ impl Default for MessagingSettings {
 }
 
 /// `[messaging.supervisor]`: which agents `ai-memory message supervise` may
-/// wake, with which adapter, and how often. Read by the supervisor only; the
-/// server ignores it.
+/// wake and with which adapter. Read by the supervisor only; the server
+/// ignores it. Wakes have no hourly budget: the server's loop guard pauses
+/// a pair of agents that wake each other in a loop.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SupervisorSettings {
-    /// Adapter launches allowed across every supervised agent in any rolling
-    /// hour (1 to 1000).
+    /// Deprecated and ignored: wakes are no longer counted per hour. Still
+    /// accepted (1 to 1000) so an existing `config.toml` keeps loading.
     pub max_wakes_per_hour: u32,
     /// Stop after this many minutes with no new mail and no wake. `0` (the
     /// default) never stops.
@@ -1819,6 +1820,12 @@ pub struct SupervisorSettings {
     /// Needs the root credential; discovered agents are woken only by mail
     /// from their own project.
     pub discover: bool,
+    /// Trust the program of a known adapter (`codex`, `claude`, `gemini`)
+    /// the first time a discovered agent needs it, after the same file
+    /// checks an approval makes, and record its path and SHA-256. A later
+    /// change of that binary is trusted again and logged. Default `true`;
+    /// `false` keeps the explicit `message supervise approve --adapter`.
+    pub trust_on_first_use: bool,
     /// `[[messaging.supervisor.agents]]`: the supervised agents.
     pub agents: Vec<SupervisedAgent>,
 }
@@ -1830,6 +1837,7 @@ impl Default for SupervisorSettings {
             idle_exit_minutes: 0,
             max_concurrent_wakes: 2,
             discover: true,
+            trust_on_first_use: true,
             agents: Vec::new(),
         }
     }
@@ -1868,10 +1876,10 @@ pub struct SupervisedAgent {
     pub wake_unverified: bool,
     /// The adapter that wakes the agent.
     pub adapter: WakeAdapterConfig,
-    /// Adapter launches allowed in any rolling hour (default 4).
+    /// Deprecated and ignored: wakes are no longer counted per hour.
     #[serde(default = "default_wakes_per_hour")]
     pub wakes_per_hour: u32,
-    /// Adapter launches allowed in any rolling day (default 24).
+    /// Deprecated and ignored: wakes are no longer counted per day.
     #[serde(default = "default_wakes_per_day")]
     pub wakes_per_day: u32,
     /// Seconds before a running adapter is stopped (5 to 300, default 60).
@@ -1879,11 +1887,10 @@ pub struct SupervisedAgent {
     pub timeout_secs: u32,
 }
 
-/// Default hourly wake budget of a supervised agent, configured or
-/// discovered.
-pub(crate) const DEFAULT_WAKES_PER_HOUR: u32 = 4;
-/// Default daily wake budget of a supervised agent.
-pub(crate) const DEFAULT_WAKES_PER_DAY: u32 = 24;
+/// Default of the deprecated `wakes_per_hour`.
+const DEFAULT_WAKES_PER_HOUR: u32 = 4;
+/// Default of the deprecated `wakes_per_day`.
+const DEFAULT_WAKES_PER_DAY: u32 = 24;
 /// Default adapter timeout, in seconds.
 pub(crate) const DEFAULT_WAKE_TIMEOUT_SECS: u32 = 60;
 

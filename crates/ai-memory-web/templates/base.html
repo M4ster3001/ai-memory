@@ -25,6 +25,23 @@
       <p class="nav-label">{{ i18n.text("web-observe-improve") }}</p>
       <a href="pending" data-nav="pending" {% block nav_pending_current %}{% endblock %}><span aria-hidden="true">☷</span>{{ i18n.text("web-learning-review") }}</a>
       <a href="health" data-nav="health" {% block nav_health_current %}{% endblock %}><span aria-hidden="true">⌁</span>{{ i18n.text("web-server-health") }}</a>
+      <p class="nav-label" data-nav-agents hidden>{{ i18n.text("web-nav-agents") }}</p>
+      <a href="rooms" data-nav="rooms" data-nav-agents hidden><span aria-hidden="true">✦</span>{{ i18n.text("web-nav-agent-chat") }} <span id="agents-chat-count" class="nav-message-count" hidden></span></a>
+      <a href="agent-bus" data-nav="agent-bus" data-nav-agents hidden><span aria-hidden="true">⇄</span>{{ i18n.text("web-nav-agent-bus") }} <span id="agents-bus-count" class="nav-message-count" hidden></span></a>
+      <script>
+      (async function(){
+        try{
+          var response=await fetch(new URL("agent-bus/summary",document.baseURI),{credentials:"same-origin",cache:"no-store",headers:{"Accept":"application/json"}});
+          if(!response.ok)return;
+          var summary=await response.json();
+          document.querySelectorAll("[data-nav-agents]").forEach(function(node){node.hidden=false;});
+          [["agents-chat-count",summary.chat_unread],["agents-bus-count",summary.paused_pairs]].forEach(function(pair){
+            var badge=document.getElementById(pair[0]);
+            if(badge&&pair[1]>0){badge.textContent=String(pair[1]);badge.hidden=false;}
+          });
+        }catch(error){}
+      })();
+      </script>
       <p class="nav-label">{{ i18n.text("web-resources") }}</p>
       <a href="docs" data-nav="docs" {% block nav_docs_current %}{% endblock %}><span aria-hidden="true">▤</span>{{ i18n.text("web-documentation") }}</a>
       <a href="docs/changelog" data-nav="changelog" {% block nav_changelog_current %}{% endblock %}><span aria-hidden="true">↻</span>{{ i18n.text("web-changelog") }}</a>
@@ -44,7 +61,7 @@
       <button type="button" id="ai-memory-logout" class="quiet-button" data-error="{{ i18n.text("web-log-out-failed") }}">{{ i18n.text("web-log-out") }}</button>
       {% endblock %}
       <label for="interface-language" class="sr-only">{{ i18n.text("web-language") }}</label>
-      <select id="interface-language" aria-label="{{ i18n.text("web-language") }}">
+      <select id="interface-language" class="language-select" aria-label="{{ i18n.text("web-language") }}">
         <option value="en" lang="en" {% if i18n.tag() == "en" %}selected{% endif %}>English</option>
         <option value="pt-BR" lang="pt-BR" {% if i18n.tag() == "pt-BR" %}selected{% endif %}>Português (Brasil)</option>
       </select>

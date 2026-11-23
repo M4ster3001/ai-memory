@@ -8,6 +8,7 @@ use axum::routing::{get, post};
 use crate::html_auth::HtmlAuthRedirectConfig;
 use crate::state::WebState;
 
+mod agent_bus;
 mod agents;
 mod api;
 mod documentation;
@@ -123,6 +124,9 @@ pub(crate) fn build(state: Arc<WebState>) -> Router {
             .route("/docs/{slug}", get(documentation::page))
             .route("/inbox", get(inbox::handler))
             .route("/rooms", get(rooms::handler))
+            .route("/agent-bus", get(agent_bus::handler))
+            .route("/agent-bus/resume", post(agent_bus::resume))
+            .route("/agent-bus/summary", get(agent_bus::summary))
             .route("/inbox/notifications", get(notifications::handler))
             .route("/messages", post(inbox::send))
             .route("/messages/{id}/edit", post(inbox::begin_edit))

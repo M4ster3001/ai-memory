@@ -1148,6 +1148,50 @@ pub(crate) struct RoomsView {
     pub agents: Vec<BusAgentRow>,
 }
 
+/// One discovered agent on `GET /agent-bus`.
+pub(crate) struct BusWakeRow {
+    /// `workspace/project`.
+    pub scope: String,
+    pub agent: String,
+    /// The wake handle kind; the session id itself is not shown.
+    pub kind: String,
+    pub open: bool,
+    pub last_seen: String,
+    /// `event` or `event/reason` of the newest wake outcome.
+    pub last_wake: Option<String>,
+    pub last_wake_at: String,
+}
+
+/// One paused pair on `GET /agent-bus`.
+pub(crate) struct BusPairRow {
+    pub a: String,
+    pub b: String,
+    pub reason: String,
+    pub paused_at: String,
+    pub trips: i64,
+    /// The JSON body the resume button posts: ids and harness names.
+    pub key: String,
+}
+
+/// One trusted program on `GET /agent-bus`.
+pub(crate) struct BusProgramRow {
+    pub at: String,
+    pub adapter: String,
+    pub program: String,
+    pub sha256: String,
+    pub trusted: String,
+}
+
+/// View-model for the root-only `GET /agent-bus`.
+#[derive(Template)]
+#[template(path = "agent_bus.html")]
+pub(crate) struct AgentBusView {
+    pub i18n: ai_memory_core::i18n::Localizer,
+    pub agents: Vec<BusWakeRow>,
+    pub pairs: Vec<BusPairRow>,
+    pub programs: Vec<BusProgramRow>,
+}
+
 /// View-model for a non-root session that opens a root-only page.
 #[derive(Template)]
 #[template(path = "admin_required.html")]

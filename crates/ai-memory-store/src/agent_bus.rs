@@ -21,6 +21,7 @@ const LAST_SEEN_REFRESH_MICROS: i64 = 60_000_000;
 /// through `kind`. The handle is the session id itself: the router reports a
 /// kind only when the native id was a canonical UUID, which the store keeps
 /// unchanged.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn record_wake_handle_in_tx(
     tx: &Transaction<'_>,
     session: SessionId,
@@ -28,6 +29,7 @@ pub(crate) fn record_wake_handle_in_tx(
     project_id: ProjectId,
     agent: AgentKind,
     kind: WakeHandleKind,
+    cwd: Option<&str>,
     now: i64,
 ) -> StoreResult<()> {
     if WakeHandleKind::for_agent(agent) != Some(kind) {
@@ -38,14 +40,16 @@ pub(crate) fn record_wake_handle_in_tx(
     tx.execute(
         "INSERT INTO agent_wake_handles \
              (session_id, workspace_id, project_id, agent_kind, handle_kind, handle, \
-              first_seen_at, last_seen_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7) \
+              first_seen_at, last_seen_at, cwd) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?9) \
          ON CONFLICT(session_id) DO UPDATE SET \
              workspace_id = excluded.workspace_id, \
              project_id = excluded.project_id, \
-             last_seen_at = excluded.last_seen_at \
+             last_seen_at = excluded.last_seen_at, \
+             cwd = COALESCE(excluded.cwd, agent_wake_handles.cwd) \
          WHERE agent_wake_handles.workspace_id IS NOT excluded.workspace_id \
             OR agent_wake_handles.project_id IS NOT excluded.project_id \
+            OR (excluded.cwd IS NOT NULL AND agent_wake_handles.cwd IS NOT excluded.cwd) \
             OR agent_wake_handles.last_seen_at < excluded.last_seen_at - ?8",
         params![
             session.as_bytes(),
@@ -56,6 +60,7 @@ pub(crate) fn record_wake_handle_in_tx(
             session.to_string(),
             now,
             LAST_SEEN_REFRESH_MICROS,
+            cwd.filter(|cwd| cwd.len() <= 4_096),
         ],
     )?;
     Ok(())
@@ -73,6 +78,10 @@ pub struct WakeHandle {
     /// Last hook event seen for the session, unix microseconds (refreshed at
     /// most once a minute).
     pub last_seen_at: i64,
+    /// The session's working directory as its hooks reported it, when the
+    /// daemon needs it: a resumed Claude Code or Gemini CLI session is found
+    /// by its project directory. `None` in the dashboard reads.
+    pub cwd: Option<String>,
 }
 
 /// One agent the daemon may wake: it has claimable mail addressed to it and
@@ -99,10 +108,15 @@ pub struct BusTarget {
 
 impl ReaderPool {
     /// The agents with claimable addressed mail and a wake handle, at most
-    /// `max_targets` of them (the ones whose oldest mail waited longest
-    /// first), each with at most `max_ids` message ids. Shared project mail
-    /// (no `to_agent`) never makes a target: it is not addressed to anyone,
-    /// and a room is the way to reach every agent of a project.
+    /// `max_targets` of them, each with at most `max_ids` message ids. The
+    /// agents whose newest mail arrived last come first, so new mail always
+    /// reaches the answer even when more agents hold old unread mail than one
+    /// answer lists. Shared project mail (no `to_agent`) never makes a target:
+    /// it is not addressed to anyone, and a room is the way to reach every
+    /// agent of a project.
+    ///
+    /// Every query runs in one read transaction, so the counts, handles and
+    /// ids describe one snapshot.
     ///
     /// # Errors
     /// Propagates any SQL or pool error.
@@ -114,88 +128,10 @@ impl ReaderPool {
         let max_targets = i64::try_from(max_targets.clamp(1, 1_000)).unwrap_or(1_000);
         let max_ids = max_ids.clamp(1, 1_000);
         self.with_conn(move |conn| {
-            let mut groups = conn.prepare(
-                "SELECT m.to_workspace_id, m.to_project_id, m.to_agent, w.name, p.name, \
-                        COUNT(*), MIN(m.created_at) \
-                 FROM agent_messages m \
-                 JOIN workspaces w ON w.id = m.to_workspace_id \
-                 JOIN projects p ON p.id = m.to_project_id \
-                 WHERE m.state = 'pending' AND m.to_agent IS NOT NULL \
-                   AND EXISTS (SELECT 1 FROM agent_wake_handles h \
-                               WHERE h.workspace_id = m.to_workspace_id \
-                                 AND h.project_id = m.to_project_id \
-                                 AND h.agent_kind = m.to_agent) \
-                 GROUP BY m.to_workspace_id, m.to_project_id, m.to_agent \
-                 ORDER BY MIN(m.created_at) ASC \
-                 LIMIT ?1",
-            )?;
-            type Group = (Vec<u8>, Vec<u8>, String, String, String, i64);
-            let rows: Vec<Group> = groups
-                .query_map(params![max_targets], |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                    ))
-                })?
-                .collect::<Result<_, _>>()?;
-            let mut handles = conn.prepare(
-                "SELECT h.handle_kind, h.handle, s.ended_at IS NULL, h.last_seen_at \
-                 FROM agent_wake_handles h JOIN sessions s ON s.id = h.session_id \
-                 WHERE h.workspace_id = ?1 AND h.project_id = ?2 AND h.agent_kind = ?3 \
-                 ORDER BY (s.ended_at IS NULL) DESC, h.last_seen_at DESC LIMIT 1",
-            )?;
-            let mut ids = conn.prepare(
-                "SELECT id FROM agent_messages \
-                 WHERE to_workspace_id = ?1 AND to_project_id = ?2 AND state = 'pending' \
-                   AND to_agent = ?3 \
-                 ORDER BY created_at ASC, id ASC LIMIT ?4",
-            )?;
-            let mut out = Vec::with_capacity(rows.len());
-            for (ws, pj, agent, workspace, project, total) in rows {
-                let handle = handles
-                    .query_row(params![ws, pj, agent], |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, bool>(2)?,
-                            row.get::<_, i64>(3)?,
-                        ))
-                    })
-                    .optional()?;
-                let Some((kind, handle, open, last_seen_at)) = handle else {
-                    continue;
-                };
-                let Some(kind) = WakeHandleKind::parse(&kind) else {
-                    continue;
-                };
-                let pending = ids
-                    .query_map(
-                        params![ws, pj, agent, i64::try_from(max_ids).unwrap_or(1_000)],
-                        |row| row.get::<_, Vec<u8>>(0),
-                    )?
-                    .map(|id| Ok(MessageId::from_slice(&id?)?))
-                    .collect::<StoreResult<Vec<_>>>()?;
-                out.push(BusTarget {
-                    workspace_id: WorkspaceId::from_slice(&ws)?,
-                    workspace,
-                    project_id: ProjectId::from_slice(&pj)?,
-                    project,
-                    agent: AgentKind::from_wire(&agent),
-                    handle: WakeHandle {
-                        kind,
-                        handle,
-                        open,
-                        last_seen_at,
-                    },
-                    truncated: usize::try_from(total).unwrap_or(usize::MAX) > pending.len(),
-                    pending,
-                });
-            }
-            Ok(out)
+            let tx = conn.unchecked_transaction()?;
+            let out = bus_targets_in(&tx, max_targets, max_ids);
+            tx.finish()?;
+            out
         })
         .await
     }
@@ -246,6 +182,7 @@ impl ReaderPool {
                             handle,
                             open,
                             last_seen_at,
+                            cwd: None,
                         },
                     ));
                 }
@@ -295,6 +232,7 @@ impl ReaderPool {
                             handle,
                             open,
                             last_seen_at,
+                            cwd: None,
                         },
                     ));
                 }
@@ -303,4 +241,95 @@ impl ReaderPool {
         })
         .await
     }
+}
+
+fn bus_targets_in(
+    conn: &rusqlite::Connection,
+    max_targets: i64,
+    max_ids: usize,
+) -> StoreResult<Vec<BusTarget>> {
+    let mut groups = conn.prepare(
+        "SELECT m.to_workspace_id, m.to_project_id, m.to_agent, w.name, p.name, COUNT(*) \
+         FROM agent_messages m \
+         JOIN workspaces w ON w.id = m.to_workspace_id \
+         JOIN projects p ON p.id = m.to_project_id \
+         WHERE m.state = 'pending' AND m.to_agent IS NOT NULL \
+           AND EXISTS (SELECT 1 FROM agent_wake_handles h \
+                       WHERE h.workspace_id = m.to_workspace_id \
+                         AND h.project_id = m.to_project_id \
+                         AND h.agent_kind = m.to_agent) \
+         GROUP BY m.to_workspace_id, m.to_project_id, m.to_agent \
+         ORDER BY MAX(m.created_at) DESC \
+         LIMIT ?1",
+    )?;
+    type Group = (Vec<u8>, Vec<u8>, String, String, String, i64);
+    let rows: Vec<Group> = groups
+        .query_map(params![max_targets], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        })?
+        .collect::<Result<_, _>>()?;
+    let mut handles = conn.prepare(
+        "SELECT h.handle_kind, h.handle, s.ended_at IS NULL, h.last_seen_at, \
+                COALESCE(h.cwd, s.cwd) \
+         FROM agent_wake_handles h JOIN sessions s ON s.id = h.session_id \
+         WHERE h.workspace_id = ?1 AND h.project_id = ?2 AND h.agent_kind = ?3 \
+         ORDER BY (s.ended_at IS NULL) DESC, h.last_seen_at DESC LIMIT 1",
+    )?;
+    let mut ids = conn.prepare(
+        "SELECT id FROM agent_messages \
+         WHERE to_workspace_id = ?1 AND to_project_id = ?2 AND state = 'pending' \
+           AND to_agent = ?3 \
+         ORDER BY created_at ASC, id ASC LIMIT ?4",
+    )?;
+    let mut out = Vec::with_capacity(rows.len());
+    for (ws, pj, agent, workspace, project, total) in rows {
+        let handle = handles
+            .query_row(params![ws, pj, agent], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, bool>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            })
+            .optional()?;
+        let Some((kind, handle, open, last_seen_at, cwd)) = handle else {
+            continue;
+        };
+        let Some(kind) = WakeHandleKind::parse(&kind) else {
+            continue;
+        };
+        let pending = ids
+            .query_map(
+                params![ws, pj, agent, i64::try_from(max_ids).unwrap_or(1_000)],
+                |row| row.get::<_, Vec<u8>>(0),
+            )?
+            .map(|id| Ok(MessageId::from_slice(&id?)?))
+            .collect::<StoreResult<Vec<_>>>()?;
+        out.push(BusTarget {
+            workspace_id: WorkspaceId::from_slice(&ws)?,
+            workspace,
+            project_id: ProjectId::from_slice(&pj)?,
+            project,
+            agent: AgentKind::from_wire(&agent),
+            handle: WakeHandle {
+                kind,
+                handle,
+                open,
+                last_seen_at,
+                cwd,
+            },
+            truncated: usize::try_from(total).unwrap_or(usize::MAX) > pending.len(),
+            pending,
+        });
+    }
+    Ok(out)
 }

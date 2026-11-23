@@ -189,6 +189,13 @@ async fn dispatch(
             Ok(())
         }
         Command::Room(args) => commands::room::run(&config, args).await,
+        Command::AgentBus(args) => {
+            let exit_code = commands::agent_bus::run(&config, args, config_path.as_deref()).await?;
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
+            Ok(())
+        }
         Command::Workstreams(args) => commands::workstreams::run(&config, args).await,
         Command::RenameWorkstream(args) => commands::rename_workstream::run(&config, args).await,
         Command::WorkstreamSearch(args) => commands::workstream_search::run(&config, args).await,

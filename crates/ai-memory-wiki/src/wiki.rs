@@ -411,6 +411,17 @@ impl Wiki {
         Ok(id)
     }
 
+    /// Resume wakes between two agents the agent bus's loop guard paused, as
+    /// the root-only dashboard does. Returns whether the pair was paused.
+    /// Callers must hold the root credential.
+    pub async fn resume_agent_pair(
+        &self,
+        a: ai_memory_store::AgentSide,
+        b: ai_memory_store::AgentSide,
+    ) -> WikiResult<bool> {
+        Ok(self.writer.resume_agent_pair(a, b).await?)
+    }
+
     /// Take a pending message out of its recipient's queue so its sender can
     /// edit it. Until it is saved or released no harness can collect it.
     /// Returns `None` when the message is not pending in that project.

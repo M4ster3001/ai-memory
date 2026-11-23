@@ -8,8 +8,8 @@
 //!   answer says, per pending message, only whether the sender is another
 //!   agent of the watched project, the watched agent itself, one of the
 //!   listed projects with a recorded session, one of them without one,
-//!   someone else, or the server (a receipt). Sender names and ids never
-//!   leave the server.
+//!   someone else, the server (a receipt), or a sender the loop guard paused
+//!   with this agent. Sender names and ids never leave the server.
 //! - `POST /inbox/wake-report` records what a wake did, from enumerated values
 //!   only (`state`, `reason`, a bounded `retry_after_secs`), so the server can
 //!   set the delivery state, write the timeline and send the sender its
@@ -92,6 +92,11 @@ enum WakeSender {
     Unlisted,
     /// The server itself: a delivery receipt.
     System,
+    /// The loop guard paused wakes between this sender and the watched
+    /// agent (`agent_pair_pauses`): the mail stays in the inbox, but it must
+    /// not wake. A supervisor that predates the label treats it as unknown,
+    /// which never wakes either.
+    Paused,
 }
 
 #[derive(Debug, Serialize)]
@@ -302,6 +307,7 @@ pub(crate) async fn handle_wake_candidates(
                 MessageKind::Message if own_project && candidate.from_agent == agent => {
                     WakeSender::SameAgent
                 }
+                MessageKind::Message if candidate.pair_paused => WakeSender::Paused,
                 MessageKind::Message if own_project => WakeSender::SameProject,
                 MessageKind::Message
                     if listed
@@ -395,5 +401,75 @@ pub(crate) async fn handle_wake_report(
                 "could not record the wake report",
             )
         }
+    }
+}
+
+/// The pending mail that may interrupt `agent` in the middle of a turn, from
+/// its wake candidates in `(ws, proj)`: a receipt, or a message from another
+/// harness of the same project that the loop guard did not pause. Mail from
+/// another project, the agent's own mail and paused mail never interrupt it,
+/// the same rule the wake supervisor applies to a discovered agent.
+#[must_use]
+pub fn turn_notice_ids(
+    candidates: &[ai_memory_store::WakeCandidate],
+    ws: WorkspaceId,
+    proj: ProjectId,
+    agent: AgentKind,
+) -> Vec<MessageId> {
+    candidates
+        .iter()
+        .filter(|candidate| match candidate.kind {
+            MessageKind::Receipt => true,
+            MessageKind::Message => {
+                candidate.from_workspace_id == ws
+                    && candidate.from_project_id == proj
+                    && candidate.from_agent != agent
+                    && !candidate.pair_paused
+            }
+        })
+        .map(|candidate| candidate.id)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn candidate(
+        kind: MessageKind,
+        from: (WorkspaceId, ProjectId),
+        agent: AgentKind,
+        paused: bool,
+    ) -> ai_memory_store::WakeCandidate {
+        ai_memory_store::WakeCandidate {
+            id: MessageId::new(),
+            kind,
+            from_workspace_id: from.0,
+            from_project_id: from.1,
+            from_agent: agent,
+            sender_session_recorded: false,
+            pair_paused: paused,
+        }
+    }
+
+    #[test]
+    fn only_another_agent_of_the_project_or_a_receipt_interrupts_a_turn() {
+        let here = (WorkspaceId::new(), ProjectId::new());
+        let elsewhere = (here.0, ProjectId::new());
+        let codex = AgentKind::Codex;
+        let all = [
+            candidate(MessageKind::Message, here, AgentKind::ClaudeCode, false),
+            candidate(MessageKind::Message, here, codex, false),
+            candidate(MessageKind::Message, here, AgentKind::GeminiCli, true),
+            candidate(
+                MessageKind::Message,
+                elsewhere,
+                AgentKind::ClaudeCode,
+                false,
+            ),
+            candidate(MessageKind::Receipt, elsewhere, AgentKind::Other, false),
+        ];
+        let ids = turn_notice_ids(&all, here.0, here.1, codex);
+        assert_eq!(ids, [all[0].id, all[4].id]);
     }
 }

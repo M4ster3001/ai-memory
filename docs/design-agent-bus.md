@@ -11,6 +11,8 @@ Status: proposal, written 2026-11-15 after the first real run of the wake superv
 5. A project talks to another project only when the human user asks for it. When they do, the system opens a connection between exactly the projects they named.
 6. Any agent can adopt it by reading the documentation: Claude Code, Codex, Gemini and others. No external services.
 
+Principle added 2026-11-16 (owner): rooms and every other chat feature are one more resource on top of the inbox, never a replacement. The inbox stays the base: one-to-one mail, delivery states and receipts, `memory_message_*`, the watcher and the wake supervisor keep working exactly as they do today, with or without rooms. A room post that mentions an agent becomes ordinary inbox mail for that agent, so anything that reads the inbox sees it. Removing the rooms must leave the inbox untouched, and no room feature may be required to use the inbox.
+
 ## 2. What exists today (slices 1 to 3a, PRs #25 to #28)
 
 | Piece | What it does | Limit found in use |
@@ -107,9 +109,12 @@ Slices as the owner ordered them on 2026-11-15, on branch `feat/agent-bus`:
 | --- | --- |
 | F1 wake handles from hooks, discovery in the supervisor | Built. V105 `agent_wake_handles`, `GET /inbox/bus`, `discover = true`, `message supervise approve --adapter codex_queue`. A Claude Code handle is recorded but has no adapter yet. |
 | F2 rooms inside a project | Built. V106, `memory_room_*`, `ai-memory room`, `/admin/rooms*`, root-only `/web/rooms`. A mention is addressed mail with a fixed body, so the F1 bus wakes the mentioned agent. |
-| F3 Claude headless adapter, stopped Codex, pair budgets | Not built. |
-| F4 human-opened links between projects | Not built. |
-| F5 `agent-bus install`, dashboard approval, agent guide, `adopt` | Not built. |
+| F3 adapters and wakes, no hourly budget | Built (2026-11-21). `message watch --rewake` as Claude Code's `Stop` hook with `asyncRewake` (added by `install-hooks` on native installs and by `agent-bus install`); adapters `claude_resume`, `codex_exec_resume` (falls back to `codex_queue` on a busy chat or a refused login) and `gemini_resume` (documentation only, untested); V107 loop guard (ping-pong, repeated content, thread depth, per-pair breaker, human prompt resumes) and coalescing instead of budgets; programs trusted on first use; second-opinion fixes 1, 3, 4 and 5 (2 is the loop guard). |
+| F4 human-opened links between projects | Not built. Next round. |
+| F6 plug and play | Built (2026-11-21). `agent-bus install` writes the native hooks of every agent found, the Claude Code wake hook and the service; idempotent. Wake handles follow the directory the session reported last (V108); a stopped Codex conversation whose directory is gone is queued instead. |
+| F7 chat page and links between projects | Specified in §8, not built. |
+| F6 mid-turn mail notice | Built (2026-11-21). Native `PreToolUse`/`PostToolUse` hooks of Codex and `PostToolUse` of Claude Code add a fixed line through `hookSpecificOutput.additionalContext` (documented by Codex for both events and present in the 0.169.0-alpha.11.1 hook schema), from `GET /handoff?inbox_turn=1`; check every 5 s, notice every 15 s, once per id; 300 ms budget. Gemini not covered. |
+| F5 `agent-bus install`, status, doctor, dashboard, agent guide | Built (2026-11-21). `ai-memory agent-bus install|status|doctor`, `GET /inbox/bus/status`, `POST /inbox/bus/program`, root-only `/web/agent-bus` with a resume button, `docs/agent-bus/`. No `adopt` and no `memory_bus_whoami`: `doctor` covers the checks. |
 
 Bite checks run while building them, each restored afterwards: the store
 accepting a wake handle kind of another harness fails
@@ -138,3 +143,96 @@ Choices made while building F1 and F2, for review:
   position.
 - A plain post wakes nobody; only an `@harness` mention does. This keeps a busy
   room from spending every member's tokens.
+
+Choices made while building F3 and F5, for review:
+
+- An open Claude Code session is woken only by its `Stop` hook; the
+  supervisor resumes a Claude Code session only when the server recorded it as
+  ended and `claude agents --json` lists no process for it. A session that is
+  open but whose process died without `SessionEnd` waits for the idle
+  auto-end.
+- The rewake hook waits 12 hours per turn (`timeout` 43200). Claude Code's
+  upper bound for a hook timeout was not tested; a session idle for longer
+  hears of its mail at its next prompt.
+- The loop guard reads at most the last two hours of a pair when no human
+  prompt was recorded, so a project without prompt capture is not paused by
+  old traffic. Its thresholds (20 turns, 3 copies in 30 minutes, depth 40) are
+  constants, not settings.
+- A paused pair stays paused until a human prompt or the dashboard; there is
+  no timed half-open state.
+- Trust on first use is the default; `trust_on_first_use = false` keeps the
+  terminal approval. Configured entries keep their terminal approval either
+  way.
+- The Claude Code hook that `agent-bus install` writes carries no token: it
+  passes `--data-dir` and `--config`, and the binary reads the server and token
+  from that configuration. `install-hooks` puts the URL and token in the
+  command's environment, as its other hooks do.
+- Bite checks run while building F3 (each restored): dropping the `paused`
+  label from `wake-candidates` fails `candidates_label_mail_of_a_paused_pair`;
+  dropping the world-writable check from `check_session_dir` fails
+  `a_resumed_session_runs_only_in_a_checked_directory_of_the_operator`; letting
+  the rewake hook wake on `paused` mail fails
+  `only_new_mail_from_another_agent_or_a_receipt_wakes`.
+
+## 8. F7 specification: the chat page and links between projects
+
+Written 2026-11-21 from the owner's request; not built yet. It extends §3.6
+(links) and replaces §3.7 (rooms as a link with a name) for the web view.
+
+### 8.1 `/web/chat`
+
+- Root only, like `/web/rooms`, reached from the sidebar "Agents" group
+  (today "Agent chat" points at `/web/rooms`; it will point here).
+- A project selector, then one timeline per project, newest at the bottom:
+  addressed mail between agents of the project (`agent_messages`,
+  `kind = 'message'`) and room posts, merged by time. One bubble per item,
+  with an icon and colour per sender: `claude-code`, `codex`, `gemini-cli`,
+  and "human" for posts from the dashboard.
+- Each mail bubble shows its delivery state (`queued`, `wake_attempted`,
+  `delivered`, `wake_failed/<reason>`), receipts folded under the message
+  they report on, and a banner with the Resume button when the pair is
+  paused (the existing `POST /web/agent-bus/resume`).
+- Bodies are shown only for mail inside the selected project, or between
+  two projects with an active link. Mail from any other project shows its
+  sender project and state, never its body.
+- Updates without reload through a new root-only long-poll,
+  `GET /web/chat/watch?project=<id>&after=<cursor>`, woken by the writer's
+  inbox signals (the same mechanism as `GET /inbox/watch`); no model call.
+- A composer posts to a room as `human` (`from_agent = other`, a new
+  `human` label in the view). An `@codex` or `@claude-code` mention becomes
+  mail as today. A human post also counts as a human anchor for the loop
+  guard, so it resumes paused pairs of the project.
+
+### 8.2 Links between projects (the §3.6 design, refined)
+
+States: `requested` → `confirmed` (by the destination) → `active` →
+`closed` or `expired`. A request never wakes anyone.
+
+- V108 is taken by the wake handle directory; links need V109:
+  `agent_links(id, a_workspace_id, a_project_id, b_workspace_id,
+  b_project_id, state, requested_at, requested_by, reason, confirmed_at,
+  confirmed_via, expires_at, closed_at, closed_by)`, pair normalized, one
+  live link per pair, and `agent_link_events` for the audit trail.
+- Opening: a human asks in project A (prompt captured by A's hooks, checked
+  as in the authorization research), or uses "Connect projects" on
+  `/web/chat` (two projects, reason, validity default 2 h, at most 24 h).
+- Confirming: the destination's human, either with the "Confirm" button on
+  the destination project's chat page, or in the destination agent's chat:
+  the agent shows the request, asks, and calls `memory_link_confirm` with
+  the reference of the human's answer, which the server checks was captured
+  after the request was shown.
+- While active, mail between the two projects passes the wake gate as
+  same-project mail (`wake-candidates` labels it `linked`), and only between
+  those two. The loop guard applies unchanged. Closing: either human, any
+  time; expiry closes it by itself.
+- Surfaces: MCP `memory_link_request`, `memory_link_confirm`,
+  `memory_link_close`; CLI `ai-memory link request|confirm|close|list`;
+  root-only routes `/admin/links*`; the "Cross-project" tab on `/web/chat`
+  lists links with state, expiry and who asked, with Confirm and Close.
+
+### 8.3 Where this differs from §3.6
+
+- Two-step opening (request, then confirmation in the destination) instead
+  of one human act on the dashboard.
+- Default validity stays 2 h (owner choice in this request), maximum 24 h.
+- Links carry their own audit table besides `audit_log`.

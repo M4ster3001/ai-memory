@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+
+{% block title %}{{ i18n.text("web-agent-bus-ai-memory") }}{% endblock %}
+
+{% block content %}
+<h1 class="text-2xl font-bold text-slate-900 dark:text-slate-100 mb-2">{{ i18n.text("web-agent-bus-heading") }}</h1>
+<p class="text-sm text-slate-500 dark:text-slate-400 mb-6">{{ i18n.text("web-agent-bus-intro") }}</p>
+
+<section class="mb-8" aria-label="{{ i18n.text("web-agent-bus-section-agents") }}">
+  <h2 class="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-2">{{ i18n.text("web-agent-bus-section-agents") }}</h2>
+  {% if agents.is_empty() %}
+  <p class="text-sm text-slate-500 dark:text-slate-400" data-agents="none">{{ i18n.text("web-agent-bus-no-agents") }}</p>
+  {% else %}
+  <dl class="grid grid-cols-1 sm:grid-cols-[12rem_1fr] gap-x-4 gap-y-1 text-sm">
+    {% for agent in agents %}
+    <dt class="text-slate-500 dark:text-slate-400">{{ agent.scope }}</dt>
+    <dd class="font-mono text-slate-800 dark:text-slate-200 break-words" data-agent="{{ agent.agent }}">{{ agent.agent }} · {{ agent.kind }} · {% if agent.open %}{{ i18n.text("web-rooms-session-open") }}{% else %}{{ i18n.text("web-rooms-session-ended") }}{% endif %} · {{ agent.last_seen }} · {% match agent.last_wake %}{% when Some with (wake) %}<span data-last-wake="{{ wake }}">{{ wake }} {{ agent.last_wake_at }}</span>{% when None %}{{ i18n.text("web-agent-bus-no-wake") }}{% endmatch %}</dd>
+    {% endfor %}
+  </dl>
+  {% endif %}
+</section>
+
+<section class="mb-8" aria-label="{{ i18n.text("web-agent-bus-section-paused") }}">
+  <h2 class="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-2">{{ i18n.text("web-agent-bus-section-paused") }}</h2>
+  <p class="text-sm text-slate-500 dark:text-slate-400 mb-2">{{ i18n.text("web-agent-bus-paused-intro") }}</p>
+  {% if pairs.is_empty() %}
+  <p class="text-sm text-slate-500 dark:text-slate-400" data-pairs="none">{{ i18n.text("web-agent-bus-no-paused") }}</p>
+  {% else %}
+  <ul class="space-y-3">
+    {% for pair in pairs %}
+    <li class="rounded-md border border-slate-200 dark:border-slate-800 p-3" data-pair="{{ pair.reason }}">
+      <p class="text-sm font-mono text-slate-800 dark:text-slate-200">{{ pair.a }} ⇄ {{ pair.b }}</p>
+      <p class="text-sm text-slate-500 dark:text-slate-400">{{ pair.reason }} · {{ pair.paused_at }} · {{ pair.trips }}×</p>
+      <button type="button" class="mt-2 rounded bg-slate-800 px-3 py-1 text-sm text-white dark:bg-slate-200 dark:text-slate-900" data-resume="{{ pair.key }}">{{ i18n.text("web-agent-bus-resume") }}</button>
+    </li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+</section>
+
+<section class="mb-6" aria-label="{{ i18n.text("web-agent-bus-section-programs") }}">
+  <h2 class="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-2">{{ i18n.text("web-agent-bus-section-programs") }}</h2>
+  {% if programs.is_empty() %}
+  <p class="text-sm text-slate-500 dark:text-slate-400" data-programs="none">{{ i18n.text("web-agent-bus-no-programs") }}</p>
+  {% else %}
+  <dl class="grid grid-cols-1 sm:grid-cols-[12rem_1fr] gap-x-4 gap-y-1 text-sm">
+    {% for program in programs %}
+    <dt class="text-slate-500 dark:text-slate-400">{{ program.at }}</dt>
+    <dd class="font-mono text-slate-800 dark:text-slate-200 break-all" data-program="{{ program.adapter }}">{{ program.adapter }} · {{ program.trusted }} · {{ program.program }} · {{ program.sha256 }}</dd>
+    {% endfor %}
+  </dl>
+  {% endif %}
+</section>
+
+<script>
+document.querySelectorAll("[data-resume]").forEach(function(button){
+  button.addEventListener("click",async function(){
+    button.disabled=true;
+    var response=await fetch(new URL("agent-bus/resume",document.baseURI),{method:"POST",credentials:"same-origin",headers:{"content-type":"application/json","x-ai-memory-ui":"1"},body:button.dataset.resume});
+    if(response.ok){location.reload();}else{button.disabled=false;}
+  });
+});
+</script>
+{% endblock %}

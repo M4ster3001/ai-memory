@@ -201,6 +201,42 @@ async fn candidates_label_mail_inside_the_watched_project() {
     }
 }
 
+/// Mail between two agents the loop guard paused is labelled `paused`, so
+/// neither the supervisor nor the Claude Code wake hook wakes for it, while
+/// other senders keep their labels.
+#[tokio::test]
+async fn candidates_label_mail_of_a_paused_pair() {
+    let h = harness().await;
+    let first = send_inside_inbox(&h, AgentKind::ClaudeCode).await;
+    let outsider = send(&h, false, Some(AgentKind::Codex)).await;
+    // The same body three times in one pair trips the breaker.
+    let second = send_inside_inbox(&h, AgentKind::ClaudeCode).await;
+    let third = send_inside_inbox(&h, AgentKind::ClaudeCode).await;
+    let (status, body) = call(
+        &h.app,
+        post("/inbox/wake-candidates", &candidates_body(&[]), None, true),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let json: Value = serde_json::from_str(&body).unwrap();
+    let senders: Vec<(&str, &str)> = json["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| (m["id"].as_str().unwrap(), m["sender"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        senders,
+        [
+            (first.as_str(), "paused"),
+            (outsider.as_str(), "unlisted"),
+            (second.as_str(), "paused"),
+            (third.as_str(), "paused"),
+        ]
+    );
+    assert!(!body.contains("CANARY"), "{body}");
+}
+
 #[tokio::test]
 async fn reports_set_delivery_and_refuse_anything_outside_the_vocabulary() {
     let h = harness().await;

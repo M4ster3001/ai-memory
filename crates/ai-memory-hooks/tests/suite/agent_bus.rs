@@ -260,3 +260,69 @@ async fn the_bus_needs_the_marker_the_root_credential_and_a_known_query() {
     let (status, _) = bus(&h, "wait_ms=25001").await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "wait above the cap");
 }
+
+/// `GET /inbox/bus/status` and `POST /inbox/bus/program` are root-only like
+/// the bus, the status names agents without session ids, and a program
+/// report is audited only when every field is in its vocabulary.
+#[tokio::test]
+async fn the_bus_status_and_program_reports_are_root_only_and_bounded() {
+    let h = harness().await;
+    hook(&h, "session-start", "codex", CODEX_THREAD).await;
+    for _ in 0..100 {
+        if !handles(&h).await.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let status_request = |marker: bool| {
+        let mut builder = Request::get("/inbox/bus/status");
+        if marker {
+            builder = builder.header(crate::CLIENT_MARKER_HEADER, "cli");
+        }
+        builder.body(Body::empty()).unwrap()
+    };
+    let (status, _) = call(&h.app, status_request(false)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "no client marker");
+    let mut as_user = status_request(true);
+    as_user
+        .extensions_mut()
+        .insert(AuthorizedViewer(UserId::new()));
+    let (status, _) = call(&h.app, as_user).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "a database user");
+    let (status, body) = call(&h.app, status_request(true)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let json: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["agents"][0]["agent"], "codex", "{json}");
+    assert_eq!(json["agents"][0]["open"], true);
+    assert!(!body.contains(CODEX_THREAD), "a session id leaked: {body}");
+
+    let program = |body: Value| {
+        Request::post("/inbox/bus/program")
+            .header(crate::CLIENT_MARKER_HEADER, "cli")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    let sha = "a".repeat(64);
+    let good = json!({"adapter": "claude_resume", "program": "/home/u/.local/bin/claude",
+                      "sha256": sha, "trusted": "first_use"});
+    for bad in [
+        json!({"adapter": "shell", "program": "/bin/sh", "sha256": sha, "trusted": "first_use"}),
+        json!({"adapter": "claude_resume", "program": "claude", "sha256": sha, "trusted": "first_use"}),
+        json!({"adapter": "claude_resume", "program": "/x", "sha256": "zz", "trusted": "first_use"}),
+        json!({"adapter": "claude_resume", "program": "/x", "sha256": sha, "trusted": "approved"}),
+        json!({"adapter": "claude_resume", "program": "/x", "sha256": sha, "trusted": "changed",
+               "extra": 1}),
+    ] {
+        let (status, body) = call(&h.app, program(bad.clone())).await;
+        assert!(status.is_client_error(), "{bad}: {status} {body}");
+    }
+    let (status, body) = call(&h.app, program(good)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let (_, body) = call(&h.app, status_request(true)).await;
+    let json: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        json["programs"][0]["program"]["program"], "/home/u/.local/bin/claude",
+        "{json}"
+    );
+}
