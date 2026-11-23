@@ -109,6 +109,20 @@ jobs:
         with:
           tool: cargo-nextest
       - run: cargo nextest run --workspace --all-targets --profile ci
+      # The agent bus regression suite (docs/agent-bus/TESTING.md) is already
+      # part of the run above. This step runs it again by name, on the binaries
+      # that run just built, so a break of the bus is one labelled check in the
+      # pull request. The floor guards the filter: a rename that stops matching
+      # the tests would otherwise leave this step green and empty. Raise the
+      # floor when cases are added; never lower it to make a removal pass.
+      - name: agent-bus regression
+        run: |
+          listed=$(cargo nextest list --workspace --all-targets --profile ci \
+            -E 'test(agent_bus_regression)' --message-format oneline | grep -c agent_bus_regression)
+          echo "agent-bus regression tests found: $listed"
+          test "$listed" -ge 75
+          cargo nextest run --workspace --all-targets --profile ci \
+            -E 'test(agent_bus_regression)' --no-tests=fail
       # `--all-targets` deliberately excludes doctests, so a doc-comment code
       # block that fails to compile (e.g. an indented shell example rustdoc
       # reads as Rust) shipped unnoticed. Run them explicitly.
