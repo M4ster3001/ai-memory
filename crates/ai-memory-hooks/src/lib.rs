@@ -21,6 +21,7 @@
 //! This crate does not read process environment directly; server configuration
 //! is resolved once by `ai-memory-cli` and threaded in as typed state.
 
+mod agent_bus;
 pub mod antigravity;
 mod assistant_capture;
 mod brief_tiers;
@@ -53,6 +54,7 @@ pub use ai_memory_core::{SanitizeConfig, Sanitized, Sanitizer};
 // Client-side symbols used by the CLI crate; the server-side `apply_assistant_backstop`
 // and the protocol/table internals stay crate-private (router reaches them via
 // `crate::assistant_capture`).
+pub use agent_bus::MAX_BUS_TARGETS;
 pub use assistant_capture::{
     ClientAssistantTransform, strip_assistant_message_raw, transform_for_client,
 };

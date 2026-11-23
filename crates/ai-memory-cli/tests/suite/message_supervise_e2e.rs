@@ -600,4 +600,221 @@ mod slow {
             f.pop(id);
         }
     }
+
+    /// The status of mail sent from inside the inbox project.
+    fn inbox_status(f: &Fixture, id: &str) -> Value {
+        serde_json::from_str(&f.cli(&[
+            "message",
+            "status",
+            "--workspace",
+            WORKSPACE,
+            "--project",
+            INBOX,
+            "--id",
+            id,
+            "--json",
+        ]))
+        .unwrap()
+    }
+
+    /// Record a program approval for discovered agents exactly as
+    /// `message supervise approve --adapter codex_queue` does.
+    fn approve_program(f: &Fixture, state: &Path) {
+        std::fs::create_dir_all(state).unwrap();
+        std::fs::set_permissions(state, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let cwd = std::fs::canonicalize(state).unwrap();
+        let program = std::fs::canonicalize(f.program()).unwrap();
+        let sha256 = hex(&Sha256::digest(std::fs::read(&program).unwrap()));
+        let parts = [
+            "ai-memory.supervisor-program-approval/v1".to_owned(),
+            "codex_queue".to_owned(),
+            ["queue", "--thread", "{handle}", "--message", "{wake}"].join("\u{0}"),
+            program.to_str().unwrap().to_owned(),
+            sha256.clone(),
+            cwd.to_str().unwrap().to_owned(),
+            "60".to_owned(),
+        ];
+        let mut hasher = Sha256::new();
+        for part in &parts {
+            hasher.update((part.len() as u64).to_le_bytes());
+            hasher.update(part.as_bytes());
+        }
+        let approvals = json!({"programs": {"codex_queue": {
+            "digest": hex(&hasher.finalize()),
+            "program": program,
+            "sha256": sha256,
+            "approved_at": "2026-11-15T00:00:00Z",
+        }}});
+        std::fs::write(cwd.join("approvals.json"), approvals.to_string()).unwrap();
+    }
+
+    /// The agent bus with no configured entry: the Codex session the hook
+    /// reported in the inbox project is woken through its own thread id by
+    /// mail from another agent of that project, and by nothing else.
+    #[tokio::test]
+    async fn the_bus_wakes_a_discovered_session_from_its_own_project_only() {
+        const DISCOVERED_THREAD: &str = "00000000-0000-4000-8000-000000000303";
+        let f = fixture().await;
+        std::fs::write(
+            f.dd().join("config.toml"),
+            "[messaging.supervisor]\nmax_wakes_per_hour = 20\n",
+        )
+        .unwrap();
+        let state = f.dd().join("supervisor-bus");
+
+        // 1. No program approved for the adapter: reported, not run.
+        let first = f
+            .send_as(INBOX, None, Some("claude-code"), "BODY-CANARY bus")
+            .await;
+        f.supervise_once(&state);
+        assert_eq!(f.calls(), 0, "an unapproved program ran");
+        let status = inbox_status(&f, &first);
+        assert_eq!(status["delivery"]["state"], "wake_failed", "{status}");
+        assert_eq!(status["delivery"]["reason"], "not_approved", "{status}");
+
+        // 2. Approved once for the adapter: the session's own thread id is
+        //    the target, and the text carries no sender data.
+        approve_program(&f, &state);
+        f.supervise_once(&state);
+        assert_eq!(f.calls(), 1);
+        let args = f.last_args();
+        assert_eq!(
+            args[..4],
+            ["queue", "--thread", DISCOVERED_THREAD, "--message"]
+        );
+        assert_eq!(args.len(), 5, "{args:?}");
+        assert!(args[4].contains(&first), "{}", args[4]);
+        assert!(
+            !args[4].contains("CANARY"),
+            "sender text reached the adapter"
+        );
+        assert_eq!(
+            inbox_status(&f, &first)["delivery"]["state"],
+            "wake_attempted"
+        );
+        f.supervise_once(&state);
+        assert_eq!(f.calls(), 1, "the same message woke twice");
+
+        // 3. Mail from another project, with a recorded session or not, and
+        //    the agent's mail to itself wake nobody: no link, no wake_from.
+        let outside = f.send(SENDER, Some(SENDER_SESSION), "outside").await;
+        let itself = f.send_as(INBOX, None, Some("codex"), "to myself").await;
+        f.supervise_once(&state);
+        assert_eq!(f.calls(), 1, "mail from outside the project woke the agent");
+        assert_eq!(f.status(&outside)["delivery"]["state"], "queued");
+
+        // 4. A changed binary voids the program approval.
+        let colleague = f.send_as(INBOX, None, Some("claude-code"), "second").await;
+        let script = std::fs::read_to_string(f.program()).unwrap();
+        std::fs::write(f.program(), format!("{script}\n# upgraded\n")).unwrap();
+        f.supervise_once(&state);
+        assert_eq!(f.calls(), 1, "a changed program ran on an old approval");
+        assert_eq!(
+            inbox_status(&f, &colleague)["delivery"]["reason"],
+            "not_approved"
+        );
+        for id in [&first, &outside, &itself, &colleague] {
+            f.pop(id);
+        }
+    }
+
+    /// Rooms through the CLI against the real server: a post with an
+    /// `@codex` mention wakes the discovered Codex session through the bus,
+    /// with the fixed wake text, and codex reads the post from the room.
+    #[tokio::test]
+    async fn a_room_mention_wakes_the_mentioned_agent_through_the_bus() {
+        const DISCOVERED_THREAD: &str = "00000000-0000-4000-8000-000000000303";
+        let f = fixture().await;
+        std::fs::write(
+            f.dd().join("config.toml"),
+            "[messaging.supervisor]\nmax_wakes_per_hour = 20\n",
+        )
+        .unwrap();
+        let state = f.dd().join("supervisor-room");
+        approve_program(&f, &state);
+        let scope = ["--workspace", WORKSPACE, "--project", INBOX];
+
+        // A plain post wakes nobody.
+        let plain: Value = serde_json::from_str(
+            &f.cli(
+                &[
+                    &[
+                        "room",
+                        "post",
+                        "general",
+                        "BODY-CANARY plain",
+                        "--agent",
+                        "claude-code",
+                    ][..],
+                    &scope[..],
+                ]
+                .concat(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(plain["seq"], 1, "{plain}");
+        f.supervise_once(&state);
+        assert_eq!(f.calls(), 0, "a post without a mention woke an agent");
+
+        // A mention does, once, through the session's own thread.
+        let asked: Value = serde_json::from_str(
+            &f.cli(
+                &[
+                    &[
+                        "room",
+                        "post",
+                        "general",
+                        "BODY-CANARY @codex need a hand",
+                        "--agent",
+                        "claude-code",
+                    ][..],
+                    &scope[..],
+                ]
+                .concat(),
+            ),
+        )
+        .unwrap();
+        let mention = asked["mentioned"][0]["message_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        f.supervise_once(&state);
+        assert_eq!(f.calls(), 1);
+        let args = f.last_args();
+        assert_eq!(
+            args[..4],
+            ["queue", "--thread", DISCOVERED_THREAD, "--message"]
+        );
+        assert!(args[4].contains(&mention), "{}", args[4]);
+        assert!(!args[4].contains("CANARY"), "post text reached the adapter");
+        f.supervise_once(&state);
+        assert_eq!(f.calls(), 1, "the mention woke twice");
+
+        // Codex reads the room as a non-member from the start of the history.
+        let read: Value = serde_json::from_str(
+            &f.cli(
+                &[
+                    &[
+                        "room", "read", "general", "--agent", "codex", "--after", "0",
+                    ][..],
+                    &scope[..],
+                ]
+                .concat(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(read["posts"].as_array().unwrap().len(), 2, "{read}");
+        assert_eq!(read["posts"][1]["body"], "BODY-CANARY @codex need a hand");
+        let listed: Value = serde_json::from_str(
+            &f.cli(&[&["room", "list", "--agent", "claude-code"][..], &scope[..]].concat()),
+        )
+        .unwrap();
+        assert_eq!(
+            listed["rooms"][0]["members"],
+            json!(["claude-code"]),
+            "{listed}"
+        );
+        assert_eq!(listed["rooms"][0]["unread"], 0);
+        f.pop(&mention);
+    }
 }

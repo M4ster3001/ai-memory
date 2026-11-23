@@ -3480,6 +3480,7 @@ pub fn insert_observation_keyed(
 /// `moved_from_cwd` marks an explicit native relocation (OpenCode
 /// `session.moved`): when the stored cwd still matches it, the live session
 /// row is rebound to this event's scope and cwd in the same transaction.
+#[cfg(test)]
 pub fn admit_hook_session_event(
     conn: &mut Connection,
     session: &NewSession,
@@ -3487,6 +3488,34 @@ pub fn admit_hook_session_event(
     owner_filter: &OwnerFilter,
     ingest_key: Option<&str>,
     moved_from_cwd: Option<&str>,
+) -> StoreResult<HookSessionAdmission> {
+    admit_reported_hook_session_event(
+        conn,
+        session,
+        obs,
+        owner_filter,
+        ingest_key,
+        moved_from_cwd,
+        None,
+    )
+}
+
+/// [`admit_hook_session_event`] for an event that also reports how the agent
+/// bus can wake its session. The handle is recorded in the same transaction,
+/// under the scope the session was admitted to, unless the event ends the
+/// session (`docs/design-agent-bus.md`).
+///
+/// # Errors
+/// As [`admit_hook_session_event`], plus a kind that does not belong to the
+/// session's harness.
+pub fn admit_reported_hook_session_event(
+    conn: &mut Connection,
+    session: &NewSession,
+    obs: &NewObservation,
+    owner_filter: &OwnerFilter,
+    ingest_key: Option<&str>,
+    moved_from_cwd: Option<&str>,
+    wake_handle: Option<ai_memory_core::message_wake::WakeHandleKind>,
 ) -> StoreResult<HookSessionAdmission> {
     if obs.session_id != session.id
         || obs.workspace_id != session.workspace_id
@@ -3720,6 +3749,17 @@ pub fn admit_hook_session_event(
                 target.to_string_lossy(),
                 session.id.as_bytes()
             ],
+        )?;
+    }
+    if let Some(kind) = wake_handle.filter(|_| !session_end) {
+        crate::agent_bus::record_wake_handle_in_tx(
+            &tx,
+            session.id,
+            workspace_id,
+            project_id,
+            guard.agent_kind,
+            kind,
+            now,
         )?;
     }
     tx.commit()?;
@@ -6292,6 +6332,19 @@ pub fn insert_message(
         ));
     }
     let tx = conn.transaction()?;
+    let id = insert_message_in_tx(&tx, m, policy)?;
+    tx.commit()?;
+    Ok(id)
+}
+
+/// The insert of [`insert_message`] inside the caller's transaction, after
+/// its argument checks. A room post uses it to address a mention in the same
+/// transaction as the post.
+pub(crate) fn insert_message_in_tx(
+    tx: &Transaction<'_>,
+    m: &NewAgentMessage,
+    policy: &ai_memory_core::DeliveryPolicy,
+) -> StoreResult<MessageId> {
     // Backpressure: bound the recipient's pending depth. Counting inside the
     // transaction (single-writer actor) makes the check-then-insert atomic.
     let pending: i64 = tx.query_row(
@@ -6317,7 +6370,7 @@ pub fn insert_message(
     let deadlines = policy.deadlines(m.priority, m.ttl_secs, now);
     let awaiting = match m.to_agent {
         Some(agent) => !crate::message_delivery::agent_is_registered(
-            &tx,
+            tx,
             &m.to_workspace_id,
             &m.to_project_id,
             agent,
@@ -6366,7 +6419,7 @@ pub fn insert_message(
     // Audit records the lifecycle event under the recipient scope (the crossing
     // point), authorless like handoffs — the row itself carries sender identity.
     audit(
-        &tx,
+        tx,
         "send_message",
         Some(m.to_workspace_id.as_bytes()),
         Some(m.to_project_id.as_bytes()),
@@ -6374,7 +6427,6 @@ pub fn insert_message(
         None,
         now,
     )?;
-    tx.commit()?;
     Ok(id)
 }
 
@@ -6684,7 +6736,7 @@ fn observation_kind_as_str(kind: ObservationKind) -> &'static str {
     kind.as_str()
 }
 
-fn audit(
+pub(crate) fn audit(
     tx: &rusqlite::Transaction<'_>,
     op: &str,
     workspace_id: Option<&[u8; 16]>,
@@ -6709,7 +6761,7 @@ fn audit(
 /// destructive batch can record what it did (e.g. the observation prune's
 /// deleted-row count) instead of leaving a gap only inferable from timestamps.
 #[allow(clippy::too_many_arguments)]
-fn audit_with_detail(
+pub(crate) fn audit_with_detail(
     tx: &rusqlite::Transaction<'_>,
     op: &str,
     workspace_id: Option<&[u8; 16]>,

@@ -13,6 +13,34 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- Added rooms, named chats among the agents of one project. Five MCP tools,
+  `memory_room_list`, `memory_room_join`, `memory_room_leave`,
+  `memory_room_post` and `memory_room_read`, and the same operations as
+  `ai-memory room list|join|leave|post|read` (JSON output, through the new
+  `/admin/rooms*` routes). A post stays in its room; members read it from
+  their own read position. An `@harness` mention such as `@codex` becomes
+  addressed mail for that harness with a fixed body that names the room and
+  post, never the text, so the agent bus can wake the mentioned agent. Rooms
+  never cross projects, keep their newest 500 posts, hold at most 64 per
+  project, and are audited without post text (migration V106). The root-only
+  `/web/rooms` page lists rooms, members and the agents discovered by the bus.
+  See [`docs/agent-messaging.md`](docs/agent-messaging.md#rooms).
+- Added agent discovery to `ai-memory message supervise`, the first part of the
+  agent bus. Hook ingest now records a wake handle for each Claude Code and
+  Codex session whose session id is a canonical UUID (migration V105,
+  `agent_wake_handles`), and the new `GET /inbox/bus` long-poll lists, for the
+  root credential, the agents with claimable mail addressed to them and the
+  newest handle of their harness in the project, with message ids only. With
+  `[messaging.supervisor] discover = true`, the default, the supervisor wakes
+  those agents with no `config.toml` entry, for mail from another agent of
+  their own project only. Codex sessions are woken through `codex_queue` on
+  their own thread id; Claude Code sessions are recorded but not woken yet.
+  The program runs only after
+  `ai-memory message supervise approve --adapter codex_queue`, which approves
+  it once for every discovered agent and is pinned to its SHA-256. Configured
+  entries keep working unchanged and take precedence for their inbox. See
+  [`docs/agent-messaging.md`](docs/agent-messaging.md#discovered-agents) and
+  [`docs/design-agent-bus.md`](docs/design-agent-bus.md).
 - Added `ai-memory message supervise`, a host process that wakes the agents
   listed under `[messaging.supervisor]` in `config.toml` when mail arrives for
   them. It runs only a closed set of adapters, today `codex_queue`

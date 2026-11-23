@@ -4,7 +4,9 @@
 
 mod access_breadth;
 mod access_mode;
+mod agent_bus;
 mod agent_messages;
+mod agent_rooms;
 mod audit_contamination;
 mod audit_log;
 mod auto_improve_staging;

@@ -1118,6 +1118,36 @@ pub(crate) struct HealthView {
     pub sections: Vec<HealthSection>,
 }
 
+/// One room on the root-only `GET /rooms`.
+pub(crate) struct RoomRow {
+    /// `workspace/project`.
+    pub scope: String,
+    pub name: String,
+    /// Member harnesses, comma-separated.
+    pub members: String,
+    pub last_seq: i64,
+}
+
+/// One discovered agent on `GET /rooms`.
+pub(crate) struct BusAgentRow {
+    /// `workspace/project`.
+    pub scope: String,
+    pub agent: String,
+    /// The wake handle kind; the session id itself is not shown.
+    pub kind: String,
+    pub open: bool,
+    pub last_seen: String,
+}
+
+/// View-model for the root-only `GET /rooms`.
+#[derive(Template)]
+#[template(path = "rooms.html")]
+pub(crate) struct RoomsView {
+    pub i18n: ai_memory_core::i18n::Localizer,
+    pub rooms: Vec<RoomRow>,
+    pub agents: Vec<BusAgentRow>,
+}
+
 /// View-model for a non-root session that opens a root-only page.
 #[derive(Template)]
 #[template(path = "admin_required.html")]

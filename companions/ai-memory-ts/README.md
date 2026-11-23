@@ -182,6 +182,11 @@ Not wrapped (call them with `callTool`):
 - `memory_forget_sweep`: changes retention for a whole project; use callTool
 - `memory_install_self_routing`: writes coding-agent instruction files; specific to harnesses
 - `memory_restore_page`: admin-only restore of one page from a git checkpoint; use callTool
+- `memory_room_list`: agent-to-agent chat inside one project; use callTool
+- `memory_room_join`: agent-to-agent chat inside one project; use callTool
+- `memory_room_leave`: agent-to-agent chat inside one project; use callTool
+- `memory_room_post`: agent-to-agent chat inside one project; use callTool
+- `memory_room_read`: agent-to-agent chat inside one project; use callTool
 <!-- generated:methods:end -->
 
 `callTool(name, args)` calls any tool with wire-format arguments and returns

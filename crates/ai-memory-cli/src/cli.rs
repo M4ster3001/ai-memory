@@ -199,6 +199,8 @@ pub enum Command {
     /// directed, claim-once mailbox between two projects — see
     /// `docs/agent-messaging.md`).
     Message(MessageArgs),
+    /// Rooms: named chats among the agents of one project. Prints JSON.
+    Room(RoomArgs),
     /// List recent managed workstreams selectable from the current checkout.
     Workstreams(WorkstreamsArgs),
     /// Rename a managed workstream in the current checkout. Metadata only:
@@ -826,6 +828,100 @@ pub struct MessageArgs {
     pub command: MessageCommand,
 }
 
+/// Arguments for `room`.
+#[derive(Debug, Args)]
+pub struct RoomArgs {
+    /// Room action to run.
+    #[command(subcommand)]
+    pub command: RoomCommand,
+}
+
+/// Subcommands for `room`.
+#[derive(Debug, Subcommand)]
+pub enum RoomCommand {
+    /// List the rooms of the project, with members and unread counts.
+    List(RoomListArgs),
+    /// Join a room as a harness, creating it when missing.
+    Join(RoomMemberArgs),
+    /// Leave a room; the room and its history stay.
+    Leave(RoomMemberArgs),
+    /// Post to a room; `@codex` or `@claude-code` in the text mentions and
+    /// wakes that agent.
+    Post(RoomPostArgs),
+    /// Read a room's posts after your read position, or after `--after`.
+    Read(RoomReadArgs),
+}
+
+/// Arguments for `room list`.
+#[derive(Debug, Args)]
+pub struct RoomListArgs {
+    /// Count unread posts for this harness (for example codex or claude-code).
+    #[arg(long)]
+    pub agent: Option<String>,
+    /// Workspace of the project (defaults to the resolved scope).
+    #[arg(long)]
+    pub workspace: Option<String>,
+    /// Project whose rooms to list (defaults to the resolved scope).
+    #[arg(long)]
+    pub project: Option<String>,
+}
+
+/// Arguments for `room join` and `room leave`.
+#[derive(Debug, Args)]
+pub struct RoomMemberArgs {
+    /// The room: 1 to 40 lowercase letters, digits or '-'.
+    pub room: String,
+    /// The harness that joins or leaves (for example codex or claude-code).
+    #[arg(long)]
+    pub agent: String,
+    /// Workspace of the project (defaults to the resolved scope).
+    #[arg(long)]
+    pub workspace: Option<String>,
+    /// Project of the room (defaults to the resolved scope).
+    #[arg(long)]
+    pub project: Option<String>,
+}
+
+/// Arguments for `room post`.
+#[derive(Debug, Args)]
+pub struct RoomPostArgs {
+    /// The room: 1 to 40 lowercase letters, digits or '-'.
+    pub room: String,
+    /// The post, 1 to 4000 characters; read from stdin when omitted.
+    pub body: Option<String>,
+    /// The harness that posts (for example codex or claude-code).
+    #[arg(long)]
+    pub agent: String,
+    /// Workspace of the project (defaults to the resolved scope).
+    #[arg(long)]
+    pub workspace: Option<String>,
+    /// Project of the room (defaults to the resolved scope).
+    #[arg(long)]
+    pub project: Option<String>,
+}
+
+/// Arguments for `room read`.
+#[derive(Debug, Args)]
+pub struct RoomReadArgs {
+    /// The room: 1 to 40 lowercase letters, digits or '-'.
+    pub room: String,
+    /// The harness that reads (for example codex or claude-code).
+    #[arg(long)]
+    pub agent: String,
+    /// Return posts after this number instead of after the read position.
+    #[arg(long)]
+    pub after: Option<i64>,
+    /// Most posts to return (1 to 200, default 50).
+    #[arg(long)]
+    pub limit: Option<usize>,
+    /// Workspace of the project (defaults to the resolved scope).
+    #[arg(long)]
+    pub workspace: Option<String>,
+    /// Project of the room (defaults to the resolved scope).
+    #[arg(long)]
+    pub project: Option<String>,
+}
+
 /// Subcommands for `message`.
 #[derive(Debug, Subcommand)]
 pub enum MessageCommand {
@@ -843,8 +939,9 @@ pub enum MessageCommand {
     /// Wait for new mail addressed to a harness, without a model, and print
     /// one line per new message id.
     Watch(MessageWatchArgs),
-    /// Wake the agents listed under `[messaging.supervisor]` when mail they
-    /// may be woken for arrives, through operator-approved adapters only.
+    /// Wake the agents listed under `[messaging.supervisor]`, and the agents
+    /// hook sessions reported to the server, when mail they may be woken for
+    /// arrives, through operator-approved adapters only.
     Supervise(MessageSuperviseArgs),
 }
 
@@ -867,7 +964,8 @@ pub struct MessageSuperviseArgs {
 /// Subcommands for `message supervise`.
 #[derive(Debug, Subcommand)]
 pub enum SuperviseCommand {
-    /// Review one supervised agent's adapter on this terminal and approve it.
+    /// Review one supervised agent's adapter, or the program of an adapter for
+    /// discovered agents, on this terminal and approve it.
     Approve(SuperviseApproveArgs),
     /// Print the per-user service unit that runs the supervisor. Nothing is
     /// installed.
@@ -878,7 +976,16 @@ pub enum SuperviseCommand {
 #[derive(Debug, Args)]
 pub struct SuperviseApproveArgs {
     /// The `name` of the `[[messaging.supervisor.agents]]` entry.
-    pub name: String,
+    #[arg(required_unless_present = "adapter", conflicts_with = "adapter")]
+    pub name: Option<String>,
+    /// Approve the program an adapter runs for every discovered agent
+    /// (`codex_queue`), instead of one configured entry.
+    #[arg(long)]
+    pub adapter: Option<String>,
+    /// Absolute path of the program to approve with `--adapter` (default:
+    /// the adapter's program found on `PATH`).
+    #[arg(long, requires = "adapter")]
+    pub program: Option<PathBuf>,
 }
 
 /// Arguments for `message send`.

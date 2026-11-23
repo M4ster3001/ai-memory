@@ -45,6 +45,9 @@ pub struct InboxSignals {
 struct SignalsInner {
     next: AtomicU64,
     keys: Mutex<HashMap<SignalKey, watch::Sender<u64>>>,
+    /// Bumped with every inbox, for the agent bus daemon that waits on all
+    /// of them at once (`GET /inbox/bus`).
+    any: watch::Sender<u64>,
     waiters: Arc<Semaphore>,
 }
 
@@ -59,6 +62,7 @@ impl InboxSignals {
             inner: Arc::new(SignalsInner {
                 next: AtomicU64::new(seed),
                 keys: Mutex::new(HashMap::new()),
+                any: watch::Sender::new(seed),
                 waiters: Arc::new(Semaphore::new(max_waiters)),
             }),
         }
@@ -80,6 +84,7 @@ impl InboxSignals {
         if let Some(sender) = keys.get(&(workspace, project, recipient)) {
             sender.send_replace(self.fresh_generation());
         }
+        self.inner.any.send_replace(self.fresh_generation());
     }
 
     /// A message of unknown recipient became claimable in the inbox: wake
@@ -92,6 +97,19 @@ impl InboxSignals {
                 sender.send_replace(self.fresh_generation());
             }
         }
+        self.inner.any.send_replace(self.fresh_generation());
+    }
+
+    /// Start watching every inbox at once, for the agent bus daemon. It
+    /// takes a slot from the same [`MAX_INBOX_WATCHERS`] budget as a
+    /// per-inbox waiter; `None` when none is free.
+    #[must_use]
+    pub fn try_watch_all(&self) -> Option<InboxBusWatch> {
+        let permit = self.inner.waiters.clone().try_acquire_owned().ok()?;
+        Some(InboxBusWatch {
+            any: self.inner.any.subscribe(),
+            _permit: permit,
+        })
     }
 
     /// Start watching the mail `agent` can be woken for in an inbox: mail
@@ -157,6 +175,25 @@ impl InboxWatch {
     }
 }
 
+/// A held long-poll slot that wakes on a commit to any inbox.
+pub struct InboxBusWatch {
+    any: watch::Receiver<u64>,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl InboxBusWatch {
+    /// The current generation, marked as seen.
+    pub fn generation(&mut self) -> u64 {
+        *self.any.borrow_and_update()
+    }
+
+    /// Wait for the next bump after the last [`Self::generation`]. Returns
+    /// `false` only when the signals were dropped (server shutdown).
+    pub async fn changed(&mut self) -> bool {
+        self.any.changed().await.is_ok()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,6 +228,31 @@ mod tests {
                 .is_err(),
             "another harness's mail must not wake this watcher"
         );
+    }
+
+    #[tokio::test]
+    async fn the_bus_watch_wakes_on_any_inbox_and_shares_the_waiter_budget() {
+        let signals = InboxSignals::new(2);
+        let (ws, proj) = inbox();
+        let mut bus = signals.try_watch_all().unwrap();
+        let _held = signals
+            .try_watch(ws, proj, AgentKind::Codex, false)
+            .unwrap();
+        assert!(
+            signals.try_watch_all().is_none(),
+            "the bus watch takes a slot from the same budget"
+        );
+        let before = bus.generation();
+        // No per-inbox waiter is registered for this one: the bus still wakes.
+        signals.notify(WorkspaceId::new(), ProjectId::new(), Some(AgentKind::Grok));
+        tokio::time::timeout(Duration::from_secs(1), bus.changed())
+            .await
+            .expect("the bus watch wakes on any inbox");
+        assert!(bus.generation() > before);
+        signals.notify_inbox(ws, proj);
+        tokio::time::timeout(Duration::from_secs(1), bus.changed())
+            .await
+            .expect("a requeue wakes the bus watch too");
     }
 
     #[tokio::test]

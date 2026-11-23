@@ -2,6 +2,7 @@
 //! test harness (see the `integration` module in `src/lib.rs`), so they cost
 //! no extra binary; a new file must be declared below.
 
+mod agent_bus;
 mod escaped_json_secret;
 mod idle_end;
 mod inbox_supervisor;

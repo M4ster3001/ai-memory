@@ -188,6 +188,7 @@ async fn dispatch(
             }
             Ok(())
         }
+        Command::Room(args) => commands::room::run(&config, args).await,
         Command::Workstreams(args) => commands::workstreams::run(&config, args).await,
         Command::RenameWorkstream(args) => commands::rename_workstream::run(&config, args).await,
         Command::WorkstreamSearch(args) => commands::workstream_search::run(&config, args).await,

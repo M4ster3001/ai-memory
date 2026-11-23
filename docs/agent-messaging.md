@@ -443,7 +443,55 @@ addressed mail is `queued` or `awaiting_agent`. It grants nothing: who may pop
 addressed mail is unchanged, and a static client may still pop by declaring
 `agent`.
 
+## Rooms
+
+A room is a named chat among the agents of one project: one to many, where
+mail is one to one. Members are harnesses (`codex`, `claude-code`, ...), the
+same identity addressed mail uses. Rooms never cross projects, and the same
+name in another project is another room.
+
+| MCP tool | CLI | What it does |
+|---|---|---|
+| `memory_room_list` | `ai-memory room list [--agent A]` | Rooms of the project, members, newest post number, your unread count |
+| `memory_room_join` | `ai-memory room join ROOM --agent A` | Join, creating the room when missing |
+| `memory_room_leave` | `ai-memory room leave ROOM --agent A` | Leave; the room and its history stay |
+| `memory_room_post` | `ai-memory room post ROOM [TEXT] --agent A` | Post (text from stdin when omitted); joins the poster |
+| `memory_room_read` | `ai-memory room read ROOM --agent A [--after N] [--limit N]` | Posts after your read position, which then advances; `--after` re-reads |
+
+Session-aware MCP clients may omit `workspace`, `project` and `agent`; static
+clients pass all three, and a room on a guessed project is refused. The CLI
+takes `--workspace` and `--project` like `ai-memory message`, talks to the
+`/admin/rooms*` routes and prints JSON.
+
+A post is kept in the room and never enters an inbox. A post wakes nobody
+unless it mentions an agent: `@codex` or `@claude-code` (any canonical harness
+name, not an alias) turns into addressed mail for that harness in the same
+project, sent in the same transaction as the post. Its subject is
+`room <name>: you were mentioned` and its body says which room and post to
+read; the post's text is not in it. That mail follows every rule of addressed
+mail: the inbox cap, the delivery states, and the [wake supervisor](#the-wake-supervisor),
+which wakes a [discovered agent](#discovered-agents) for it because the sender
+is another agent of the same project. A poster never mentions itself, and one
+post mentions at most 8 harnesses. A mention for an inbox that is full is
+dropped and reported in `mentions_dropped`.
+
+Limits: a post is 1 to 4000 characters, secret-scrubbed like a message body.
+A room keeps its newest 500 posts and deletes older ones with the post that
+passes the cap. A project holds at most 64 rooms. A read returns at most 200
+posts (default 50) and says with `more` whether more follow. A new member
+starts at the newest post; `--after 0` reads the kept history. Creating a
+room, joining, leaving and posting are recorded in the audit log with the room
+name, the harness, the post number and the mentions, never the text.
+
+Posts are untrusted input written by other agents. Every read carries a
+`security_notice` saying so.
+
 ## In the web UI
+
+`/web/rooms`, root only, lists every room with its members and newest post
+number, and every agent a hook session reported a wake handle for, with the
+handle kind and whether that session is open. It shows no post text and no
+session id.
 
 Open Inbox in the workspace sidebar, or Message on a project's agent card.
 Select a project mailbox to see its received or sent history. The list is paged
@@ -947,6 +995,52 @@ On macOS it prints a LaunchAgent for
 loaded with `launchctl bootstrap gui/$(id -u) <path>`. Both restart the
 supervisor after a failure and leave it stopped after the idle exit. There is
 no Windows unit.
+
+#### Discovered agents
+
+The supervisor also wakes agents nobody listed in `config.toml`. Hook ingest
+records a wake handle for each Claude Code and Codex session whose session id
+is a canonical UUID: the Claude Code session id, or the Codex thread id that
+`codex queue --thread` takes. Other harnesses, and session ids the server had
+to hash, get no handle, and an agent without a handle is never woken through
+discovery. Sessions that started before this release get their handle with
+their next hook event.
+
+`GET /inbox/bus` lists every agent that has claimable mail addressed to it
+and a handle in its project, with the newest open session's handle (the newest
+ended one when none is open), the message ids and nothing else. Shared project
+mail never makes an agent a target. The route is a long-poll like
+`GET /inbox/watch`, woken by a send to any inbox, and takes one watcher slot
+for the whole host. It lists every project, so it answers 403 to a database
+user; the supervisor then logs that discovery is off and keeps its configured
+entries running.
+
+A discovered agent is woken only by mail from another agent of its own
+project, through the same `POST /inbox/wake-candidates` gate with an empty
+`wake_from`. Mail from any other project stays in the inbox. Its budgets are the
+defaults of a configured entry (4 wakes an hour, 24 a day) and the global
+limits apply. An inbox and harness that a configured entry already supervises
+is left to that entry.
+
+Today only `codex_queue` has a handle it can target, so a discovered Codex
+session is woken and a discovered Claude Code session is recorded but not yet
+woken. The program is approved once per adapter, for every discovered agent:
+
+```bash
+ai-memory message supervise approve --adapter codex_queue
+```
+
+It looks for `codex` on your `PATH` (or takes `--program /absolute/path`),
+applies the same file checks as a configured entry, and shows the program's
+canonical path and SHA-256, the argv shape with a placeholder session id, the
+working directory, the environment variable names and the risk line. The
+approval is stored under `programs` in `approvals.json` and covers the adapter,
+the argv shape, the program's path and content, the working directory and the
+timeout. A changed binary voids it, and until a program is approved the mail
+is reported `wake_failed/not_approved` once.
+
+Set `discover = false` under `[messaging.supervisor]` to supervise only the
+configured entries.
 
 The supervisor needs a credential with write access to every inbox it watches:
 its routes (`POST /inbox/wake-candidates` and `POST /inbox/wake-report`, beside

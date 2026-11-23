@@ -73,6 +73,8 @@ Cross-project messaging exists: `memory_message_send` is the ONLY way to
 reach another project's inbox (send a report, notify, leave a message for
 that project's agent). A wiki page written into the target project is NOT a
 message and is never surfaced as one.
+Inside one project, agents also talk in named rooms, and an `@harness` mention
+such as `@codex` wakes that agent; the installed messaging skill covers it.
 
 For ranking diagnosis, opt-in query explanations add bounded score provenance
 to project/scopes hits. Cross-project search uses a distinct FTS-only ranker
@@ -822,7 +824,7 @@ Additional boundary rules:
 - **MCP tool surface changes** require updating `MEMORY_INSTRUCTIONS`,
   `ai_memory_core::SNIPPET_BODY`, README/docs tool references, and the
   regression tests asserting every tool appears in both prompt surfaces.
-  The tool count is currently 27 (see `docs/ARCHITECTURE.md`). They also
+  The tool count is currently 32 (see `docs/ARCHITECTURE.md`). They also
   update the TypeScript SDK in `companions/ai-memory-ts` in the same change:
   the schema snapshot (`npm run schema:update`), the wrapper or its
   classification in `src/coverage.ts`, types, tests and docs. The SDK's
