@@ -1158,6 +1158,13 @@ impl Supervisor {
                 return Ok(());
             }
         }
+        // A prompt the Codex queue accepted may still wait behind a busy turn.
+        let queue_waiting = self
+            .ledger
+            .lock()
+            .await
+            .ledger
+            .queue_prompt_waiting(&entry.name, now);
         let mut attempt = entry.clone();
         loop {
             let kind = attempt.adapter.kind();
@@ -1170,7 +1177,7 @@ impl Supervisor {
             let outcome = if blocked.is_some() {
                 WakeOutcome::Unavailable(DeliveryReason::AuthFailed)
             } else {
-                match self.launch(&attempt, &ids).await {
+                match self.launch(&attempt, &ids, queue_waiting).await {
                     Ok(outcome) => outcome,
                     Err(Skip::Done) => return Ok(()),
                 }
@@ -1184,6 +1191,26 @@ impl Supervisor {
             .flatten()
             .and_then(|fallback| attempt.with_adapter(fallback));
             if let Some(next) = next {
+                let busy = outcome == WakeOutcome::Failed(DeliveryReason::SessionBusy);
+                if busy && queue_waiting && next.adapter.kind() == AdapterKind::CodexQueue {
+                    // The thread is still busy and the prompt queued for it
+                    // has not run: another prompt would only pile up behind
+                    // it. This mail stays unannounced and joins the next
+                    // wake (an idle thread, or the prompt's 10 minutes).
+                    self.ledger
+                        .lock()
+                        .await
+                        .ledger
+                        .hold_for_queued_prompt(&entry.name, now_secs());
+                    log(&format!(
+                        "{}: {} session_busy; a queued wake prompt is still waiting, so \
+                         {} message(s) join the next wake",
+                        entry.name,
+                        kind.id(),
+                        ids.len()
+                    ));
+                    return Ok(());
+                }
                 log(&format!(
                     "{}: {} {}; trying {}",
                     entry.name,
@@ -1208,7 +1235,12 @@ impl Supervisor {
     /// Run `entry`'s adapter once for `ids`, after its program is trusted
     /// and, for a Claude Code resume, after `claude agents --json` shows no
     /// live process for the session. Records the outcome in the ledger.
-    async fn launch(&self, entry: &Entry, ids: &[String]) -> Result<WakeOutcome, Skip> {
+    async fn launch(
+        &self,
+        entry: &Entry,
+        ids: &[String],
+        queue_waiting: bool,
+    ) -> Result<WakeOutcome, Skip> {
         let program = self.trusted_program(entry, ids).await?;
         let kind = entry.adapter.kind();
         let env = wake_env(&entry.adapter, &program, &self.config.runtime_env);
@@ -1288,7 +1320,12 @@ impl Supervisor {
             entry.timeout,
         )
         .await;
-        {
+        // A busy thread with its queued prompt still waiting is not a failed
+        // wake: the caller holds the mail instead of queueing again.
+        let held = queue_waiting
+            && outcome == WakeOutcome::Failed(DeliveryReason::SessionBusy)
+            && kind.fallback() == Some(AdapterKind::CodexQueue);
+        if !held {
             let mut file = self.ledger.lock().await;
             file.ledger
                 .record_outcome(&entry.name, kind, ids, outcome, now_secs());

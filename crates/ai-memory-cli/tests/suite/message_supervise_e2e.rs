@@ -314,6 +314,8 @@ mod slow {
              if [ \"$(cat {mode})\" = quota ]; then \
              echo '{{\"error\":{{\"type\":\"usage_limit_reached\",\"resets_in_seconds\":1800}}}}' >&2; \
              exit 1; fi\n\
+             if [ \"$(cat {mode})\" = busy ] && [ \"$1\" = exec ]; then \
+             echo 'thread already has an active writer' >&2; exit 1; fi\n\
              if [ \"$(cat {mode})\" = byok ] && [ \"$1\" = exec ]; then \
              echo '{{\"type\":\"error\",\"code\":\"codex_byok_restricted_by_api_credit_promo\"}}' >&2; \
              exit 1; fi\n\
@@ -1092,6 +1094,125 @@ mod slow {
         assert_eq!(f.calls(), 4);
         assert_eq!(f.last_args()[..2], ["exec", "resume"]);
         pop_as(&f, "codex", &third);
+    }
+
+    /// Distinct mail texts: the server's loop guard pauses a pair that
+    /// repeats one body.
+    const BODIES: [&str; 5] = [
+        "the build finished on the first runner",
+        "which review comment should land before the release",
+        "a flaky test needs another look today",
+        "please confirm the migration plan for the archive",
+        "lunch is ready whenever you are",
+    ];
+
+    /// How many wake prompts reached the Codex queue (the adapter calls
+    /// whose first argument is `queue`).
+    fn queue_calls(f: &Fixture) -> usize {
+        std::fs::read_to_string(f.record())
+            .unwrap_or_default()
+            .split("CALL\n")
+            .skip(1)
+            .filter(|call| call.lines().next() == Some("ARG queue"))
+            .count()
+    }
+
+    /// A stopped Codex conversation whose headless resume finds the thread
+    /// busy (`codex_exec_resume` is `session_busy`, the turn is queued).
+    async fn busy_codex(f: &Fixture) {
+        std::fs::write(f.dd().join("config.toml"), "[messaging.supervisor]\n").unwrap();
+        let project = tempfile::Builder::new()
+            .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+            .unwrap();
+        for (event, id) in [
+            ("session-start", STOPPED_THREAD),
+            ("session-end", STOPPED_THREAD),
+            ("session-end", CODEX_SESSION),
+        ] {
+            hook(
+                f,
+                INBOX,
+                "codex",
+                json!({"event": event, "session_id": id, "cwd": project.path()}),
+            )
+            .await;
+            tokio::time::sleep(Duration::from_millis(400)).await;
+        }
+        wait_for_session(f, "codex", false).await;
+        f.set_mode("busy");
+        // The project directory must outlive the test's supervisor passes.
+        std::mem::forget(project);
+    }
+
+    /// A Codex turn that runs a long command is busy: the headless resume
+    /// is refused and each wake lands in the app's follow-up queue. Mail
+    /// the agent already read mid-turn (through the tool-call notice) does
+    /// not make the queued prompt go away, so a later message must not add a
+    /// second prompt behind it.
+    #[tokio::test]
+    async fn a_busy_codex_gets_one_queued_wake_even_when_it_reads_mail_mid_turn() {
+        let f = fixture().await;
+        busy_codex(&f).await;
+        let state = f.dd().join("supervisor-busy-pile");
+        let mut ids = Vec::new();
+        for n in 1..=5 {
+            let id = send_to(&f, "claude-code", "codex", BODIES[n - 1]).await;
+            f.supervise_once(&state);
+            ids.push(id.clone());
+            // Read in the middle of the long turn.
+            pop_as(&f, "codex", &id);
+        }
+        assert_eq!(queue_calls(&f), 1, "{}", Fixture::supervise_log(&state));
+        let record = std::fs::read_to_string(f.record()).unwrap();
+        assert!(!record.contains("runner"), "mail text reached the adapter");
+        for id in &ids {
+            assert_eq!(inbox_status(&f, id)["delivery"]["state"], "delivered");
+        }
+    }
+
+    /// Five messages arrive while the thread is busy: one prompt waits in
+    /// the queue. Once the agent has read what the prompt announced, the
+    /// mail that arrived meanwhile is announced by the next wake, with its
+    /// own count, and nothing is lost.
+    #[tokio::test]
+    async fn mail_that_arrives_behind_a_queued_wake_is_announced_once_it_is_read() {
+        let f = fixture().await;
+        busy_codex(&f).await;
+        let state = f.dd().join("supervisor-busy-burst");
+        let mut ids = Vec::new();
+        for n in 1..=5 {
+            ids.push(send_to(&f, "claude-code", "codex", BODIES[n - 1]).await);
+            f.supervise_once(&state);
+        }
+        assert_eq!(queue_calls(&f), 1, "{}", Fixture::supervise_log(&state));
+        assert_eq!(
+            inbox_status(&f, &ids[0])["delivery"]["state"],
+            "wake_attempted"
+        );
+        for id in &ids[1..] {
+            assert_eq!(
+                inbox_status(&f, id)["delivery"]["state"],
+                "queued",
+                "{}",
+                Fixture::supervise_log(&state)
+            );
+        }
+        // The thread goes idle and the queued prompt ran: the agent read
+        // the first message only.
+        f.set_mode("ok");
+        pop_as(&f, "codex", &ids[0]);
+        supervise_until(&f, &state, || f.calls() >= 3).await;
+        let args = f.last_args();
+        assert_eq!(args[..2], ["exec", "resume"], "{args:?}");
+        assert!(
+            args.iter().any(|a| a.contains("4 new message(s)")),
+            "{args:?}"
+        );
+        assert!(args.iter().any(|a| a.contains(&ids[4])), "{args:?}");
+        for id in &ids[1..] {
+            assert_eq!(inbox_status(&f, id)["delivery"]["state"], "wake_attempted");
+            pop_as(&f, "codex", id);
+        }
     }
 
     /// A fake `claude`: `agents --json` lists the session as live in mode
