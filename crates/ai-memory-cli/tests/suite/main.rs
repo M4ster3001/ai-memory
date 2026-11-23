@@ -5,6 +5,9 @@
 //! as the single `suite` target and never builds the sibling files on their own,
 //! so a new file must be declared here (`scripts/check-test-suites.*` enforces it).
 
+mod agent_bus_regression_cross_project;
+mod agent_bus_regression_same_project;
+mod agent_bus_regression_support;
 mod auth_default_e2e;
 mod auth_device_timeout;
 mod autoscope_env;
