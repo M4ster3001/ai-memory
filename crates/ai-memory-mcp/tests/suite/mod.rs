@@ -23,6 +23,7 @@ mod admin_rename;
 mod admin_repair_session_times;
 mod admin_status_search;
 mod admin_write_page;
+mod agent_bus_regression_contract;
 mod agent_messages_briefing;
 mod agent_messages_scope;
 mod agent_messages_tools;
