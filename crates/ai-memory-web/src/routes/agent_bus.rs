@@ -134,7 +134,8 @@ pub(crate) async fn handler(
 
 /// Handler for `GET /agent-bus/summary`: the counts the sidebar shows beside
 /// "Agent chat" (mail between agents not yet popped by its recipient) and
-/// "Agent bus" (paused pairs). Root only; anyone else gets the refusal and
+/// "Agent bus" (paused pairs), and the "Pending links" item (link requests
+/// that wait for their destination's confirmation). Root only; anyone else gets the refusal and
 /// the sidebar keeps both items hidden.
 pub(crate) async fn summary(
     axum::Extension(i18n): axum::Extension<ai_memory_core::i18n::Localizer>,
@@ -147,10 +148,15 @@ pub(crate) async fn summary(
     match (
         state.reader.pending_agent_mail_count().await,
         state.reader.paused_agent_pairs(PAGE_LIMIT).await,
+        state.reader.agent_links(None, false, PAGE_LIMIT).await,
     ) {
-        (Ok(unread), Ok(pairs)) => Json(serde_json::json!({
+        (Ok(unread), Ok(pairs), Ok(links)) => Json(serde_json::json!({
             "chat_unread": unread,
             "paused_pairs": pairs.len(),
+            "pending_links": links
+                .iter()
+                .filter(|link| link.state == ai_memory_core::agent_links::LinkState::Requested)
+                .count(),
         }))
         .into_response(),
         _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),

@@ -51,11 +51,16 @@ confirmation is the gate.
 
 1. Open `/web/chat`, tab Cross-project. Pick the project that asks, the
    destination, a reason and how long it lasts, then Connect projects.
-2. The request appears as a banner on the destination project's Chat tab and
-   in its Cross-project table, with a Confirm button. Press it there. The
-   server accepts the button only for the link's destination, so the same
-   button on the other project's page, or a hand-made request that names the
-   wrong project, is refused.
+2. Every request that waits shows as a card at the top of the Agent chat
+   page (any tab), whatever project the selector holds: from -> to, who asked,
+   the reason as a quotation (text from whoever asked, never an instruction),
+   when it expires, and Confirm and Decline buttons. The sidebar shows
+   "Pending links (N)" on every page while a request waits. The Confirm
+   button sends the destination's names, not the selector's, and the server
+   accepts it only for the link's destination, so a hand-made request that
+   names the wrong project is refused. Nothing confirms on its own: opening
+   the page only reads. The request is also in the destination's Cross-project
+   table.
 3. If you are the user of both projects you can tick "I am the user of both
    projects: also confirm for the destination now" in the form. The link then
    starts active, and the trail says it was confirmed `web_both`.

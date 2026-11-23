@@ -37,8 +37,8 @@ use serde::Deserialize;
 
 use crate::state::WebState;
 use crate::templates::{
-    ChatBubble, ChatFeed, ChatFeedView, ChatLinkRow, ChatPause, ChatProjectOption, ChatRequest,
-    ChatView, encode_segment,
+    ChatBubble, ChatFeed, ChatFeedView, ChatLinkRow, ChatPause, ChatPendingView, ChatProjectOption,
+    ChatRequest, ChatView, encode_segment,
 };
 
 /// Most long-poll requests the page holds open at once.
@@ -280,10 +280,9 @@ async fn build_feed(
     i18n: &ai_memory_core::i18n::Localizer,
 ) -> Result<ChatFeed, ()> {
     let reader = &state.reader;
-    let (items, pauses, links) = match tokio::try_join!(
+    let (items, pauses) = match tokio::try_join!(
         reader.chat_timeline(project, ai_memory_store::CHAT_ITEM_LIMIT),
         reader.paused_agent_pairs(PAGE_LIMIT),
-        reader.agent_links(Some(project), false, PAGE_LIMIT),
     ) {
         Ok(read) => read,
         Err(error) => {
@@ -323,23 +322,69 @@ async fn build_feed(
             }
         })
         .collect();
-    let requests = links
+    Ok(ChatFeed { items, pauses })
+}
+
+/// Every link request that waits for its destination, newest first, in the
+/// whole workspace: the page shows them whatever project the selector holds,
+/// so a request for a project nobody is looking at is not missed. Each card
+/// carries its destination; the store still accepts a confirmation only from
+/// that destination, and only when the root user presses the button.
+async fn pending_requests(state: &WebState) -> Result<Vec<ChatRequest>, ()> {
+    let links = match state.reader.agent_links(None, false, PAGE_LIMIT).await {
+        Ok(links) => links,
+        Err(error) => {
+            tracing::error!(%error, "web chat pending links read failed");
+            return Err(());
+        }
+    };
+    Ok(links
         .iter()
-        .filter(|link| link.state == LinkState::Requested && link.to.key == project)
+        .filter(|link| link.state == LinkState::Requested)
         .map(|link| ChatRequest {
             id: link.id.to_string(),
             from: format!("{} / {}", link.from.workspace, link.from.project),
+            to: format!("{} / {}", link.to.workspace, link.to.project),
+            to_workspace: link.to.workspace.clone(),
+            to_project: link.to.project.clone(),
             reason: shown_text(&link.reason, 300).0,
             asked_by: asked_by(link),
             valid_hours: hours(link.valid_secs),
             expires: when(link.expires_at),
         })
-        .collect();
-    Ok(ChatFeed {
-        items,
-        pauses,
-        requests,
-    })
+        .collect())
+}
+
+/// Handler for `GET /chat/pending-links`: the cards of the waiting requests as
+/// an HTML fragment plus their count, so the open page can refresh them. Read
+/// only, root only.
+pub(crate) async fn pending_links(
+    Extension(i18n): Extension<ai_memory_core::i18n::Localizer>,
+    State(state): State<Arc<WebState>>,
+    level: Option<Extension<AuthLevel>>,
+) -> Response {
+    if let Err(response) = super::require_admin(&i18n, &state, level).await {
+        return response;
+    }
+    let Ok(pending) = pending_requests(&state).await else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let count = pending.len();
+    match (ChatPendingView { i18n, pending }).render() {
+        Ok(html) => {
+            let mut response =
+                Json(serde_json::json!({ "count": count, "html": html })).into_response();
+            response.headers_mut().insert(
+                "cache-control",
+                axum::http::HeaderValue::from_static("no-store"),
+            );
+            response
+        }
+        Err(error) => {
+            tracing::error!(%error, "web chat render failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
 /// Query of `GET /chat`.
@@ -433,11 +478,10 @@ pub(crate) async fn handler(
             feed: ChatFeed {
                 items: Vec::new(),
                 pauses: Vec::new(),
-                requests: Vec::new(),
             },
+            pending: Vec::new(),
             rooms: Vec::new(),
             links: Vec::new(),
-            waiting_count: 0,
             has_projects: false,
         };
         return render(&view);
@@ -455,6 +499,9 @@ pub(crate) async fn handler(
     let Ok(feed) = build_feed(&state, key, &i18n).await else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
+    let Ok(pending) = pending_requests(&state).await else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
     let (cursor, rooms, links) = match tokio::try_join!(
         state.reader.chat_fingerprint(key),
         state.reader.rooms(workspace_id, project_id),
@@ -466,7 +513,6 @@ pub(crate) async fn handler(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
-    let waiting_count = feed.requests.len();
     let links = links
         .iter()
         .map(|link| {
@@ -513,9 +559,9 @@ pub(crate) async fn handler(
         project: chosen.project_name,
         cursor,
         feed,
+        pending,
         rooms: rooms.into_iter().map(|room| room.name).collect(),
         links,
-        waiting_count,
         has_projects: true,
     };
     render(&view)

@@ -407,9 +407,18 @@ async fn agent_bus_regression_only_the_destinations_page_confirms_a_link() {
         get("/web/chat?tab=cross&workspace=default&project=api"),
     )
     .await;
+    // The waiting card is on every page, but its button names the
+    // destination, never the requester, and the requester's table row has none.
     assert!(
-        !from_page.contains("data-link-confirm="),
+        !from_page.contains("data-dest-project=\"api\""),
         "the requester can confirm"
+    );
+    assert_eq!(
+        from_page
+            .matches(&format!("data-link-confirm=\"{id}\""))
+            .count(),
+        1,
+        "only the card, not the requester's table row, offers Confirm"
     );
     let (_, to_page) = send(
         root(&w),
@@ -468,6 +477,8 @@ async fn agent_bus_regression_the_chat_is_closed_to_anyone_who_is_not_the_root_u
     for request in [
         get("/web/chat?workspace=default&project=api"),
         get("/web/chat/watch?workspace=default&project=api&wait_ms=0"),
+        get("/web/chat/pending-links"),
+        get("/web/agent-bus/summary"),
         post(
             "/web/chat/links",
             &json!({"from_workspace": "default", "from_project": "api",
@@ -478,4 +489,218 @@ async fn agent_bus_regression_the_chat_is_closed_to_anyone_who_is_not_the_root_u
         assert_ne!(status, StatusCode::OK, "{body}");
         assert!(!body.contains("SECRET-TEXT"), "{body}");
     }
+}
+
+/// Files a request from `api` to `web` through the page's own route and
+/// returns its id.
+async fn request_link(w: &World, reason: &str) -> String {
+    let (status, answer) = send(
+        root(w),
+        post(
+            "/web/chat/links",
+            &json!({
+                "from_workspace": "default", "from_project": "api",
+                "to_workspace": "default", "to_project": "web",
+                "reason": reason, "hours": 2,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{answer}");
+    let answer: Value = serde_json::from_str(&answer).unwrap();
+    answer["id"].as_str().unwrap().to_owned()
+}
+
+async fn summary(w: &World) -> Value {
+    let (status, body) = send(root(w), get("/web/agent-bus/summary")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    serde_json::from_str(&body).unwrap()
+}
+
+#[tokio::test]
+async fn agent_bus_regression_a_waiting_request_is_found_from_any_project_and_any_tab() {
+    let w = world().await;
+    let ops = w
+        .store
+        .writer
+        .get_or_create_project(w.a.0, "ops".to_string(), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        summary(&w).await["pending_links"],
+        0,
+        "no request, no badge"
+    );
+    let (_, quiet) = send(
+        root(&w),
+        get("/web/chat?tab=cross&workspace=default&project=ops"),
+    )
+    .await;
+    assert!(
+        !quiet.contains("data-pending-link=\"1\""),
+        "no card without a request"
+    );
+
+    let id = request_link(
+        &w,
+        "share the schema <script>alert('REASON-CANARY')</script>",
+    )
+    .await;
+
+    // The sidebar's counter reads the same count.
+    assert_eq!(summary(&w).await["pending_links"], 1);
+
+    // The card shows on every tab and for a project that is neither side, the
+    // case that hid a request when the selector held the wrong project.
+    for uri in [
+        "/web/chat?workspace=default&project=ops",
+        "/web/chat?tab=cross&workspace=default&project=ops",
+        "/web/chat?workspace=default&project=api",
+        "/web/chat?tab=cross&workspace=default&project=web",
+    ] {
+        let (status, page) = send(root(&w), get(uri)).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert_eq!(
+            page.matches("data-pending-link=\"1\"").count(),
+            1,
+            "one card, not one per place, on {uri}"
+        );
+        assert!(page.contains("default / api → default / web"), "{uri}");
+        // The button names the destination, whatever the selector holds.
+        assert!(
+            page.contains(&format!(
+                "data-link-confirm=\"{id}\" data-dest-workspace=\"default\" data-dest-project=\"web\""
+            )),
+            "{uri}"
+        );
+        assert!(page.contains(&format!("data-link-close=\"{id}\"")), "{uri}");
+        assert!(
+            page.contains("data-waiting=\"1\""),
+            "the tab counts it on {uri}"
+        );
+        // The reason is a quotation, escaped, never markup.
+        assert!(page.contains("class=\"chat-quote\""), "{uri}");
+        assert!(
+            !page.contains("<script>alert('REASON-CANARY')"),
+            "the reason became markup on {uri}"
+        );
+        assert!(page.contains("&lt;script&gt;"), "{uri}");
+    }
+    let _ = ops;
+
+    // The refresh fragment carries the same card and its count.
+    let (status, body) = send(root(&w), get("/web/chat/pending-links")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let body: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["count"], 1);
+    let html = body["html"].as_str().unwrap();
+    assert!(html.contains(&format!("data-link-request=\"{id}\"")));
+    assert!(!html.contains("<script>"), "{html}");
+
+    // Looking at it opened nothing and confirmed nothing.
+    assert!(
+        !w.store
+            .reader
+            .projects_linked_at(w.a.1, w.b.1, jiff::Timestamp::now().as_microsecond())
+            .await
+            .unwrap()
+    );
+    let links = w.store.reader.agent_links(None, false, 10).await.unwrap();
+    assert_eq!(links.len(), 1);
+    assert_eq!(links[0].state.as_str(), "requested");
+}
+
+#[tokio::test]
+async fn agent_bus_regression_a_card_confirms_only_for_the_destination_and_leaves_with_the_request()
+{
+    let w = world().await;
+    let id = request_link(&w, "share the schema").await;
+    let linked = || async {
+        w.store
+            .reader
+            .projects_linked_at(w.a.1, w.b.1, jiff::Timestamp::now().as_microsecond())
+            .await
+            .unwrap()
+    };
+    // What a card sends is the destination's names; the requester's names
+    // are refused whatever page the button is on.
+    let (status, refused) = send(
+        root(&w),
+        post(
+            &format!("/web/chat/links/{id}/confirm"),
+            &json!({"workspace": "default", "project": "api"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert!(!linked().await);
+    assert_eq!(summary(&w).await["pending_links"], 1);
+
+    let (status, done) = send(
+        root(&w),
+        post(
+            &format!("/web/chat/links/{id}/confirm"),
+            &json!({"workspace": "default", "project": "web"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{done}");
+    assert!(linked().await);
+    assert_eq!(
+        summary(&w).await["pending_links"],
+        0,
+        "confirmed, no longer waiting"
+    );
+    let (_, page) = send(root(&w), get("/web/chat?workspace=default&project=ops")).await;
+    assert!(
+        !page.contains("data-pending-link=\"1\""),
+        "no card once confirmed"
+    );
+
+    // A declined request leaves the cards too.
+    let (status, _) = send(
+        root(&w),
+        post(&format!("/web/chat/links/{id}/close"), &json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let second = request_link(&w, "once more").await;
+    assert_eq!(summary(&w).await["pending_links"], 1);
+    let (status, _) = send(
+        root(&w),
+        post(&format!("/web/chat/links/{second}/close"), &json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        summary(&w).await["pending_links"],
+        0,
+        "declined, not waiting"
+    );
+    let (_, body) = send(root(&w), get("/web/chat/pending-links")).await;
+    let body: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["count"], 0);
+    assert!(
+        !body["html"]
+            .as_str()
+            .unwrap()
+            .contains("data-pending-link=\"1\"")
+    );
+}
+
+#[tokio::test]
+async fn agent_bus_regression_the_sidebar_item_is_hidden_until_the_summary_says_there_is_a_request()
+{
+    let w = world().await;
+    let (_, page) = send(root(&w), get("/web/chat?workspace=default&project=api")).await;
+    assert!(
+        page.contains("id=\"pending-links-nav\"")
+            && page.contains("pending-links-nav\" data-nav-pending-links hidden"),
+        "the item starts hidden, so a page without a request shows no empty badge"
+    );
+    assert!(page.contains("href=\"chat?tab=cross#pending-links\""));
+    assert!(
+        page.contains("summary.pending_links"),
+        "the script fills it"
+    );
 }
